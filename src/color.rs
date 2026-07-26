@@ -30,8 +30,10 @@ impl EnvSource for SystemEnv {
     }
 }
 
+#[cfg(test)]
 pub struct MapEnv(pub std::collections::HashMap<String, String>);
 
+#[cfg(test)]
 impl EnvSource for MapEnv {
     fn get(&self, key: &str) -> Option<String> {
         self.0.get(key).cloned()
@@ -103,7 +105,9 @@ fn base_profile(env: &dyn EnvSource, stream_is_tty: bool) -> ColorProfile {
 pub fn resolve_profile(mode: ColorMode, env: &dyn EnvSource, is_tty: bool) -> ColorProfile {
     match mode {
         ColorMode::Never => ColorProfile::Ascii,
-        ColorMode::Always => detect_profile(env, is_tty).max(ColorProfile::Ansi),
+        // Always pretends the stream is a tty so TERM decides the profile;
+        // otherwise forcing color in a pipe would degrade to 16 colors.
+        ColorMode::Always => detect_profile(env, true).max(ColorProfile::Ansi),
         ColorMode::Auto => detect_profile(env, is_tty),
     }
 }
@@ -181,9 +185,10 @@ mod tests {
             resolve_profile(ColorMode::Always, &e, false),
             ColorProfile::Ansi
         );
+        // Always ignores real ttyness: TERM decides, even into a pipe.
         let rich = env(&[("TERM", "xterm-256color")]);
         assert_eq!(
-            resolve_profile(ColorMode::Always, &rich, true),
+            resolve_profile(ColorMode::Always, &rich, false),
             ColorProfile::Ansi256
         );
     }

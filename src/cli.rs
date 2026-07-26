@@ -58,7 +58,35 @@ pub struct ExitCodeArgs {
 }
 
 #[derive(clap::Args)]
-pub struct StyleArgs {}
+pub struct StyleArgs {
+    /// Text to style; reads stdin when omitted. Multiple args join with newlines.
+    pub text: Vec<String>,
+    #[arg(long)]
+    pub bold: bool,
+    #[arg(long)]
+    pub faint: bool,
+    #[arg(long)]
+    pub italic: bool,
+    #[arg(long)]
+    pub underline: bool,
+    #[arg(long)]
+    pub strikethrough: bool,
+    /// Foreground color: name, 256 index, or #rrggbb
+    #[arg(long, env = "FOREGROUND")]
+    pub foreground: Option<String>,
+    /// Background color: name, 256 index, or #rrggbb
+    #[arg(long, env = "BACKGROUND")]
+    pub background: Option<String>,
+    /// Trim whitespace from each line
+    #[arg(long)]
+    pub trim: bool,
+    /// Strip ANSI escapes from input before styling (default)
+    #[arg(long, overrides_with = "no_strip_ansi")]
+    pub strip_ansi: bool,
+    /// Keep ANSI escapes present in the input
+    #[arg(long)]
+    pub no_strip_ansi: bool,
+}
 
 #[derive(clap::Args)]
 pub struct BarArgs {}

@@ -1,13 +1,14 @@
 mod cli;
-// Detection is consumed by the style command, which lands next.
-#[allow(dead_code)]
 mod color;
 mod commands;
 mod exit;
+mod style_spec;
 
 use clap::Parser;
+use crossterm::tty::IsTty;
 
 use crate::cli::{Cli, Command};
+use crate::color::ColorProfile;
 use crate::exit::{AppError, OK};
 
 fn main() {
@@ -16,7 +17,11 @@ fn main() {
 
 fn real_main() -> i32 {
     let cli = Cli::parse();
-    match dispatch(cli.command) {
+    // Capability comes from stderr's ttyness, never stdout's, so command
+    // substitution keeps color. Upgraded to the /dev/tty UiStream later.
+    let is_tty = std::io::stderr().is_tty();
+    let profile = color::resolve_profile(cli.color, &color::SystemEnv, is_tty);
+    match dispatch(cli.command, profile) {
         Ok(()) => OK,
         Err(err) => {
             match &err {
@@ -29,23 +34,23 @@ fn real_main() -> i32 {
     }
 }
 
-fn dispatch(command: Command) -> exit::AppResult {
+fn dispatch(command: Command, profile: ColorProfile) -> exit::AppResult {
     match command {
-        Command::Style(args) => commands::style::run(args),
-        Command::Bar(args) => commands::bar::run(args),
-        Command::Duration(args) => commands::duration::run(args),
-        Command::Date(args) => commands::date::run(args),
-        Command::Spark(args) => commands::spark::run(args),
-        Command::Log(args) => commands::log::run(args),
-        Command::Frame(args) => commands::frame::run(args),
-        Command::Watch(args) => commands::watch::run(args),
-        Command::Doctor(args) => commands::doctor::run(args),
-        Command::Choose(args) => commands::choose::run(args),
-        Command::Confirm(args) => commands::confirm::run(args),
-        Command::Input(args) => commands::input::run(args),
-        Command::Filter(args) => commands::filter::run(args),
-        Command::Spin(args) => commands::spin::run(args),
-        Command::Completion(args) => commands::completion::run(args),
+        Command::Style(args) => commands::style::run(args, profile),
+        Command::Bar(args) => commands::bar::run(args, profile),
+        Command::Duration(args) => commands::duration::run(args, profile),
+        Command::Date(args) => commands::date::run(args, profile),
+        Command::Spark(args) => commands::spark::run(args, profile),
+        Command::Log(args) => commands::log::run(args, profile),
+        Command::Frame(args) => commands::frame::run(args, profile),
+        Command::Watch(args) => commands::watch::run(args, profile),
+        Command::Doctor(args) => commands::doctor::run(args, profile),
+        Command::Choose(args) => commands::choose::run(args, profile),
+        Command::Confirm(args) => commands::confirm::run(args, profile),
+        Command::Input(args) => commands::input::run(args, profile),
+        Command::Filter(args) => commands::filter::run(args, profile),
+        Command::Spin(args) => commands::spin::run(args, profile),
+        Command::Completion(args) => commands::completion::run(args, profile),
         #[cfg(debug_assertions)]
         Command::ExitCode(args) => match args.code {
             0 => Ok(()),
