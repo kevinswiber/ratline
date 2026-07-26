@@ -70,3 +70,21 @@ fn timeout_prints_timed_out() {
         .code(124)
         .stderr("timed out\n");
 }
+
+#[test]
+fn broken_pipe_does_not_panic() {
+    let rat_path = assert_cmd::cargo::cargo_bin("rat");
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "seq 1 100000 | {} spark | head -c 10 >/dev/null; true",
+            rat_path.display()
+        ))
+        .output()
+        .expect("shell runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "rat panicked on a closed pipe: {stderr}"
+    );
+}

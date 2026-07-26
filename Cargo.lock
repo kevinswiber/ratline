@@ -1290,6 +1290,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "jiff",
+ "libc",
  "nucleo-matcher",
  "predicates",
  "ratatui",

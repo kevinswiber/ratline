@@ -16,6 +16,12 @@ use crate::exit::{AppError, OK};
 use crate::term::tty::UiStream;
 
 fn main() {
+    // Die quietly on a closed pipe (`rat ... | head`) like other unix
+    // tools, instead of panicking on EPIPE.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     std::process::exit(real_main());
 }
 
