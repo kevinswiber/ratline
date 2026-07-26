@@ -2,6 +2,12 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.3.1](https://github.com/kevinswiber/ratto/compare/0e698431324f0ee0b67ba50ea5755bd3e3881707..v0.3.1) - 2026-07-26
+#### Documentation
+- tidy the readme intro - ([0e69843](https://github.com/kevinswiber/ratto/commit/0e698431324f0ee0b67ba50ea5755bd3e3881707)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.3.0](https://github.com/kevinswiber/ratto/compare/98e41e20adf4390c1322548e6b65b951ba5982ec..v0.3.0) - 2026-07-26
 #### Features
 - page the full watch frame through the user pager - ([38a69ac](https://github.com/kevinswiber/ratto/commit/38a69aca08b9abb59f93219cfea9c7b2c7a1efb9)) - [@kevinswiber](https://github.com/kevinswiber)
