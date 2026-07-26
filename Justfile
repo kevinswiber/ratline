@@ -51,9 +51,9 @@ fmt-check:
 commit-check range='origin/main..HEAD':
     cog check "{{ range }}"
 
-# Run the complete gate: build, lint, and tests.
+# Run the complete gate: commit check, build, lint, and tests.
 [group('quality')]
-check: build lint test
+check: commit-check build lint test
 
 # Install git hooks (commit-msg and pre-push validation via cocogitto).
 [group('maintenance')]
