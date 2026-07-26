@@ -89,7 +89,38 @@ pub struct StyleArgs {
 }
 
 #[derive(clap::Args)]
-pub struct BarArgs {}
+pub struct BarArgs {
+    /// Current value
+    #[arg(long, allow_negative_numbers = true)]
+    pub value: Option<f64>,
+    #[arg(long, default_value_t = 100.0, allow_negative_numbers = true)]
+    pub total: f64,
+    /// Bar width in cells
+    #[arg(long, default_value_t = 32)]
+    pub width: u16,
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Label column width (display cells)
+    #[arg(long, default_value_t = 34)]
+    pub label_width: u16,
+    #[arg(long, value_enum, default_value_t = crate::core::bar::BarPreset::Blocks)]
+    pub preset: crate::core::bar::BarPreset,
+    /// Override the fill character
+    #[arg(long)]
+    pub fill: Option<char>,
+    /// Override the empty character
+    #[arg(long)]
+    pub empty: Option<char>,
+    #[arg(long, default_value = "212")]
+    pub fill_color: String,
+    #[arg(long, default_value = "240")]
+    pub empty_color: String,
+    /// State word appended after the annotations
+    #[arg(long)]
+    pub state: Option<String>,
+    #[arg(long, value_enum, default_value_t = crate::core::bar::Annotation::Both)]
+    pub annotation: crate::core::bar::Annotation,
+}
 
 #[derive(clap::Args)]
 pub struct DurationArgs {}

@@ -1,6 +1,7 @@
 mod cli;
 mod color;
 mod commands;
+mod core;
 mod exit;
 mod style_spec;
 
