@@ -44,14 +44,17 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
         ..StyleSpec::default()
     };
 
-    let mut previous_hash: Option<u64> = None;
+    let mut previous_key: Option<(u64, u16, u16)> = None;
     loop {
         let output = run_child(&args)?;
         let mut combined = output.stdout.clone();
         combined.extend_from_slice(&output.stderr);
         let hash = signature(&combined);
-        if previous_hash != Some(hash) {
-            previous_hash = Some(hash);
+        // The terminal size joins the change key: a resize must repaint
+        // even when the content is unchanged.
+        let size = crossterm::terminal::size().unwrap_or((80, 24));
+        if previous_key != Some((hash, size.0, size.1)) {
+            previous_key = Some((hash, size.0, size.1));
             let body = String::from_utf8_lossy(&output.stdout);
             let mut lines: Vec<String> = Vec::new();
             if let Some(title) = &title_line {
@@ -70,7 +73,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
                 );
             }
             if is_tty {
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                let (cols, rows) = size;
                 let max_rows = args.max_height.unwrap_or_else(|| rows.saturating_sub(2));
                 let (mut kept, hidden) = truncate_to_rows(lines, max_rows, cols);
                 if hidden > 0 {

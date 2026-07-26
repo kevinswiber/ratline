@@ -63,6 +63,7 @@ pub struct InlineRenderer<W: Write> {
     screen_cleared: bool,
     cursor_hidden: bool,
     finished: bool,
+    last_width: Option<u16>,
 }
 
 impl<W: Write> InlineRenderer<W> {
@@ -76,6 +77,7 @@ impl<W: Write> InlineRenderer<W> {
             screen_cleared: false,
             cursor_hidden: false,
             finished: false,
+            last_width: None,
         }
     }
 
@@ -98,6 +100,17 @@ impl<W: Write> InlineRenderer<W> {
     /// Repaint: one assembled string, one write, one flush (I8 — the
     /// synchronized frame never spans a blocking operation).
     pub fn draw(&mut self, lines: &[String], term_width: u16) -> std::io::Result<()> {
+        // A resize invalidates the wrap-derived row count (reflowing
+        // terminals change how many rows the old frame occupies), so a
+        // relative move-up can no longer be trusted: repaint from scratch,
+        // re-wiping when this renderer owns the whole screen.
+        if self.last_width.is_some_and(|w| w != term_width) {
+            self.prev_rows = 0;
+            if self.clear_screen {
+                self.screen_cleared = false;
+            }
+        }
+        self.last_width = Some(term_width);
         let mut bytes = String::new();
         if self.hide_cursor && !self.cursor_hidden {
             bytes.push_str("\x1b[?25l");
@@ -349,5 +362,59 @@ mod clear_screen_tests {
         let s = String::from_utf8(out).unwrap();
         assert_eq!(s.matches("\x1b[2J").count(), 1, "got: {s:?}");
         assert!(s.contains("\x1b[1A"), "second frame still moves up: {s:?}");
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::*;
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn width_change_repaints_without_move_up() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["a", "b", "c"]), 100).unwrap();
+            r.draw(&lines(&["a", "b", "c"]), 60).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            !s.contains("\x1b[3A"),
+            "stale move-up after resize corrupts a reflowed screen: {s:?}"
+        );
+    }
+
+    #[test]
+    fn width_change_rewipes_in_clear_screen_mode() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_sync_output(false)
+                .with_clear_screen(true);
+            r.draw(&lines(&["a"]), 100).unwrap();
+            r.draw(&lines(&["a"]), 60).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s.matches("\x1b[2J").count(),
+            2,
+            "resize must reclaim the screen with a fresh wipe: {s:?}"
+        );
+    }
+
+    #[test]
+    fn stable_width_keeps_normal_move_up() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["a", "b"]), 80).unwrap();
+            r.draw(&lines(&["c"]), 80).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\x1b[2A"), "got: {s:?}");
     }
 }
