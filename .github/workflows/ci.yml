@@ -19,9 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Lint runs once, on Linux; macOS runs build + tests.
-          - { os: ubuntu-latest, gate: lint }
-          - { os: macos-latest, gate: build }
+          # Lint runs once, on Linux; macOS runs build + tests; Windows
+          # type-checks all targets (tests are unix-flavored for now).
+          - { os: ubuntu-latest, gate: lint, run_tests: true }
+          - { os: macos-latest, gate: build, run_tests: true }
+          - { os: windows-latest, gate: check, run_tests: false }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -41,5 +43,9 @@ jobs:
       - name: just build
         if: matrix.gate == 'build'
         run: just build
+      - name: just check-types
+        if: matrix.gate == 'check'
+        run: just check-types
       - name: just test
+        if: matrix.run_tests
         run: just test

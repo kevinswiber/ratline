@@ -1,6 +1,10 @@
 # rat maintainer entrypoints. Run `just --list` for grouped discovery.
 # Rust nightly is used for formatting only; everything else runs on stable.
 
+# Recipes are written for a POSIX shell. Git for Windows bundles one but does
+# not put it on PATH, so name it explicitly.
+set windows-shell := ["C:/Program Files/Git/bin/sh.exe", "-cu"]
+
 # List available recipes.
 [group('help')]
 default:
@@ -25,6 +29,12 @@ release *args:
 [group('core')]
 run *args:
     cargo +stable run --bin rat -- {{ args }}
+
+# Type-check all targets without the full clippy/fmt gate (used by the
+# Windows CI leg, which runs no tests yet).
+[group('core')]
+check-types:
+    cargo +stable clippy --all-targets --all-features -- -D warnings
 
 # Run Rust formatting checks and Clippy across all targets and features.
 [group('quality')]
