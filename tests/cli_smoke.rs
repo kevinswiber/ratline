@@ -88,3 +88,13 @@ fn broken_pipe_does_not_panic() {
         "rat panicked on a closed pipe: {stderr}"
     );
 }
+
+#[test]
+fn confirm_prompt_parses_positionally() {
+    // No tty in tests: the command fails, but --help would exit 0 and any
+    // parse error would exit 2. Exit 1 proves the positional was accepted.
+    rat()
+        .args(["confirm", "Ship it to prod?"])
+        .assert()
+        .code(1);
+}

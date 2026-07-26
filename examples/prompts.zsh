@@ -10,7 +10,9 @@ toppings=$(rat choose --no-limit --header 'Toppings (space to select):' nuts spr
 
 pick=$(printf 'alpha\nbeta\ngamma\ndelta\n' | rat filter --header 'Fuzzy find:')
 
-if rat confirm "Order ${fruit:-nothing} with [${toppings//$'\n'/, }] for $name?"; then
+topping_text=${toppings//$'\n'/, }
+msg="Order ${fruit:-nothing} with [${topping_text:-no toppings}] for ${name:-you}?"
+if rat confirm "$msg"; then
     rat spin --title 'Placing order...' -- sleep 2
     rat style --foreground 42 "Ordered. ($pick was a fine choice too.)"
 else

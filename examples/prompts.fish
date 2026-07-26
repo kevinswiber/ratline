@@ -9,7 +9,13 @@ set toppings (rat choose --no-limit --header 'Toppings (space to select):' nuts 
 
 set pick (printf 'alpha\nbeta\ngamma\ndelta\n' | rat filter --header 'Fuzzy find:')
 
-if rat confirm "Order $fruit with ["(string join ', ' $toppings)"] for $name?"
+# Build the message in a variable: concatenating a quoted string with a
+# command substitution that prints nothing would cancel the whole argument.
+set -l topping_text 'no toppings'
+if set -q toppings[1]
+    set topping_text (string join ', ' $toppings)
+end
+if rat confirm "Order $fruit with [$topping_text] for $name?"
     rat spin --title 'Placing order...' -- sleep 2
     rat style --foreground 42 "Ordered. ($pick was a fine choice too.)"
 else
