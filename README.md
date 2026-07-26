@@ -27,7 +27,7 @@ rat completion fish > ~/.config/fish/completions/rat.fish   # zsh/powershell/elv
 ```
 
 Works in any shell; examples here are plain bash, and [`examples/`](examples/)
-has full scripts in bash, zsh, and fish. Synchronized-output repainting
+has full scripts in bash, zsh, fish, and PowerShell. Synchronized-output repainting
 uses terminal mode 2026 (Ghostty, Kitty, Alacritty, WezTerm, iTerm2, Windows
 Terminal, …). Terminals without it just ignore the escapes — everything still
 works. Check yours with `rat doctor`.
@@ -190,7 +190,7 @@ esac
 ```
 
 Runnable versions of this — plus the interactive prompts chained together —
-live in [`examples/`](examples/) for bash, zsh, and fish.
+live in [`examples/`](examples/) for bash, zsh, fish, and PowerShell.
 
 ## Differences from gum
 
