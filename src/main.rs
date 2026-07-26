@@ -22,6 +22,23 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // Windows has no SIGPIPE: a closed pipe surfaces as a println! panic.
+    // Exit quietly instead of spraying a backtrace. (Kept on unix too as a
+    // belt for writes that race the signal disposition.)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        // "os error 232" is ERROR_NO_DATA, Windows' closed-pipe error.
+        if payload.contains("Broken pipe") || payload.contains("os error 232") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
     std::process::exit(real_main());
 }
 
@@ -62,12 +79,17 @@ fn dispatch(command: Command, profile: ColorProfile) -> exit::AppResult {
         Command::Spin(args) => commands::spin::run(args, profile),
         Command::Completion(args) => commands::completion::run(args, profile),
         #[cfg(debug_assertions)]
-        Command::ExitCode(args) => match args.code {
-            0 => Ok(()),
-            1 => Err(AppError::NoSelection),
-            124 => Err(AppError::Timeout),
-            130 => Err(AppError::Aborted),
-            n => Err(AppError::Child(n)),
-        },
+        Command::ExitCode(args) => {
+            if let Some(msg) = &args.stderr_msg {
+                eprintln!("{msg}");
+            }
+            match args.code {
+                0 => Ok(()),
+                1 => Err(AppError::NoSelection),
+                124 => Err(AppError::Timeout),
+                130 => Err(AppError::Aborted),
+                n => Err(AppError::Child(n)),
+            }
+        }
     }
 }

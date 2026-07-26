@@ -75,19 +75,37 @@ fn timeout_prints_timed_out() {
 
 #[test]
 fn broken_pipe_does_not_panic() {
-    let rat_path = assert_cmd::cargo::cargo_bin("rat");
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "seq 1 100000 | {} spark | head -c 10 >/dev/null; true",
-            rat_path.display()
-        ))
-        .output()
-        .expect("shell runs");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    use std::io::{Read, Write};
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("rat"))
+        .arg("spark")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("rat spawns");
+    {
+        // Enough values that the sparkline output exceeds any pipe buffer.
+        let mut stdin = child.stdin.take().expect("stdin piped");
+        for i in 0..100_000 {
+            let _ = writeln!(stdin, "{}", i % 8);
+        }
+    }
+    // Read a taste, then close the pipe mid-write.
+    let mut out = child.stdout.take().expect("stdout piped");
+    let mut buf = [0u8; 10];
+    let _ = out.read(&mut buf);
+    drop(out);
+    let _ = child.wait().expect("child exits");
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr piped")
+        .read_to_string(&mut err)
+        .expect("stderr reads");
     assert!(
-        !stderr.contains("panicked"),
-        "rat panicked on a closed pipe: {stderr}"
+        !err.contains("panicked"),
+        "rat panicked on a closed pipe: {err}"
     );
 }
 

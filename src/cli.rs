@@ -66,6 +66,8 @@ pub enum Command {
 #[derive(clap::Args)]
 pub struct ExitCodeArgs {
     pub code: i32,
+    /// Optional message printed to stderr first
+    pub stderr_msg: Option<String>,
 }
 
 #[derive(clap::Args)]

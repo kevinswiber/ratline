@@ -14,10 +14,15 @@ fn rat() -> Command {
     common::rat()
 }
 
+/// Path to the rat binary, used as a portable child process.
+fn rat_bin() -> String {
+    assert_cmd::cargo::cargo_bin("rat").display().to_string()
+}
+
 #[test]
 fn child_exit_code_is_propagated() {
     rat()
-        .args(["spin", "--", "sh", "-c", "exit 3"])
+        .args(["spin", "--", &rat_bin(), "__exitcode", "3"])
         .assert()
         .code(3);
 }
@@ -25,7 +30,7 @@ fn child_exit_code_is_propagated() {
 #[test]
 fn silent_success_prints_nothing() {
     rat()
-        .args(["spin", "--", "echo", "hi"])
+        .args(["spin", "--", &rat_bin(), "style", "hi"])
         .assert()
         .success()
         .stdout("");
@@ -34,7 +39,8 @@ fn silent_success_prints_nothing() {
 #[test]
 fn show_output_passes_child_stdout_through() {
     rat()
-        .args(["spin", "--show-output", "--", "echo", "hi"])
+        .env("NO_COLOR", "1")
+        .args(["spin", "--show-output", "--", &rat_bin(), "style", "hi"])
         .assert()
         .success()
         .stdout("hi\n");
@@ -43,19 +49,22 @@ fn show_output_passes_child_stdout_through() {
 #[test]
 fn show_error_prints_output_only_on_failure() {
     rat()
+        .env("NO_COLOR", "1")
         .args([
             "spin",
             "--show-error",
             "--",
-            "sh",
-            "-c",
-            "echo boom >&2; exit 2",
+            &rat_bin(),
+            "__exitcode",
+            "2",
+            "boom",
         ])
         .assert()
         .code(2)
         .stderr(predicates::str::contains("boom"));
     rat()
-        .args(["spin", "--show-error", "--", "sh", "-c", "echo fine"])
+        .env("NO_COLOR", "1")
+        .args(["spin", "--show-error", "--", &rat_bin(), "style", "fine"])
         .assert()
         .success()
         .stdout("");
@@ -66,6 +75,7 @@ fn missing_command_is_a_usage_error() {
     rat().arg("spin").assert().code(2);
 }
 
+#[cfg(unix)]
 #[test]
 fn signal_death_becomes_exit_one() {
     rat()
@@ -74,6 +84,7 @@ fn signal_death_becomes_exit_one() {
         .code(1);
 }
 
+#[cfg(unix)]
 #[test]
 fn timeout_kills_the_child() {
     rat()

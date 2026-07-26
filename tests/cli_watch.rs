@@ -1,15 +1,23 @@
+mod common;
+
 use assert_cmd::Command;
 
 fn rat() -> Command {
-    let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
+    let mut cmd = common::rat();
     cmd.env_remove("NO_COLOR");
     cmd
+}
+
+/// Path to the rat binary, used as a portable child process: shell
+/// utilities like sh, echo, and printf do not exist everywhere.
+fn rat_bin() -> String {
+    assert_cmd::cargo::cargo_bin("rat").display().to_string()
 }
 
 #[test]
 fn once_prints_child_stdout_and_exits_zero() {
     rat()
-        .args(["watch", "--once", "--", "echo", "hi"])
+        .args(["watch", "--once", "--", &rat_bin(), "style", "hi"])
         .assert()
         .success()
         .stdout(predicates::str::contains("hi"));
@@ -18,7 +26,8 @@ fn once_prints_child_stdout_and_exits_zero() {
 #[test]
 fn piped_output_has_no_movement_or_cursor_escapes() {
     let assert = rat()
-        .args(["watch", "--once", "--", "echo", "hi"])
+        .env("NO_COLOR", "1")
+        .args(["watch", "--once", "--", &rat_bin(), "style", "hi"])
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
@@ -30,7 +39,7 @@ fn piped_output_has_no_movement_or_cursor_escapes() {
 #[test]
 fn child_failure_does_not_fail_the_watch() {
     rat()
-        .args(["watch", "--once", "--", "sh", "-c", "exit 3"])
+        .args(["watch", "--once", "--", &rat_bin(), "__exitcode", "3"])
         .assert()
         .success();
 }
@@ -43,10 +52,22 @@ fn missing_command_is_a_usage_error() {
 #[test]
 fn child_ansi_passes_through_verbatim() {
     rat()
-        .args(["watch", "--once", "--", "printf", "\\033[31mred\\033[0m"])
+        .env("TERM", "xterm-256color")
+        .args([
+            "watch",
+            "--once",
+            "--",
+            &rat_bin(),
+            "--color",
+            "always",
+            "style",
+            "--foreground",
+            "212",
+            "red",
+        ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("\x1b[31mred\x1b[0m"));
+        .stdout(predicates::str::contains("\x1b[38;5;212mred\x1b[0m"));
 }
 
 #[test]
@@ -59,7 +80,8 @@ fn title_line_is_prepended() {
             "--title",
             "My Dashboard",
             "--",
-            "echo",
+            &rat_bin(),
+            "style",
             "body",
         ])
         .assert()
@@ -70,7 +92,16 @@ fn title_line_is_prepended() {
 #[test]
 fn bad_interval_is_an_error() {
     rat()
-        .args(["watch", "-n", "bogus", "--once", "--", "echo", "hi"])
+        .args([
+            "watch",
+            "-n",
+            "bogus",
+            "--once",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
         .assert()
         .code(1);
 }
@@ -84,47 +115,53 @@ fn spawn_failure_in_once_mode_fails_loudly() {
         .stderr(predicates::str::contains("definitely-no-such-binary-xyz"));
 }
 
+// The --shell script is platform-specific by nature: sh on unix, the
+// COMSPEC cmd on Windows.
+#[cfg(unix)]
+const SHELL_MATH: &str = "echo $((6 * 7))";
+#[cfg(windows)]
+const SHELL_MATH: &str = "set /a 6*7";
+
 #[test]
-fn shell_mode_runs_through_sh() {
+fn shell_mode_runs_through_the_platform_shell() {
     rat()
-        .args(["watch", "--once", "--shell", "--", "echo $((6 * 7))"])
+        .args(["watch", "--once", "--shell", "--", SHELL_MATH])
         .assert()
         .success()
         .stdout(predicates::str::contains("42"));
 }
 
 #[test]
-fn clear_flag_stays_silent_when_piped() {
-    let assert = rat()
-        .args(["watch", "--clear", "--once", "--", "echo", "hi"])
-        .assert()
-        .success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    assert!(!stdout.contains("\x1b[2J"), "piped output must stay plain");
-    assert!(stdout.contains("hi"));
-}
-
-#[test]
 fn child_stderr_passes_through_when_piped() {
     rat()
+        .env("NO_COLOR", "1")
         .args([
             "watch",
             "--once",
             "--",
-            "sh",
-            "-c",
-            "echo out; echo err >&2",
+            &rat_bin(),
+            "__exitcode",
+            "0",
+            "err",
         ])
         .assert()
         .success()
-        .stdout(predicates::str::contains("out"))
         .stderr(predicates::str::contains("err"));
 }
 
 #[test]
 fn child_stderr_stays_off_stdout_when_piped() {
     let assert = rat()
-        .args(["watch", "--once", "--", "sh", "-c", "echo err >&2"])
+        .env("NO_COLOR", "1")
+        .args([
+            "watch",
+            "--once",
+            "--",
+            &rat_bin(),
+            "__exitcode",
+            "0",
+            "err",
+        ])
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
@@ -132,4 +169,24 @@ fn child_stderr_stays_off_stdout_when_piped() {
         !stdout.contains("err"),
         "stderr leaked into stdout: {stdout:?}"
     );
+}
+
+#[test]
+fn clear_flag_stays_silent_when_piped() {
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args([
+            "watch",
+            "--clear",
+            "--once",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(!stdout.contains("\x1b[2J"), "piped output must stay plain");
+    assert!(stdout.contains("hi"));
 }
