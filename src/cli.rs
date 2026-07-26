@@ -359,10 +359,90 @@ pub struct ConfirmArgs {
 }
 
 #[derive(clap::Args)]
-pub struct InputArgs {}
+pub struct InputArgs {
+    /// Placeholder shown while empty
+    #[arg(long, default_value = "Type something...")]
+    pub placeholder: String,
+    /// Prompt prefix
+    #[arg(long, default_value = "> ")]
+    pub prompt: String,
+    /// Initial value
+    #[arg(long, default_value = "")]
+    pub value: String,
+    /// Mask the input
+    #[arg(long)]
+    pub password: bool,
+    /// Maximum input length
+    #[arg(long, default_value_t = 400)]
+    pub char_limit: usize,
+    /// Header line above the prompt
+    #[arg(long)]
+    pub header: Option<String>,
+    /// Give up after this long (exit 124)
+    #[arg(long)]
+    pub timeout: Option<String>,
+}
 
 #[derive(clap::Args)]
-pub struct FilterArgs {}
+pub struct FilterArgs {
+    /// Maximum selections (single-select by default)
+    #[arg(long, default_value_t = 1, conflicts_with = "no_limit")]
+    pub limit: usize,
+    /// Allow any number of selections
+    #[arg(long)]
+    pub no_limit: bool,
+    /// Placeholder shown while the query is empty
+    #[arg(long, default_value = "Filter...")]
+    pub placeholder: String,
+    /// Prompt prefix
+    #[arg(long, default_value = "> ")]
+    pub prompt: String,
+    /// Initial query
+    #[arg(long, default_value = "")]
+    pub value: String,
+    /// Visible list height
+    #[arg(long, default_value_t = 10)]
+    pub height: u16,
+    /// With no matches, print nothing instead of the query
+    #[arg(long, overrides_with = "no_strict", default_value_t = true)]
+    pub strict: bool,
+    #[arg(long)]
+    pub no_strict: bool,
+    /// Fuzzy matching (subsequences) instead of substring
+    #[arg(long, overrides_with = "no_fuzzy", default_value_t = true)]
+    pub fuzzy: bool,
+    #[arg(long)]
+    pub no_fuzzy: bool,
+    /// Rank matches by score
+    #[arg(long, overrides_with = "no_fuzzy_sort", default_value_t = true)]
+    pub fuzzy_sort: bool,
+    #[arg(long)]
+    pub no_fuzzy_sort: bool,
+    /// Cursor indicator
+    #[arg(long, default_value = "• ")]
+    pub indicator: String,
+    /// Prefix for selected items (multi-select)
+    #[arg(long, default_value = "◉ ")]
+    pub selected_prefix: String,
+    /// Prefix for unselected items (multi-select)
+    #[arg(long, default_value = "○ ")]
+    pub unselected_prefix: String,
+    /// Header line above the prompt
+    #[arg(long)]
+    pub header: Option<String>,
+    /// Auto-select when only one candidate exists
+    #[arg(long)]
+    pub select_if_one: bool,
+    /// Delimiter for stdin candidates
+    #[arg(long, default_value = "\n")]
+    pub input_delimiter: String,
+    /// Delimiter joining printed results
+    #[arg(long, default_value = "\n")]
+    pub output_delimiter: String,
+    /// Give up after this long (exit 124)
+    #[arg(long)]
+    pub timeout: Option<String>,
+}
 
 #[derive(clap::Args)]
 pub struct SpinArgs {}
