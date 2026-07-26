@@ -13,7 +13,7 @@ use crate::core::pager::resolve_pager;
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
-use crate::term::tty::RawModeGuard;
+use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
 use crate::ui::key::{Key, from_crossterm};
 
 pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
@@ -174,6 +174,9 @@ fn page_frame(
     let pager = resolve_pager(&SystemEnv)?;
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = renderer.finish();
+    // The pager inherits the console; keep it decoding UTF-8 while the
+    // pager owns the screen (more.com garbles the frame otherwise).
+    let _console_utf8 = ConsoleUtf8Guard::enable();
 
     let result = (|| -> std::io::Result<()> {
         let mut child = std::process::Command::new(&pager.bin)

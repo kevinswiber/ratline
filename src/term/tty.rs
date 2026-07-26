@@ -110,6 +110,60 @@ fn write_console_utf16(file: &File, buf: &[u8]) -> Option<usize> {
     Some(buf.len())
 }
 
+/// UTF-8 console codepages (65001) for the guard's lifetime; the previous
+/// codepages are restored on drop (including panic). Console codepage is
+/// shared process-global state that children inherit: more.com decodes its
+/// piped stdin with the console codepage, so under the default OEM codepage
+/// it garbles the frame's block and spark glyphs. No-op on unix and when no
+/// console is attached.
+pub struct ConsoleUtf8Guard {
+    #[cfg(windows)]
+    saved: Option<(u32, u32)>,
+}
+
+impl ConsoleUtf8Guard {
+    #[cfg(windows)]
+    pub fn enable() -> Self {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
+        };
+
+        const CP_UTF8: u32 = 65001;
+        let saved = unsafe {
+            let input = GetConsoleCP();
+            let output = GetConsoleOutputCP();
+            // Zero means no console is attached.
+            if input == 0 || output == 0 {
+                None
+            } else {
+                SetConsoleCP(CP_UTF8);
+                SetConsoleOutputCP(CP_UTF8);
+                Some((input, output))
+            }
+        };
+        ConsoleUtf8Guard { saved }
+    }
+
+    #[cfg(not(windows))]
+    pub fn enable() -> Self {
+        ConsoleUtf8Guard {}
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleUtf8Guard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{SetConsoleCP, SetConsoleOutputCP};
+
+        if let Some((input, output)) = self.saved {
+            unsafe {
+                SetConsoleCP(input);
+                SetConsoleOutputCP(output);
+            }
+        }
+    }
+}
+
 /// Raw mode for the guard's lifetime; restored on drop (including panic).
 pub struct RawModeGuard;
 
@@ -135,6 +189,31 @@ mod tests {
         let stream = UiStream::open();
         let (w, h) = stream.size();
         assert!(w > 0 && h > 0);
+    }
+
+    #[test]
+    fn console_utf8_guard_constructs_everywhere() {
+        let _guard = ConsoleUtf8Guard::enable();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn console_utf8_guard_sets_and_restores_codepages() {
+        use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP};
+
+        let before_in = unsafe { GetConsoleCP() };
+        let before_out = unsafe { GetConsoleOutputCP() };
+        {
+            let _guard = ConsoleUtf8Guard::enable();
+            // Without a console both codepages read 0 and the guard must
+            // leave them alone.
+            if before_in != 0 && before_out != 0 {
+                assert_eq!(unsafe { GetConsoleCP() }, 65001);
+                assert_eq!(unsafe { GetConsoleOutputCP() }, 65001);
+            }
+        }
+        assert_eq!(unsafe { GetConsoleCP() }, before_in);
+        assert_eq!(unsafe { GetConsoleOutputCP() }, before_out);
     }
 
     #[test]
