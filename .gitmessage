@@ -1,0 +1,15 @@
+<type>(<scope>): <subject>
+
+# <body - what changed and why>
+
+# --- Conventional Commits for rat ---
+# Header: <type>(<optional scope>): <subject>  (max 100 chars)
+#
+# Types:  feat fix perf revert docs test build ci refactor chore style
+# Scopes: none enforced yet (cog.toml scopes = []); omit the scope
+#
+# Rules:
+#   - Subject starts lowercase, imperative mood, no trailing period
+#   - Blank line between header and body
+#   - Body explains what and why (required for non-trivial changes)
+#   - Reference issues in footer: Closes #N
