@@ -466,16 +466,16 @@ pub struct SpinArgs {
     /// Text shown beside the spinner
     #[arg(long, default_value = "Loading...")]
     pub title: String,
-    /// Show the child'"'"'s stdout and stderr when it finishes
+    /// Show the child's stdout and stderr when it finishes
     #[arg(long)]
     pub show_output: bool,
-    /// Show only the child'"'"'s stdout
+    /// Show only the child's stdout
     #[arg(long)]
     pub show_stdout: bool,
-    /// Show only the child'"'"'s stderr
+    /// Show only the child's stderr
     #[arg(long)]
     pub show_stderr: bool,
-    /// Show the child'"'"'s output only when it fails
+    /// Show the child's output only when it fails
     #[arg(long)]
     pub show_error: bool,
     /// Kill the child after this long (exit 124)
