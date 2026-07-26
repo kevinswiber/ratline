@@ -49,6 +49,12 @@ and terminal restore on exit/ctrl-c are all built in. ANSI colors from the
 child pass through untouched. Piped output degrades to plain text, so
 `rat watch ... | tee log` stays readable.
 
+While watching: `q` quits, and `v` (or Enter) opens the full untruncated
+frame in your pager — resolved bat-style from `RAT_PAGER`, then `PAGER`,
+then `less` (with `-R` ensured so colors survive; quit the pager and the
+watch resumes). When output is taller than the screen, the truncation line
+says so: `… 12 more lines · v views all · q quits`.
+
 ### `rat frame` — flicker-free repaint for script-owned loops
 
 When you want your own loop, pipe each frame's content through `rat frame`:
@@ -205,6 +211,20 @@ the dashboard toolkit above.
   its full depth in scripts and CI.
 - Box-model styling (`--border`, `--margin`, padding, alignment) is not
   implemented.
+
+## Windows
+
+ratline builds and runs on Windows (PowerShell, Windows Terminal, conhost,
+or ssh'd into from any terminal). The UI stream uses `CONOUT$` where unix
+uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`; synchronized
+output works in Windows Terminal and is harmlessly ignored by legacy
+conhost. Two notes:
+
+- Windows ships no ANSI-capable pager (`more.com` mangles colors), so the
+  `v` key in `watch` needs `less.exe` on PATH — Git for Windows, scoop, and
+  winget all provide one — or set `RAT_PAGER`.
+- `rat frame`'s default state file is keyed per terminal session; when
+  running several dashboards in one console session, pass `--state`.
 
 ## Exit codes
 

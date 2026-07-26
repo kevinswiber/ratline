@@ -147,6 +147,17 @@ impl<W: Write> InlineRenderer<W> {
         Ok(())
     }
 
+    /// Forget everything painted: the next draw repaints from scratch,
+    /// re-wiping in clear-screen mode and re-hiding the cursor. Used after
+    /// another program (a pager) has owned the screen.
+    pub fn reset(&mut self) {
+        self.prev_rows = 0;
+        self.screen_cleared = false;
+        self.cursor_hidden = false;
+        self.finished = false;
+        self.last_width = None;
+    }
+
     /// Restore the cursor. Idempotent; also runs on drop.
     pub fn finish(&mut self) -> std::io::Result<()> {
         if self.finished {

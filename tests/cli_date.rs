@@ -48,8 +48,9 @@ fn relative_phrases_past_times() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    // 290 leaves ten seconds of slack before ceil rounding tips to "6m".
     rat()
-        .args(["date", "--relative", &(now - 300).to_string()])
+        .args(["date", "--relative", &(now - 290).to_string()])
         .assert()
         .success()
         .stdout("5m ago\n");

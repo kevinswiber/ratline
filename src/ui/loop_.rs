@@ -8,7 +8,7 @@ use crate::color::ColorProfile;
 use crate::exit::{AppError, AppResult};
 use crate::term::buffer_ansi::buffer_to_lines;
 use crate::term::inline::InlineRenderer;
-use crate::term::tty::UiStream;
+use crate::term::tty::{RawModeGuard, UiStream};
 use crate::ui::key::{Key, from_crossterm};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -37,8 +37,7 @@ pub fn run_ui<A: UiApp>(
     if !ui.is_tty() {
         return Err(anyhow::anyhow!("interactive commands need a terminal").into());
     }
-    crossterm::terminal::enable_raw_mode().context("enabling raw mode")?;
-    let _raw_guard = RawModeGuard;
+    let _raw_guard = RawModeGuard::enable().context("enabling raw mode")?;
     let mut renderer = InlineRenderer::new(ui)
         .with_cursor_hidden(true)
         .with_sync_output(true);
@@ -85,12 +84,4 @@ pub fn run_ui<A: UiApp>(
     renderer.clear().context("clearing ui")?;
     renderer.finish().context("restoring terminal")?;
     outcome
-}
-
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
 }

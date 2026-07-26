@@ -66,6 +66,22 @@ impl Write for UiStream {
     }
 }
 
+/// Raw mode for the guard's lifetime; restored on drop (including panic).
+pub struct RawModeGuard;
+
+impl RawModeGuard {
+    pub fn enable() -> std::io::Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(RawModeGuard)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
