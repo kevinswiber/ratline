@@ -150,7 +150,28 @@ pub struct DurationArgs {
 }
 
 #[derive(clap::Args)]
-pub struct DateArgs {}
+pub struct DateArgs {
+    /// "now" (default), epoch seconds, or an RFC3339 timestamp
+    pub value: Option<String>,
+    /// Print epoch seconds
+    #[arg(long, conflicts_with_all = ["format", "relative", "since", "until"])]
+    pub epoch: bool,
+    /// strftime output format
+    #[arg(long)]
+    pub format: Option<String>,
+    /// Use UTC instead of the local zone
+    #[arg(long)]
+    pub utc: bool,
+    /// Phrase the timestamp relative to now
+    #[arg(long, conflicts_with_all = ["format", "since", "until"])]
+    pub relative: bool,
+    /// Seconds elapsed from this timestamp to the value
+    #[arg(long, conflicts_with = "until")]
+    pub since: Option<String>,
+    /// Seconds remaining from the value to this timestamp
+    #[arg(long)]
+    pub until: Option<String>,
+}
 
 #[derive(clap::Args)]
 pub struct SparkArgs {}
