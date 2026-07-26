@@ -1,0 +1,5 @@
+/target
+/.gumbo
+AGENTS.local.md
+CLAUDE.local.md
+.claude/settings.local.json
