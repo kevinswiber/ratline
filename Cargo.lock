@@ -1383,8 +1383,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ratline"
-version = "0.2.1"
+name = "ratto"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",

@@ -2,6 +2,28 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.3.0](https://github.com/kevinswiber/ratto/compare/98e41e20adf4390c1322548e6b65b951ba5982ec..v0.3.0) - 2026-07-26
+#### Features
+- page the full watch frame through the user pager - ([38a69ac](https://github.com/kevinswiber/ratto/commit/38a69aca08b9abb59f93219cfea9c7b2c7a1efb9)) - [@kevinswiber](https://github.com/kevinswiber)
+- compile and behave correctly on windows - ([69db43e](https://github.com/kevinswiber/ratto/commit/69db43e6b0097b32d9f1043360c2ddfa98c9d6fb)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- let --color always outrank NO_COLOR at full depth - ([58ddab8](https://github.com/kevinswiber/ratto/commit/58ddab8cd87113f2ee1edc950be2158baeda2fe4)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- spell out when --color auto goes plain - ([98e41e2](https://github.com/kevinswiber/ratto/commit/98e41e20adf4390c1322548e6b65b951ba5982ec)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
+## [v0.3.0](https://github.com/kevinswiber/ratto/compare/98e41e20adf4390c1322548e6b65b951ba5982ec..v0.3.0) - 2026-07-26
+#### Features
+- page the full watch frame through the user pager - ([38a69ac](https://github.com/kevinswiber/ratto/commit/38a69aca08b9abb59f93219cfea9c7b2c7a1efb9)) - [@kevinswiber](https://github.com/kevinswiber)
+- compile and behave correctly on windows - ([69db43e](https://github.com/kevinswiber/ratto/commit/69db43e6b0097b32d9f1043360c2ddfa98c9d6fb)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- let --color always outrank NO_COLOR at full depth - ([58ddab8](https://github.com/kevinswiber/ratto/commit/58ddab8cd87113f2ee1edc950be2158baeda2fe4)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- spell out when --color auto goes plain - ([98e41e2](https://github.com/kevinswiber/ratto/commit/98e41e20adf4390c1322548e6b65b951ba5982ec)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.2.1](https://github.com/kevinswiber/ratline/compare/2038679fbc70ed86523c76a3ea0c04291640bf48..v0.2.1) - 2026-07-26
 #### Bug Fixes
 - repaint from scratch after a terminal resize in watch - ([4f1c7e2](https://github.com/kevinswiber/ratline/commit/4f1c7e230fcc9df8df6b77ebd36e65cff2ade38c)) - [@kevinswiber](https://github.com/kevinswiber)
