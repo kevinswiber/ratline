@@ -37,6 +37,7 @@ works. Check yours with `rat doctor`.
 
 ```sh
 rat watch --interval 2s -- ./status.sh        # flicker-free live view
+rat watch --clear -- ./status.sh              # wipe the screen first, atomically
 rat watch --once -- ./status.sh               # render one frame
 rat watch --shell -- 'date; df -h | head -3'  # through sh -c
 ```
