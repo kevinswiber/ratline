@@ -1,7 +1,16 @@
 [package]
-name = "rat-cli"
+name = "ratline"
 version = "0.1.0"
 edition = "2024"
+description = "Ratatui-powered terminal primitives for shell dashboards: flicker-free repaints, progress bars, prompts, and portable time tools"
+license = "Apache-2.0"
+authors = ["Kevin Swiber <kevin@swiber.dev>"]
+homepage = "https://github.com/kevinswiber/ratline"
+repository = "https://github.com/kevinswiber/ratline"
+documentation = "https://docs.rs/ratline"
+readme = "README.md"
+keywords = ["terminal", "dashboard", "cli", "tui", "shell"]
+categories = ["command-line-utilities", "command-line-interface"]
 
 [[bin]]
 name = "rat"

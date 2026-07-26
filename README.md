@@ -1,13 +1,18 @@
-# rat
+# ratline
 
-Ratatui-powered primitives for shell dashboards.
+Ratatui-powered terminal primitives for shell dashboards. The binary is `rat`.
 
-`rat` is a small CLI in the spirit of [gum](https://github.com/charmbracelet/gum),
+`ratline` is a small CLI in the spirit of [gum](https://github.com/charmbracelet/gum),
 built for one job gum doesn't cover: **scripts that act as live dashboards** —
 watching long-running jobs, rendering progress, and repainting flicker-free.
 It keeps gum's scripting ergonomics (results on stdout, UI on the terminal,
 meaningful exit codes) and adds the terminal-control plumbing you'd otherwise
 hand-roll in every watcher script.
+
+The name is nautical: ratlines are the rope rungs sailors climb a ship's
+rigging by. This one is also a nod to [ratatui](https://ratatui.rs), which
+does the rendering under the hood (this project is not affiliated with
+ratatui).
 
 ```fish
 # The pitch, in one line: a flicker-free dashboard loop with zero escape codes.
@@ -17,7 +22,7 @@ rat watch --interval 2s -- ./render-status.fish
 ## Install
 
 ```sh
-cargo install --path .
+cargo install ratline
 rat completion fish > ~/.config/fish/completions/rat.fish
 ```
 
