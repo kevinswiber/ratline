@@ -136,7 +136,18 @@ pub struct BarArgs {
 }
 
 #[derive(clap::Args)]
-pub struct DurationArgs {}
+pub struct DurationArgs {
+    /// Seconds to format, or a duration string with --seconds
+    pub value: String,
+    /// Parse a duration string ("1h33m") and print integer seconds
+    #[arg(long, conflicts_with_all = ["ms", "format"])]
+    pub seconds: bool,
+    /// Treat the value as milliseconds
+    #[arg(long)]
+    pub ms: bool,
+    #[arg(long, value_enum, default_value_t = crate::core::duration::DurationFormat::Compact)]
+    pub format: crate::core::duration::DurationFormat,
+}
 
 #[derive(clap::Args)]
 pub struct DateArgs {}

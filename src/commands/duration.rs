@@ -1,7 +1,27 @@
+use anyhow::anyhow;
+
 use crate::cli::DurationArgs;
 use crate::color::ColorProfile;
-use crate::exit::{AppError, AppResult};
+use crate::core::duration::{
+    DurationFormat, format_clock, format_compact, format_long, parse_duration,
+};
+use crate::exit::AppResult;
 
-pub fn run(_args: DurationArgs, _profile: ColorProfile) -> AppResult {
-    Err(AppError::Fail(anyhow::anyhow!("not implemented")))
+pub fn run(args: DurationArgs, _profile: ColorProfile) -> AppResult {
+    if args.seconds {
+        println!("{}", parse_duration(&args.value)?);
+        return Ok(());
+    }
+    let raw: f64 = args
+        .value
+        .parse()
+        .map_err(|_| anyhow!("invalid number: {:?}", args.value))?;
+    let secs = if args.ms { raw / 1000.0 } else { raw } as i64;
+    let out = match args.format {
+        DurationFormat::Compact => format_compact(secs),
+        DurationFormat::Long => format_long(secs),
+        DurationFormat::Clock => format_clock(secs),
+    };
+    println!("{out}");
+    Ok(())
 }
