@@ -1,4 +1,6 @@
 mod cli;
+// Detection is consumed by the style command, which lands next.
+#[allow(dead_code)]
 mod color;
 mod commands;
 mod exit;
