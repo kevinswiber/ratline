@@ -1,18 +1,18 @@
-# ratline
+# ratto
 
 Ratatui-powered terminal primitives for shell dashboards. The binary is `rat`.
 
-`ratline` is a small CLI in the spirit of [gum](https://github.com/charmbracelet/gum),
+`ratto` is a small CLI in the spirit of [gum](https://github.com/charmbracelet/gum),
 built for one job gum doesn't cover: **scripts that act as live dashboards** —
 watching long-running jobs, rendering progress, and repainting flicker-free.
 It keeps gum's scripting ergonomics (results on stdout, UI on the terminal,
 meaningful exit codes) and adds the terminal-control plumbing you'd otherwise
 hand-roll in every watcher script.
 
-The name is nautical: ratlines are the rope rungs sailors climb a ship's
-rigging by. This one is also a nod to [ratatui](https://ratatui.rs), which
+*Ratto* is Italian for rat — a nod to [ratatui](https://ratatui.rs), which
 does the rendering under the hood (this project is not affiliated with
-ratatui).
+ratatui). Previously published as `ratline`; those crate versions are
+yanked.
 
 ```sh
 # The pitch, in one line: a flicker-free dashboard loop with zero escape codes.
@@ -22,7 +22,7 @@ rat watch --interval 2s -- ./render-status.sh
 ## Install
 
 ```sh
-cargo install ratline
+cargo install ratto
 rat completion bash > ~/.local/share/bash-completion/completions/rat
 rat completion fish > ~/.config/fish/completions/rat.fish   # zsh/powershell/elvish too
 ```
@@ -214,7 +214,7 @@ the dashboard toolkit above.
 
 ## Windows
 
-ratline builds and runs on Windows (PowerShell, Windows Terminal, conhost,
+ratto builds and runs on Windows (PowerShell, Windows Terminal, conhost,
 or ssh'd into from any terminal). The UI stream uses `CONOUT$` where unix
 uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`; synchronized
 output works in Windows Terminal and is harmlessly ignored by legacy
