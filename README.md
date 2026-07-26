@@ -127,8 +127,23 @@ rat log --time '%H:%M:%S' --level info up    # timestamped
 
 Colors survive command substitution — capability is detected from the
 terminal, never from stdout, so `banner=$(rat style --bold hi)` keeps its
-escapes. `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` are honored;
-`--color always|never|auto` overrides.
+escapes even though stdout is a pipe. (This is the opposite of
+`grep --color=auto`, on purpose: capturing styled text is the whole point.)
+
+Under the default `--color auto`, output goes plain only when:
+
+- there is no terminal at all — `/dev/tty` cannot be opened and stderr is
+  not a tty (cron, CI runners, fully detached processes);
+- `NO_COLOR` is set (wins over everything, including `CLICOLOR_FORCE`);
+- `CLICOLOR=0` is set (unless `CLICOLOR_FORCE` overrides it);
+- `CI` is set — CI logs are treated as not-a-terminal;
+- `TERM` is `dumb`, unset, or names no color support.
+
+`--color always` forces color (trusting `TERM` even when piped) and
+`--color never` strips it; both beat the environment except `NO_COLOR`.
+To strip ANSI coming from *other* programs, pipe through a bare
+`rat style`: input escapes are removed by default and an empty style adds
+nothing back.
 
 ## Interactive prompts
 
