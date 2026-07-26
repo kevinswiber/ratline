@@ -1,3 +1,5 @@
+mod common;
+
 use assert_cmd::Command;
 
 const SUBCOMMANDS: [&str; 15] = [
@@ -89,9 +91,13 @@ fn broken_pipe_does_not_panic() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn confirm_prompt_parses_positionally() {
-    // No tty in tests: the command fails, but --help would exit 0 and any
-    // parse error would exit 2. Exit 1 proves the positional was accepted.
-    rat().args(["confirm", "Ship it to prod?"]).assert().code(1);
+    // Exit 1 proves the positional parsed (a parse error would exit 2);
+    // detached so no real prompt opens in interactive test runs.
+    common::rat_detached()
+        .args(["confirm", "Ship it to prod?"])
+        .assert()
+        .code(1);
 }

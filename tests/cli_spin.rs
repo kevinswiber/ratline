@@ -1,7 +1,17 @@
+mod common;
+
 use assert_cmd::Command;
 
+// Detached on unix so the spinner does not paint over interactive test
+// runs; plain elsewhere.
+#[cfg(unix)]
 fn rat() -> Command {
-    Command::cargo_bin("rat").expect("rat binary builds")
+    common::rat_detached()
+}
+
+#[cfg(windows)]
+fn rat() -> Command {
+    common::rat()
 }
 
 #[test]
