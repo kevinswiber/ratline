@@ -159,7 +159,39 @@ pub struct SparkArgs {}
 pub struct LogArgs {}
 
 #[derive(clap::Args)]
-pub struct FrameArgs {}
+pub struct FrameArgs {
+    #[command(subcommand)]
+    pub action: Option<FrameAction>,
+    /// State file path (defaults to a per-terminal temp file)
+    #[arg(long)]
+    pub state: Option<std::path::PathBuf>,
+    /// Override the detected terminal width
+    #[arg(long)]
+    pub width: Option<u16>,
+    /// Skip synchronized-output escapes
+    #[arg(long)]
+    pub no_sync: bool,
+    /// Leave the cursor visible while painting
+    #[arg(long)]
+    pub no_hide_cursor: bool,
+    /// Forget the previous frame without painting
+    #[arg(long, conflicts_with_all = ["finish", "clear"])]
+    pub reset: bool,
+    /// Show the cursor, close any open frame, and forget state
+    #[arg(long, conflicts_with = "clear")]
+    pub finish: bool,
+    /// Erase the painted frame, show the cursor, and forget state
+    #[arg(long)]
+    pub clear: bool,
+}
+
+#[derive(clap::Subcommand)]
+pub enum FrameAction {
+    /// Emit the begin-synchronized-update escape
+    Begin,
+    /// Emit the end-synchronized-update escape
+    End,
+}
 
 #[derive(clap::Args)]
 pub struct WatchArgs {}

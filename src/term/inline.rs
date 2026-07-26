@@ -43,6 +43,8 @@ pub fn frame_bytes(prev_rows: u16, lines: &[String], _term_width: u16, sync: boo
 
 /// Repaints blocks of pre-rendered ANSI lines in place. Generic over the
 /// writer so tests assert exact bytes against a Vec<u8>.
+// Consumed by the watch command and the interactive UI loop, which land next.
+#[allow(dead_code)]
 pub struct InlineRenderer<W: Write> {
     out: W,
     prev_rows: u16,
@@ -52,6 +54,7 @@ pub struct InlineRenderer<W: Write> {
     finished: bool,
 }
 
+#[allow(dead_code)]
 impl<W: Write> InlineRenderer<W> {
     pub fn new(out: W) -> Self {
         InlineRenderer {
