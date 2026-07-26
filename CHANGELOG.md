@@ -2,6 +2,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.3.2](https://github.com/kevinswiber/ratto/compare/dac4e59cf3b147b2f174db429ca1ea3ca021ff33..v0.3.2) - 2026-07-26
+#### Bug Fixes
+- brace the interpolated name in the powershell example - ([5da19aa](https://github.com/kevinswiber/ratto/commit/5da19aac53cef138a3cea1fcfa07a200158201ea)) - [@kevinswiber](https://github.com/kevinswiber)
+- render utf-8 correctly on the windows console - ([3a7c188](https://github.com/kevinswiber/ratto/commit/3a7c188bfab81240dae38fb99c1a5a28180fb357)) - [@kevinswiber](https://github.com/kevinswiber)
+- recognize both windows closed-pipe error codes - ([a0ef249](https://github.com/kevinswiber/ratto/commit/a0ef2498d033385f2b99ca17c320c7f825a9fd64)) - [@kevinswiber](https://github.com/kevinswiber)
+- exit quietly on closed pipes on windows and test everywhere - ([4e541b8](https://github.com/kevinswiber/ratto/commit/4e541b8c14f24f684c8689c916b2f48dffc5838c)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- add powershell examples - ([362e63e](https://github.com/kevinswiber/ratto/commit/362e63e950280ba079508a23777e5dd6eba5821f)) - [@kevinswiber](https://github.com/kevinswiber)
+- point changelog links at the current repository - ([dac4e59](https://github.com/kevinswiber/ratto/commit/dac4e59cf3b147b2f174db429ca1ea3ca021ff33)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.3.1](https://github.com/kevinswiber/ratto/compare/0e698431324f0ee0b67ba50ea5755bd3e3881707..v0.3.1) - 2026-07-26
 #### Documentation
 - tidy the readme intro - ([0e69843](https://github.com/kevinswiber/ratto/commit/0e698431324f0ee0b67ba50ea5755bd3e3881707)) - [@kevinswiber](https://github.com/kevinswiber)
