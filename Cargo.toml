@@ -18,7 +18,10 @@ path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.30.2"
-crossterm = "0.29.0"
+# use-dev-tty: macOS kqueue cannot poll /dev/tty, which is exactly the fd
+# crossterm falls back to when stdin is a pipe (`... | rat filter`). The
+# feature swaps mio for a poll(2)-based reader that handles it.
+crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 clap = { version = "4.6.4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4.6.7"
 anyhow = "1.0.104"
