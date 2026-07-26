@@ -222,7 +222,11 @@ pub struct WatchArgs {
 }
 
 #[derive(clap::Args)]
-pub struct DoctorArgs {}
+pub struct DoctorArgs {
+    /// Machine-readable output
+    #[arg(long)]
+    pub json: bool,
+}
 
 #[derive(clap::Args)]
 pub struct ChooseArgs {}
