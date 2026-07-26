@@ -14,7 +14,9 @@ $toppingText = if ($toppings) { $toppings -join ', ' } else { 'no toppings' }
 
 $pick = 'alpha', 'beta', 'gamma', 'delta' | rat filter --header 'Fuzzy find:'
 
-rat confirm "Order $fruit with [$toppingText] for $name?"
+# ${name} braces matter: a bare $name? would interpolate the
+# variable "name?" (question marks are valid in PS variable names).
+rat confirm "Order $fruit with [$toppingText] for ${name}?"
 if ($LASTEXITCODE -eq 0) {
     $me = (Get-Process -Id $PID).Path
     rat spin --title 'Placing order...' -- $me -NoProfile -Command 'Start-Sleep 2'
