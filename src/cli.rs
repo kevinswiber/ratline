@@ -194,7 +194,32 @@ pub enum FrameAction {
 }
 
 #[derive(clap::Args)]
-pub struct WatchArgs {}
+pub struct WatchArgs {
+    /// Refresh interval, e.g. "2s", "500ms", "1m"
+    #[arg(short = 'n', long, default_value = "2s")]
+    pub interval: String,
+    /// Run one tick and exit
+    #[arg(long)]
+    pub once: bool,
+    /// Leave the cursor visible
+    #[arg(long)]
+    pub no_hide_cursor: bool,
+    /// Skip synchronized-output escapes
+    #[arg(long)]
+    pub no_sync: bool,
+    /// Run the command through `sh -c`
+    #[arg(long)]
+    pub shell: bool,
+    /// Bold title line above the output
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Cap the painted height (defaults to terminal height minus two)
+    #[arg(long)]
+    pub max_height: Option<u16>,
+    /// Command to run each tick (after --)
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
 
 #[derive(clap::Args)]
 pub struct DoctorArgs {}

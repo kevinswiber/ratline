@@ -43,8 +43,6 @@ pub fn frame_bytes(prev_rows: u16, lines: &[String], _term_width: u16, sync: boo
 
 /// Repaints blocks of pre-rendered ANSI lines in place. Generic over the
 /// writer so tests assert exact bytes against a Vec<u8>.
-// Consumed by the watch command and the interactive UI loop, which land next.
-#[allow(dead_code)]
 pub struct InlineRenderer<W: Write> {
     out: W,
     prev_rows: u16,
@@ -54,7 +52,6 @@ pub struct InlineRenderer<W: Write> {
     finished: bool,
 }
 
-#[allow(dead_code)]
 impl<W: Write> InlineRenderer<W> {
     pub fn new(out: W) -> Self {
         InlineRenderer {
@@ -94,6 +91,8 @@ impl<W: Write> InlineRenderer<W> {
     }
 
     /// Erase the current frame and forget it.
+    // Consumed by the interactive UI loop, which lands with those commands.
+    #[allow(dead_code)]
     pub fn clear(&mut self) -> std::io::Result<()> {
         let mut bytes = String::new();
         if self.prev_rows > 0 {
@@ -233,4 +232,56 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b[3A"), "second frame must move up 3: {s:?}");
     }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn truncate_keeps_leading_rows_and_counts_hidden() {
+        let input = lines(&["a", "b", "c", "d"]);
+        let (kept, hidden) = truncate_to_rows(input.clone(), 2, 80);
+        assert_eq!(kept, lines(&["a", "b"]));
+        assert_eq!(hidden, 2);
+        let (kept, hidden) = truncate_to_rows(input, 10, 80);
+        assert_eq!(hidden, 0);
+        assert_eq!(kept.len(), 4);
+    }
+
+    #[test]
+    fn truncate_is_wrap_aware() {
+        // One 200-char line is 3 rows at width 80: it alone exceeds 2 rows.
+        let input = lines(&[&"a".repeat(200), "tail"]);
+        let (kept, hidden) = truncate_to_rows(input, 2, 80);
+        assert!(kept.is_empty());
+        assert_eq!(hidden, 2);
+    }
+}
+
+/// Keep the leading lines that fit in `max_rows` rendered rows; return the
+/// kept lines and how many were hidden. Dashboards lead with the headline,
+/// so the head is kept rather than the tail.
+pub fn truncate_to_rows(
+    lines: Vec<String>,
+    max_rows: u16,
+    term_width: u16,
+) -> (Vec<String>, usize) {
+    let mut used: u16 = 0;
+    let mut kept = Vec::new();
+    let total = lines.len();
+    for line in lines {
+        let rows = rendered_rows(std::slice::from_ref(&line), term_width);
+        if used.saturating_add(rows) > max_rows {
+            break;
+        }
+        used += rows;
+        kept.push(line);
+    }
+    let hidden = total - kept.len();
+    (kept, hidden)
 }

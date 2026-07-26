@@ -140,3 +140,36 @@ pub enum DurationFormat {
     Long,
     Clock,
 }
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    #[test]
+    fn parse_interval_supports_ms_and_seconds() {
+        use std::time::Duration;
+        assert_eq!(parse_interval("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_interval("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_interval("2").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_interval("1m").unwrap(), Duration::from_secs(60));
+        assert!(parse_interval("bogus").is_err());
+        assert!(parse_interval("").is_err());
+    }
+}
+
+/// Parse a watch interval: "2s", "500ms", "1m", or bare seconds.
+pub fn parse_interval(s: &str) -> anyhow::Result<std::time::Duration> {
+    let trimmed = s.trim();
+    if let Some(ms) = trimmed.strip_suffix("ms") {
+        let n: u64 = ms
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("invalid interval: {s:?}"))?;
+        return Ok(std::time::Duration::from_millis(n));
+    }
+    let secs = parse_duration(trimmed)?;
+    if secs < 0 {
+        bail!("interval must be positive");
+    }
+    Ok(std::time::Duration::from_secs(secs as u64))
+}
