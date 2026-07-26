@@ -174,10 +174,47 @@ pub struct DateArgs {
 }
 
 #[derive(clap::Args)]
-pub struct SparkArgs {}
+pub struct SparkArgs {
+    /// Numbers to plot; reads stdin when omitted
+    #[arg(allow_negative_numbers = true)]
+    pub values: Vec<String>,
+    /// Clamp the lower bound
+    #[arg(long, allow_negative_numbers = true)]
+    pub min: Option<f64>,
+    /// Clamp the upper bound
+    #[arg(long, allow_negative_numbers = true)]
+    pub max: Option<f64>,
+    /// Color for the sparkline
+    #[arg(long = "spark-color", visible_alias = "color-fg")]
+    pub spark_color: Option<String>,
+}
 
 #[derive(clap::Args)]
-pub struct LogArgs {}
+pub struct LogArgs {
+    /// Message text; joined with single spaces
+    pub text: Vec<String>,
+    /// Log level tag
+    #[arg(short = 'l', long, value_enum)]
+    pub level: Option<LogLevel>,
+    /// Minimum level to emit (lower levels are dropped)
+    #[arg(long, value_enum, env = "RAT_LOG_LEVEL")]
+    pub min_level: Option<LogLevel>,
+    /// Prefix with the current time in this strftime format
+    #[arg(short = 't', long)]
+    pub time: Option<String>,
+    /// Append plain text to this file instead of stderr
+    #[arg(short = 'o', long)]
+    pub file: Option<std::path::PathBuf>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Fatal,
+}
 
 #[derive(clap::Args)]
 pub struct FrameArgs {
