@@ -14,14 +14,7 @@ use crate::term::inline::{InlineRenderer, truncate_to_rows};
 
 pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
     let interval = parse_interval(&args.interval)?;
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let terminated = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))
-        .context("registering SIGINT")?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&terminated))
-        .context("registering SIGTERM")?;
-    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&terminated))
-        .context("registering SIGHUP")?;
+    let (interrupted, terminated) = register_signals()?;
 
     let stdout = std::io::stdout();
     let is_tty = stdout.is_tty();
@@ -133,10 +126,7 @@ struct ChildOutput {
 /// once mode fails loudly.
 fn run_child(args: &WatchArgs) -> Result<ChildOutput, AppError> {
     let output = if args.shell {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(args.command.join(" "))
-            .output()
+        shell_command(&args.command.join(" ")).output()
     } else {
         std::process::Command::new(&args.command[0])
             .args(&args.command[1..])
@@ -160,9 +150,48 @@ fn run_child(args: &WatchArgs) -> Result<ChildOutput, AppError> {
     }
 }
 
+/// Unix: restore the terminal on INT/TERM/HUP. Windows: the interactive
+/// path reads Ctrl-C as a key event; piped mode has no terminal state to
+/// restore, so default console handling suffices.
+#[cfg(unix)]
+fn register_signals() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>), AppError> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let terminated = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupted))
+        .context("registering SIGINT")?;
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&terminated))
+        .context("registering SIGTERM")?;
+    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&terminated))
+        .context("registering SIGHUP")?;
+    Ok((interrupted, terminated))
+}
+
+#[cfg(windows)]
+fn register_signals() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>), AppError> {
+    Ok((
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ))
+}
+
 fn signature(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(unix)]
+fn shell_command(script: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c").arg(script);
+    cmd
+}
+
+#[cfg(windows)]
+fn shell_command(script: &str) -> std::process::Command {
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg("/C").arg(script);
+    cmd
 }

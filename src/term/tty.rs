@@ -15,10 +15,15 @@ enum Inner {
 }
 
 impl UiStream {
-    /// Open /dev/tty read-write; fall back to stderr. Unlike gum (which is
-    /// stderr-only), the UI survives `2>/dev/null`.
+    /// Open the controlling terminal read-write (/dev/tty on unix, CONOUT$
+    /// on Windows); fall back to stderr. Unlike gum (which is stderr-only),
+    /// the UI survives `2>/dev/null`.
     pub fn open() -> Self {
-        let inner = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
+        #[cfg(unix)]
+        const CONSOLE: &str = "/dev/tty";
+        #[cfg(windows)]
+        const CONSOLE: &str = "CONOUT$";
+        let inner = match OpenOptions::new().read(true).write(true).open(CONSOLE) {
             Ok(file) => Inner::Tty(file),
             Err(_) => Inner::Stderr(std::io::stderr()),
         };
@@ -32,8 +37,8 @@ impl UiStream {
         }
     }
 
-    // Consumed by frame's state keying and doctor's report, which land next.
-    #[allow(dead_code)]
+    /// True when the stream is the console device rather than the stderr
+    /// fallback.
     pub fn is_dev_tty(&self) -> bool {
         matches!(self.inner, Inner::Tty(_))
     }

@@ -38,14 +38,33 @@ impl FrameState {
     }
 }
 
-/// Keyed by parent process and controlling terminal so two dashboards in two
-/// terminals never collide.
+/// Keyed per terminal session so two dashboards in two terminals never
+/// collide: parent pid + tty inode on unix; terminal-session env vars on
+/// Windows (pass --state when running several dashboards in one console).
 pub fn default_state_path() -> PathBuf {
+    std::env::temp_dir().join(format!("rat-frame-{}", session_key()))
+}
+
+#[cfg(unix)]
+fn session_key() -> String {
     let parent = std::os::unix::process::parent_id();
     let tty_ino = std::fs::metadata("/dev/tty")
         .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("rat-frame-{parent}-{tty_ino}"))
+    format!("{parent}-{tty_ino}")
+}
+
+#[cfg(windows)]
+fn session_key() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::env::var("WT_SESSION")
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    std::env::var("SESSIONNAME")
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{:x}", hasher.finish())
 }
 
 #[cfg(test)]

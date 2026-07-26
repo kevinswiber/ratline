@@ -1,4 +1,7 @@
-use std::io::{Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -9,6 +12,8 @@ use crate::exit::AppResult;
 use crate::term::tty::UiStream;
 
 /// Terminal support for synchronized output (mode 2026), per DECRPM.
+// Only the unix probe constructs the positive variants.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SyncSupport {
     Unsupported,
@@ -40,6 +45,7 @@ impl SyncSupport {
 }
 
 /// Find a `CSI ? 2026 ; Ps $ y` reply anywhere in the byte stream.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn parse_decrpm(bytes: &[u8]) -> SyncSupport {
     let needle = b"\x1b[?2026;";
     let Some(pos) = bytes
@@ -67,6 +73,14 @@ pub fn parse_decrpm(bytes: &[u8]) -> SyncSupport {
 
 /// Ask the terminal about mode 2026 and wait briefly for the reply. The
 /// reader thread may outlive the wait; the process exits right after.
+#[cfg(windows)]
+fn probe_sync_support(_ui: &mut UiStream) -> SyncSupport {
+    // Reading the DECRQM reply through the Windows console API is not
+    // implemented; report unknown rather than guessing.
+    SyncSupport::NoReply
+}
+
+#[cfg(unix)]
 fn probe_sync_support(ui: &mut UiStream) -> SyncSupport {
     if !ui.is_dev_tty() || !ui.is_tty() {
         return SyncSupport::NoReply;
@@ -122,8 +136,12 @@ pub fn run(args: DoctorArgs, profile: ColorProfile) -> AppResult {
     let reason = profile_reason(is_tty);
     let sync = probe_sync_support(&mut ui);
 
+    #[cfg(unix)]
+    const CONSOLE_NAME: &str = "/dev/tty";
+    #[cfg(windows)]
+    const CONSOLE_NAME: &str = "CONOUT$";
     let stream = if is_dev_tty {
-        "/dev/tty"
+        CONSOLE_NAME
     } else {
         "stderr (fallback)"
     };
