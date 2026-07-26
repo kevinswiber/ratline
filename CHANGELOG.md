@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.2.1](https://github.com/kevinswiber/ratline/compare/2038679fbc70ed86523c76a3ea0c04291640bf48..v0.2.1) - 2026-07-26
+#### Bug Fixes
+- repaint from scratch after a terminal resize in watch - ([4f1c7e2](https://github.com/kevinswiber/ratline/commit/4f1c7e230fcc9df8df6b77ebd36e65cff2ade38c)) - [@kevinswiber](https://github.com/kevinswiber)
+- keep the confirm prompt from vanishing in the fish example - ([a7354f2](https://github.com/kevinswiber/ratline/commit/a7354f27a4500a1baf16216441f5220e865d9d48)) - [@kevinswiber](https://github.com/kevinswiber)
+- enable crossterm use-dev-tty so piped filter reads keys on macos - ([deda8d0](https://github.com/kevinswiber/ratline/commit/deda8d01737ec88f656aaf4ab032c23575825bdc)) - [@kevinswiber](https://github.com/kevinswiber)
+- repair mangled apostrophes in spin help text - ([2038679](https://github.com/kevinswiber/ratline/commit/2038679fbc70ed86523c76a3ea0c04291640bf48)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.2.0](https://github.com/kevinswiber/ratline/compare/d9f8258f0d4cc1cbac3d0bfc0b0edfa35a6b176e..v0.2.0) - 2026-07-26
 #### Features
 - add watch --clear for full-screen dashboards - ([350243d](https://github.com/kevinswiber/ratline/commit/350243d2f5e44a9326cfee429606104dc3d2f83d)) - [@kevinswiber](https://github.com/kevinswiber)
