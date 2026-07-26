@@ -2,6 +2,14 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.4.0](https://github.com/kevinswiber/ratto/compare/458eb4acddba67c7878264fbf739d7d2012a08db..v0.4.0) - 2026-07-26
+#### Features
+- fall back to the stock windows pager when less is missing - ([53e22bf](https://github.com/kevinswiber/ratto/commit/53e22bfb162fe5f7e1b1a8b3f3111cc700286568)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- keep the windows console in utf-8 while the pager runs - ([458eb4a](https://github.com/kevinswiber/ratto/commit/458eb4acddba67c7878264fbf739d7d2012a08db)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.3.2](https://github.com/kevinswiber/ratto/compare/dac4e59cf3b147b2f174db429ca1ea3ca021ff33..v0.3.2) - 2026-07-26
 #### Bug Fixes
 - brace the interpolated name in the powershell example - ([5da19aa](https://github.com/kevinswiber/ratto/commit/5da19aac53cef138a3cea1fcfa07a200158201ea)) - [@kevinswiber](https://github.com/kevinswiber)
