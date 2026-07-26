@@ -11,8 +11,7 @@ hand-roll in every watcher script.
 
 *Ratto* is Italian for rat — a nod to [ratatui](https://ratatui.rs), which
 does the rendering under the hood (this project is not affiliated with
-ratatui). Previously published as `ratline`; those crate versions are
-yanked.
+ratatui).
 
 ```sh
 # The pitch, in one line: a flicker-free dashboard loop with zero escape codes.
