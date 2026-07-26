@@ -42,6 +42,36 @@ fn unknown_subcommand_is_usage_error() {
 }
 
 #[test]
+fn exitcode_harness_maps_codes_exactly() {
+    for code in [0, 1, 7, 124, 130] {
+        rat()
+            .args(["__exitcode", &code.to_string()])
+            .assert()
+            .code(code);
+    }
+}
+
+#[test]
+fn silent_failures_write_nothing_to_stderr() {
+    // 1 maps to NoSelection, 130 to Aborted, 7 to Child: all silent.
+    for code in [1, 7, 130] {
+        rat()
+            .args(["__exitcode", &code.to_string()])
+            .assert()
+            .stderr(predicates::str::is_empty());
+    }
+}
+
+#[test]
+fn timeout_prints_timed_out() {
+    rat()
+        .args(["__exitcode", "124"])
+        .assert()
+        .code(124)
+        .stderr("timed out\n");
+}
+
+#[test]
 fn stub_subcommands_fail_with_not_implemented() {
     rat()
         .arg("doctor")

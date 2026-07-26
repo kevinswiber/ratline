@@ -44,5 +44,13 @@ fn dispatch(command: Command) -> exit::AppResult {
         Command::Filter(args) => commands::filter::run(args),
         Command::Spin(args) => commands::spin::run(args),
         Command::Completion(args) => commands::completion::run(args),
+        #[cfg(debug_assertions)]
+        Command::ExitCode(args) => match args.code {
+            0 => Ok(()),
+            1 => Err(AppError::NoSelection),
+            124 => Err(AppError::Timeout),
+            130 => Err(AppError::Aborted),
+            n => Err(AppError::Child(n)),
+        },
     }
 }

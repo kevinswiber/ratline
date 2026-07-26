@@ -45,6 +45,16 @@ pub enum Command {
     Spin(SpinArgs),
     /// Generate shell completions
     Completion(CompletionArgs),
+    /// Test harness: exit with the given code through AppError mapping.
+    #[cfg(debug_assertions)]
+    #[command(name = "__exitcode", hide = true)]
+    ExitCode(ExitCodeArgs),
+}
+
+#[cfg(debug_assertions)]
+#[derive(clap::Args)]
+pub struct ExitCodeArgs {
+    pub code: i32,
 }
 
 #[derive(clap::Args)]

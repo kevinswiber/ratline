@@ -5,8 +5,6 @@ pub const ABORTED: i32 = 130;
 
 /// Command-level failure carrying its process exit code. Only `main` turns
 /// this into `process::exit`; everything else returns `AppResult`.
-// Variants beyond Fail are constructed by commands that land next.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum AppError {
     /// Message printed to stderr, exit 1.
