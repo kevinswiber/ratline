@@ -47,15 +47,28 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
     let mut previous_hash: Option<u64> = None;
     loop {
         let output = run_child(&args)?;
-        let hash = signature(&output);
+        let mut combined = output.stdout.clone();
+        combined.extend_from_slice(&output.stderr);
+        let hash = signature(&combined);
         if previous_hash != Some(hash) {
             previous_hash = Some(hash);
-            let body = String::from_utf8_lossy(&output);
+            let body = String::from_utf8_lossy(&output.stdout);
             let mut lines: Vec<String> = Vec::new();
             if let Some(title) = &title_line {
                 lines.push(title.clone());
             }
             lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
+            // Child stderr joins the frame; a raw write to the terminal
+            // would shift the cursor and corrupt the relative repaint.
+            if is_tty && !output.stderr.is_empty() {
+                let err_body = String::from_utf8_lossy(&output.stderr);
+                lines.extend(
+                    err_body
+                        .trim_end_matches('\n')
+                        .split('\n')
+                        .map(str::to_string),
+                );
+            }
             if is_tty {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 let max_rows = args.max_height.unwrap_or_else(|| rows.saturating_sub(2));
@@ -70,6 +83,12 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
                     writeln!(out, "{line}").context("writing")?;
                 }
                 out.flush().context("flushing")?;
+                // Piped mode keeps the streams separate for log readability.
+                if !output.stderr.is_empty() {
+                    let mut err = std::io::stderr().lock();
+                    err.write_all(&output.stderr).context("writing stderr")?;
+                    err.flush().context("flushing stderr")?;
+                }
             }
         }
 
@@ -99,29 +118,40 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
     Ok(())
 }
 
-/// Run one tick of the child, capturing stdout; stderr passes through.
-/// Loop mode renders spawn/read failures as content so a transient failure
-/// does not tear down the dashboard; once mode fails loudly.
-fn run_child(args: &WatchArgs) -> Result<Vec<u8>, AppError> {
+struct ChildOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run one tick of the child, capturing both streams. On a tty the stderr
+/// joins the painted frame (raw terminal writes would corrupt the repaint);
+/// piped mode forwards it to our stderr. Loop mode renders spawn failures
+/// as content so a transient failure does not tear down the dashboard;
+/// once mode fails loudly.
+fn run_child(args: &WatchArgs) -> Result<ChildOutput, AppError> {
     let output = if args.shell {
         std::process::Command::new("sh")
             .arg("-c")
             .arg(args.command.join(" "))
-            .stderr(std::process::Stdio::inherit())
             .output()
     } else {
         std::process::Command::new(&args.command[0])
             .args(&args.command[1..])
-            .stderr(std::process::Stdio::inherit())
             .output()
     };
     match output {
-        Ok(out) => Ok(out.stdout),
+        Ok(out) => Ok(ChildOutput {
+            stdout: out.stdout,
+            stderr: out.stderr,
+        }),
         Err(err) => {
             if args.once {
                 Err(anyhow!("running {:?}: {err}", args.command[0]).into())
             } else {
-                Ok(format!("watch: {:?}: {err}", args.command[0]).into_bytes())
+                Ok(ChildOutput {
+                    stdout: format!("watch: {:?}: {err}", args.command[0]).into_bytes(),
+                    stderr: Vec::new(),
+                })
             }
         }
     }

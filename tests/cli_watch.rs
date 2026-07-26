@@ -103,3 +103,33 @@ fn clear_flag_stays_silent_when_piped() {
     assert!(!stdout.contains("\x1b[2J"), "piped output must stay plain");
     assert!(stdout.contains("hi"));
 }
+
+#[test]
+fn child_stderr_passes_through_when_piped() {
+    rat()
+        .args([
+            "watch",
+            "--once",
+            "--",
+            "sh",
+            "-c",
+            "echo out; echo err >&2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("out"))
+        .stderr(predicates::str::contains("err"));
+}
+
+#[test]
+fn child_stderr_stays_off_stdout_when_piped() {
+    let assert = rat()
+        .args(["watch", "--once", "--", "sh", "-c", "echo err >&2"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        !stdout.contains("err"),
+        "stderr leaked into stdout: {stdout:?}"
+    );
+}
