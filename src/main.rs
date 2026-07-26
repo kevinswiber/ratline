@@ -5,8 +5,7 @@ mod core;
 mod exit;
 mod style_spec;
 mod term;
-// Consumed by the interactive commands, which land next.
-#[allow(dead_code)]
+
 mod ui;
 
 use clap::Parser;

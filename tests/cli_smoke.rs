@@ -74,7 +74,7 @@ fn timeout_prints_timed_out() {
 #[test]
 fn stub_subcommands_fail_with_not_implemented() {
     rat()
-        .arg("choose")
+        .arg("input")
         .assert()
         .code(1)
         .stderr(predicates::str::contains("not implemented"));

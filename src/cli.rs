@@ -287,10 +287,76 @@ pub struct DoctorArgs {
 }
 
 #[derive(clap::Args)]
-pub struct ChooseArgs {}
+pub struct ChooseArgs {
+    /// Options to pick from; reads stdin when omitted
+    pub options: Vec<String>,
+    /// Maximum selections (single-select by default)
+    #[arg(long, default_value_t = 1, conflicts_with = "no_limit")]
+    pub limit: usize,
+    /// Allow any number of selections
+    #[arg(long)]
+    pub no_limit: bool,
+    /// Return results in list order instead of selection order
+    #[arg(long)]
+    pub ordered: bool,
+    /// Visible list height
+    #[arg(long, default_value_t = 10)]
+    pub height: u16,
+    /// Cursor marker
+    #[arg(long, default_value = "> ")]
+    pub cursor: String,
+    /// Header shown above the list
+    #[arg(long, default_value = "Choose:")]
+    pub header: String,
+    /// Prefix for selected items (multi-select)
+    #[arg(long, default_value = "✓ ")]
+    pub selected_prefix: String,
+    /// Prefix for unselected items (multi-select)
+    #[arg(long, default_value = "• ")]
+    pub unselected_prefix: String,
+    /// Preselect these options
+    #[arg(long)]
+    pub selected: Vec<String>,
+    /// Auto-select when only one option exists
+    #[arg(long)]
+    pub select_if_one: bool,
+    /// Delimiter for stdin options
+    #[arg(long, default_value = "\n")]
+    pub input_delimiter: String,
+    /// Delimiter joining printed results
+    #[arg(long, default_value = "\n")]
+    pub output_delimiter: String,
+    /// Show the key help footer
+    #[arg(long, overrides_with = "no_show_help")]
+    pub show_help: bool,
+    #[arg(long)]
+    pub no_show_help: bool,
+    /// Give up after this long (exit 124)
+    #[arg(long)]
+    pub timeout: Option<String>,
+}
 
 #[derive(clap::Args)]
-pub struct ConfirmArgs {}
+pub struct ConfirmArgs {
+    /// The question to ask
+    #[arg(default_value = "Are you sure?")]
+    pub prompt: String,
+    /// Initially selected answer
+    #[arg(long = "default", default_value_t = true, action = clap::ArgAction::Set)]
+    pub default_yes: bool,
+    /// Label for the affirmative answer
+    #[arg(long, default_value = "Yes")]
+    pub affirmative: String,
+    /// Label for the negative answer
+    #[arg(long, default_value = "No")]
+    pub negative: String,
+    /// Print the chosen label to stdout
+    #[arg(long)]
+    pub show_output: bool,
+    /// Give up after this long (exit 124)
+    #[arg(long)]
+    pub timeout: Option<String>,
+}
 
 #[derive(clap::Args)]
 pub struct InputArgs {}
