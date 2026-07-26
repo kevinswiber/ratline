@@ -51,8 +51,9 @@ child pass through untouched. Piped output degrades to plain text, so
 While watching: `q` quits, and `v` (or Enter) opens the full untruncated
 frame in your pager — resolved bat-style from `RAT_PAGER`, then `PAGER`,
 then `less` (with `-R` ensured so colors survive; quit the pager and the
-watch resumes). When output is taller than the screen, the truncation line
-says so: `… 12 more lines · v views all · q quits`.
+watch resumes). On Windows, when `less` isn't installed the stock
+`more.com` steps in. When output is taller than the screen, the truncation
+line says so: `… 12 more lines · v views all · q quits`.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 
@@ -219,9 +220,10 @@ uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`; synchronized
 output works in Windows Terminal and is harmlessly ignored by legacy
 conhost. Two notes:
 
-- Windows ships no ANSI-capable pager (`more.com` mangles colors), so the
-  `v` key in `watch` needs `less.exe` on PATH — Git for Windows, scoop, and
-  winget all provide one — or set `RAT_PAGER`.
+- The `v` key in `watch` prefers `less.exe` on PATH (Git for Windows,
+  scoop, and winget all provide one) and falls back to the stock `more.com`,
+  with the console held in UTF-8 while the pager runs so glyphs render
+  correctly; set `RAT_PAGER` to override.
 - `rat frame`'s default state file is keyed per terminal session; when
   running several dashboards in one console session, pass `--state`.
 

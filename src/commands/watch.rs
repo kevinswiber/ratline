@@ -9,7 +9,7 @@ use crossterm::tty::IsTty;
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
 use crate::core::duration::parse_interval;
-use crate::core::pager::resolve_pager;
+use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
@@ -165,13 +165,15 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
 }
 
 /// Hand the full untruncated frame to the user's pager (RAT_PAGER, PAGER,
-/// then less -R), bat-style. The loop resumes when the pager exits; a
-/// failure to launch becomes a status line, never an error exit.
+/// then less -R, then more.com on Windows), bat-style. The loop resumes
+/// when the pager exits; a failure to launch becomes a status line, never
+/// an error exit.
 fn page_frame(
     lines: &[String],
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
 ) -> Option<String> {
-    let pager = resolve_pager(&SystemEnv)?;
+    let pagers = resolve_pagers(&SystemEnv);
+    let mut used = pagers.first().map(|p| p.bin.clone()).unwrap_or_default();
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = renderer.finish();
     // The pager inherits the console; keep it decoding UTF-8 while the
@@ -179,10 +181,8 @@ fn page_frame(
     let _console_utf8 = ConsoleUtf8Guard::enable();
 
     let result = (|| -> std::io::Result<()> {
-        let mut child = std::process::Command::new(&pager.bin)
-            .args(&pager.args)
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
+        let (bin, mut child) = spawn_first(&pagers)?;
+        used = bin;
         // Quitting the pager before it reads everything is normal; do not
         // let the default SIGPIPE disposition kill the watch for it.
         #[cfg(unix)]
@@ -213,10 +213,28 @@ fn page_frame(
     match result {
         Ok(()) => None,
         Err(err) => Some(format!(
-            "pager {:?} failed ({err}) — set RAT_PAGER or install less",
-            pager.bin
+            "pager {used:?} failed ({err}) — set RAT_PAGER or install less"
         )),
     }
+}
+
+/// Spawn the first launchable pager candidate; on Windows the default chain
+/// ends in the stock more.com, so this only fails when every candidate is
+/// missing (or a configured pager is).
+fn spawn_first(pagers: &[PagerCommand]) -> std::io::Result<(String, std::process::Child)> {
+    let mut last_err =
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no pager candidates resolved");
+    for pager in pagers {
+        match std::process::Command::new(&pager.bin)
+            .args(&pager.args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok((pager.bin.clone(), child)),
+            Err(err) => last_err = err,
+        }
+    }
+    Err(last_err)
 }
 
 struct ChildOutput {
