@@ -32,6 +32,7 @@ impl BarPreset {
     }
 }
 
+#[derive(Clone)]
 pub struct BarSpec<'a> {
     pub value: f64,
     pub total: f64,
@@ -95,6 +96,161 @@ pub fn render_bar(spec: &BarSpec<'_>, profile: ColorProfile) -> String {
             "{}{pct:>5.1}%",
             if show_ratio { " " } else { "  " }
         ));
+    }
+    if let Some(state) = spec.state {
+        out.push_str("  ");
+        out.push_str(state);
+    }
+    out
+}
+
+#[derive(Debug)]
+pub struct BarRow {
+    pub label: String,
+    pub value: f64,
+    pub total: f64,
+    pub state: Option<String>,
+}
+
+/// Parse batch rows: `label<DELIM>value<DELIM>total[<DELIM>state]`.
+pub fn parse_rows(input: &str, delimiter: char) -> anyhow::Result<Vec<BarRow>> {
+    let mut rows = Vec::new();
+    for (idx, line) in input.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let n = idx + 1;
+        let fields: Vec<&str> = line.split(delimiter).collect();
+        if fields.len() < 3 {
+            anyhow::bail!("line {n}: expected label{delimiter}value{delimiter}total, got {line:?}");
+        }
+        let value: f64 = fields[1]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {n}: value {:?} is not a number", fields[1]))?;
+        let total: f64 = fields[2]
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("line {n}: total {:?} is not a number", fields[2]))?;
+        rows.push(BarRow {
+            label: fields[0].to_string(),
+            value,
+            total,
+            state: fields.get(3).map(|s| s.to_string()),
+        });
+    }
+    Ok(rows)
+}
+
+/// Widest label display width, capped at `max`.
+pub fn auto_label_width(rows: &[BarRow], max: u16) -> u16 {
+    rows.iter()
+        .map(|r| r.label.width().min(usize::from(u16::MAX)) as u16)
+        .max()
+        .unwrap_or(0)
+        .min(max)
+}
+
+/// Render every row with one shared label column.
+pub fn render_rows(rows: &[BarRow], spec: &BarSpec<'_>, profile: ColorProfile) -> Vec<String> {
+    let label_width = auto_label_width(rows, spec.label_width);
+    rows.iter()
+        .map(|row| {
+            let row_spec = BarSpec {
+                value: row.value,
+                total: row.total,
+                label: Some(row.label.as_str()),
+                label_width,
+                state: row.state.as_deref(),
+                fill_style: spec.fill_style.clone(),
+                empty_style: spec.empty_style.clone(),
+                ..*spec
+            };
+            render_bar(&row_spec, profile)
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+pub struct Threshold {
+    pub at: f64,
+    pub color: ratatui::style::Color,
+}
+
+/// Parse `"33:196,66:214,100:42"` into ascending percentage bands.
+pub fn parse_thresholds(s: &str) -> anyhow::Result<Vec<Threshold>> {
+    let mut thresholds = Vec::new();
+    for part in s.split(',') {
+        let (at, color) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("threshold {part:?} is not at:color"))?;
+        thresholds.push(Threshold {
+            at: at
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("threshold {at:?} is not a number"))?,
+            color: crate::style_spec::parse_color(color.trim())?,
+        });
+    }
+    thresholds.sort_by(|a, b| a.at.total_cmp(&b.at));
+    Ok(thresholds)
+}
+
+/// First band whose `at` is >= pct; falls back past the last band.
+pub fn color_for(
+    pct: f64,
+    thresholds: &[Threshold],
+    fallback: Option<ratatui::style::Color>,
+) -> Option<ratatui::style::Color> {
+    thresholds
+        .iter()
+        .find(|t| pct <= t.at)
+        .map(|t| t.color)
+        .or_else(|| thresholds.last().map(|t| t.color))
+        .or(fallback)
+}
+
+/// Moving block for unknown totals: (start, len), period == width.
+pub fn indeterminate_span(width: u16, tick: u64) -> (u16, u16) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let len = (width / 4).max(1);
+    let start = (tick % u64::from(width)) as u16;
+    (start, len)
+}
+
+/// Render an indeterminate bar: the moving block wraps around the width.
+pub fn render_indeterminate(spec: &BarSpec<'_>, tick: u64, profile: ColorProfile) -> String {
+    let (start, len) = indeterminate_span(spec.width, tick);
+    let mut cells = vec![spec.empty; usize::from(spec.width)];
+    for i in 0..len {
+        let idx = usize::from((start + i) % spec.width.max(1));
+        cells[idx] = spec.fill;
+    }
+    let mut out = String::new();
+    if let Some(label) = spec.label {
+        out.push_str(label);
+        let pad = usize::from(spec.label_width).saturating_sub(label.width());
+        out.push_str(&" ".repeat(pad));
+        out.push(' ');
+    }
+    // Style contiguous runs so fill/empty keep their own colors.
+    let mut i = 0usize;
+    while i < cells.len() {
+        let is_fill = cells[i] == spec.fill;
+        let mut j = i;
+        while j < cells.len() && (cells[j] == spec.fill) == is_fill {
+            j += 1;
+        }
+        let run: String = cells[i..j].iter().collect();
+        let style = if is_fill {
+            &spec.fill_style
+        } else {
+            &spec.empty_style
+        };
+        out.push_str(&style.render(&run, profile));
+        i = j;
     }
     if let Some(state) = spec.state {
         out.push_str("  ");
@@ -220,5 +376,100 @@ mod tests {
         assert_eq!(BarPreset::Ascii.chars(), ('#', '-'));
         assert_eq!(BarPreset::Line.chars(), ('━', '─'));
         assert_eq!(BarPreset::Dots.chars(), ('⣿', '⣀'));
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use ratatui::style::Color;
+
+    use super::*;
+    use crate::color::ColorProfile;
+    use crate::style_spec::StyleSpec;
+
+    #[test]
+    fn parse_rows_happy_path() {
+        let rows = parse_rows("a\t1\t4\nb\t2\t4\trunning\nc\t3\t4\n", '\t').unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].label, "a");
+        assert_eq!(rows[1].state.as_deref(), Some("running"));
+        assert_eq!(rows[2].value, 3.0);
+        assert_eq!(rows[2].total, 4.0);
+    }
+
+    #[test]
+    fn parse_rows_missing_field_names_line() {
+        let err = parse_rows("a\t1\t4\nbroken\n", '\t')
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line 2"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rows_non_numeric_is_an_error() {
+        let err = parse_rows("a\tx\t4\n", '\t').unwrap_err().to_string();
+        assert!(err.contains("line 1"), "got: {err}");
+    }
+
+    #[test]
+    fn auto_label_width_is_widest_capped() {
+        let rows = parse_rows("ab\t1\t2\nlonger-label\t1\t2\n", '\t').unwrap();
+        assert_eq!(auto_label_width(&rows, 40), 12);
+        assert_eq!(auto_label_width(&rows, 8), 8);
+    }
+
+    #[test]
+    fn render_rows_pads_equally() {
+        let rows = parse_rows("a\t1\t4\nlonger\t3\t4\n", '\t').unwrap();
+        let spec = BarSpec {
+            value: 0.0,
+            total: 0.0,
+            width: 8,
+            fill: '#',
+            empty: '-',
+            fill_style: StyleSpec::default(),
+            empty_style: StyleSpec::default(),
+            label: None,
+            label_width: 40,
+            annotation: Annotation::Ratio,
+            state: None,
+        };
+        let lines = render_rows(&rows, &spec, ColorProfile::Ascii);
+        assert_eq!(lines.len(), 2);
+        let bar_at = |s: &str| s.find(['#', '-']).unwrap();
+        assert_eq!(bar_at(&lines[0]), bar_at(&lines[1]));
+    }
+
+    #[test]
+    fn thresholds_parse_and_band() {
+        let t = parse_thresholds("33:196,66:214,100:42").unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(color_for(0.0, &t, None), Some(Color::Indexed(196)));
+        assert_eq!(color_for(33.0, &t, None), Some(Color::Indexed(196)));
+        assert_eq!(color_for(50.0, &t, None), Some(Color::Indexed(214)));
+        assert_eq!(color_for(100.0, &t, None), Some(Color::Indexed(42)));
+        assert_eq!(
+            color_for(50.0, &[], Some(Color::Indexed(7))),
+            Some(Color::Indexed(7))
+        );
+    }
+
+    #[test]
+    fn bad_thresholds_are_errors() {
+        assert!(parse_thresholds("nope").is_err());
+        assert!(parse_thresholds("33:notacolor").is_err());
+    }
+
+    #[test]
+    fn indeterminate_is_periodic() {
+        for tick in 0..3 {
+            assert_eq!(
+                indeterminate_span(32, tick),
+                indeterminate_span(32, tick + 32)
+            );
+        }
+        let (_, len) = indeterminate_span(32, 5);
+        assert!(len >= 1);
+        assert_ne!(indeterminate_span(32, 0), indeterminate_span(32, 1));
     }
 }

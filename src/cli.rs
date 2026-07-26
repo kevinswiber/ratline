@@ -111,8 +111,9 @@ pub struct BarArgs {
     /// Override the empty character
     #[arg(long)]
     pub empty: Option<char>,
-    #[arg(long, default_value = "212")]
-    pub fill_color: String,
+    /// Fill color; wins over --thresholds when given (default 212)
+    #[arg(long)]
+    pub fill_color: Option<String>,
     #[arg(long, default_value = "240")]
     pub empty_color: String,
     /// State word appended after the annotations
@@ -120,6 +121,18 @@ pub struct BarArgs {
     pub state: Option<String>,
     #[arg(long, value_enum, default_value_t = crate::core::bar::Annotation::Both)]
     pub annotation: crate::core::bar::Annotation,
+    /// Color the fill by percentage band, e.g. "33:196,66:214,100:42"
+    #[arg(long)]
+    pub thresholds: Option<String>,
+    /// Field delimiter for stdin batch rows
+    #[arg(long, default_value_t = '\t')]
+    pub delimiter: char,
+    /// Render a moving block instead of progress (unknown total)
+    #[arg(long)]
+    pub indeterminate: bool,
+    /// Animation step for --indeterminate
+    #[arg(long, default_value_t = 0)]
+    pub tick: u64,
 }
 
 #[derive(clap::Args)]
