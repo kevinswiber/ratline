@@ -70,12 +70,3 @@ fn timeout_prints_timed_out() {
         .code(124)
         .stderr("timed out\n");
 }
-
-#[test]
-fn stub_subcommands_fail_with_not_implemented() {
-    rat()
-        .arg("spin")
-        .assert()
-        .code(1)
-        .stderr(predicates::str::contains("not implemented"));
-}

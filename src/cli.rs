@@ -445,7 +445,32 @@ pub struct FilterArgs {
 }
 
 #[derive(clap::Args)]
-pub struct SpinArgs {}
+pub struct SpinArgs {
+    /// Spinner charset
+    #[arg(short = 's', long, value_enum, default_value_t = crate::ui::spin::Spinner::Dot)]
+    pub spinner: crate::ui::spin::Spinner,
+    /// Text shown beside the spinner
+    #[arg(long, default_value = "Loading...")]
+    pub title: String,
+    /// Show the child'"'"'s stdout and stderr when it finishes
+    #[arg(long)]
+    pub show_output: bool,
+    /// Show only the child'"'"'s stdout
+    #[arg(long)]
+    pub show_stdout: bool,
+    /// Show only the child'"'"'s stderr
+    #[arg(long)]
+    pub show_stderr: bool,
+    /// Show the child'"'"'s output only when it fails
+    #[arg(long)]
+    pub show_error: bool,
+    /// Kill the child after this long (exit 124)
+    #[arg(long)]
+    pub timeout: Option<String>,
+    /// Command to run (after --)
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
 
 #[derive(clap::Args)]
 pub struct CompletionArgs {}

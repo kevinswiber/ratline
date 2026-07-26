@@ -4,3 +4,4 @@ pub mod filter;
 pub mod input;
 pub mod key;
 pub mod loop_;
+pub mod spin;
