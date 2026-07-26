@@ -1,6 +1,4 @@
-# Flip to true after the first release tag exists; with zero tags, cocogitto
-# commands (including install-hook) fail with "unable to get any tag".
-from_latest_tag = false
+from_latest_tag = true
 ignore_merge_commits = true
 ignore_fixup_commits = true
 disable_changelog = false
