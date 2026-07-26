@@ -4,13 +4,14 @@ mod commands;
 mod core;
 mod exit;
 mod style_spec;
+mod term;
 
 use clap::Parser;
-use crossterm::tty::IsTty;
 
 use crate::cli::{Cli, Command};
 use crate::color::ColorProfile;
 use crate::exit::{AppError, OK};
+use crate::term::tty::UiStream;
 
 fn main() {
     std::process::exit(real_main());
@@ -18,9 +19,9 @@ fn main() {
 
 fn real_main() -> i32 {
     let cli = Cli::parse();
-    // Capability comes from stderr's ttyness, never stdout's, so command
-    // substitution keeps color. Upgraded to the /dev/tty UiStream later.
-    let is_tty = std::io::stderr().is_tty();
+    // Capability comes from the UI stream's ttyness, never stdout's, so
+    // command substitution keeps color.
+    let is_tty = UiStream::open().is_tty();
     let profile = color::resolve_profile(cli.color, &color::SystemEnv, is_tty);
     match dispatch(cli.command, profile) {
         Ok(()) => OK,
