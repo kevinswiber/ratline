@@ -139,8 +139,9 @@ Under the default `--color auto`, output goes plain only when:
 - `CI` is set — CI logs are treated as not-a-terminal;
 - `TERM` is `dumb`, unset, or names no color support.
 
-`--color always` forces color (trusting `TERM` even when piped) and
-`--color never` strips it; both beat the environment except `NO_COLOR`.
+`--color always` and `--color never` beat the environment entirely: an
+explicit flag outranks ambient variables, so `always` colors at full
+`TERM` depth even under `NO_COLOR` or in CI, and `never` always strips.
 To strip ANSI coming from *other* programs, pipe through a bare
 `rat style`: input escapes are removed by default and an empty style adds
 nothing back.

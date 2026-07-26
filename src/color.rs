@@ -66,6 +66,12 @@ fn base_profile(env: &dyn EnvSource, stream_is_tty: bool) -> ColorProfile {
     if env.get("CI").is_some_and(|v| !v.is_empty()) || !stream_is_tty {
         return ColorProfile::Ascii;
     }
+    term_capability(env)
+}
+
+/// What TERM/COLORTERM alone say the terminal can render, with no tty or
+/// kill-switch gating. This is what an explicit `--color always` trusts.
+fn term_capability(env: &dyn EnvSource) -> ColorProfile {
     if env.get("GOOGLE_CLOUD_SHELL").as_deref() == Some("true") {
         return ColorProfile::TrueColor;
     }
@@ -105,9 +111,10 @@ fn base_profile(env: &dyn EnvSource, stream_is_tty: bool) -> ColorProfile {
 pub fn resolve_profile(mode: ColorMode, env: &dyn EnvSource, is_tty: bool) -> ColorProfile {
     match mode {
         ColorMode::Never => ColorProfile::Ascii,
-        // Always pretends the stream is a tty so TERM decides the profile;
-        // otherwise forcing color in a pipe would degrade to 16 colors.
-        ColorMode::Always => detect_profile(env, true).max(ColorProfile::Ansi),
+        // An explicit --color always outranks the ambient environment:
+        // ttyness, NO_COLOR, CLICOLOR, and CI are all ignored, and
+        // TERM/COLORTERM decide the depth (16-color at minimum).
+        ColorMode::Always => term_capability(env).max(ColorProfile::Ansi),
         ColorMode::Auto => detect_profile(env, is_tty),
     }
 }
@@ -167,6 +174,22 @@ mod tests {
         #[case] expected: ColorProfile,
     ) {
         assert_eq!(detect_profile(&env(pairs), is_tty), expected);
+    }
+
+    #[test]
+    fn always_ignores_kill_switches_at_full_depth() {
+        // An explicit --color always outranks ambient NO_COLOR/CI, and TERM
+        // decides the depth: 256-color, not a 16-color floor.
+        let e = env(&[("NO_COLOR", "1"), ("TERM", "xterm-256color")]);
+        assert_eq!(
+            resolve_profile(ColorMode::Always, &e, false),
+            ColorProfile::Ansi256
+        );
+        let ci = env(&[("CI", "1"), ("TERM", "xterm-ghostty")]);
+        assert_eq!(
+            resolve_profile(ColorMode::Always, &ci, false),
+            ColorProfile::TrueColor
+        );
     }
 
     #[test]
