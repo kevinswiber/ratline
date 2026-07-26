@@ -33,8 +33,12 @@ fn main() {
             .map(String::as_str)
             .or_else(|| info.payload().downcast_ref::<&str>().copied())
             .unwrap_or("");
-        // "os error 232" is ERROR_NO_DATA, Windows' closed-pipe error.
-        if payload.contains("Broken pipe") || payload.contains("os error 232") {
+        // Windows closed-pipe errors: 109 ERROR_BROKEN_PIPE ("the pipe has
+        // been ended"), 232 ERROR_NO_DATA ("the pipe is being closed").
+        if payload.contains("Broken pipe")
+            || payload.contains("os error 109")
+            || payload.contains("os error 232")
+        {
             std::process::exit(0);
         }
         default_hook(info);
