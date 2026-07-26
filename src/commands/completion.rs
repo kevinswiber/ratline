@@ -1,7 +1,11 @@
-use crate::cli::CompletionArgs;
-use crate::color::ColorProfile;
-use crate::exit::{AppError, AppResult};
+use clap::CommandFactory;
 
-pub fn run(_args: CompletionArgs, _profile: ColorProfile) -> AppResult {
-    Err(AppError::Fail(anyhow::anyhow!("not implemented")))
+use crate::cli::{Cli, CompletionArgs};
+use crate::color::ColorProfile;
+use crate::exit::AppResult;
+
+pub fn run(args: CompletionArgs, _profile: ColorProfile) -> AppResult {
+    let mut cmd = Cli::command();
+    clap_complete::generate(args.shell, &mut cmd, "rat", &mut std::io::stdout());
+    Ok(())
 }

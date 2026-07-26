@@ -1,10 +1,21 @@
+use clap::builder::styling::{Ansi256Color, Color, Style, Styles};
+
 use crate::color::ColorMode;
+
+/// Help styling: bold headers, the brand pink for literals. clap only
+/// applies it on a tty and honors NO_COLOR.
+const HELP_STYLES: Styles = Styles::styled()
+    .header(Style::new().bold())
+    .usage(Style::new().bold())
+    .literal(Style::new().fg_color(Some(Color::Ansi256(Ansi256Color(212)))))
+    .placeholder(Style::new().dimmed());
 
 #[derive(clap::Parser)]
 #[command(
     name = "rat",
     version,
-    about = "Ratatui-powered primitives for shell dashboards"
+    about = "Ratatui-powered primitives for shell dashboards",
+    styles = HELP_STYLES
 )]
 pub struct Cli {
     #[arg(long, value_enum, global = true, default_value_t = ColorMode::Auto)]
@@ -473,7 +484,11 @@ pub struct SpinArgs {
 }
 
 #[derive(clap::Args)]
-pub struct CompletionArgs {}
+pub struct CompletionArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
+}
 
 #[cfg(test)]
 mod tests {
