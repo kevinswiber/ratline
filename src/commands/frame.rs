@@ -88,7 +88,7 @@ pub fn run(args: FrameArgs, _profile: ColorProfile) -> AppResult {
     if !args.no_hide_cursor {
         bytes.push_str("\x1b[?25l");
     }
-    bytes.push_str(&frame_bytes(prev_rows, &lines, cols, !args.no_sync));
+    bytes.push_str(&frame_bytes(prev_rows, &lines, cols, !args.no_sync, false));
     stdout.write_all(bytes.as_bytes()).context("writing")?;
     stdout.flush().context("flushing")?;
 

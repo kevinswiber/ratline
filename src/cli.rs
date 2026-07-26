@@ -270,6 +270,9 @@ pub struct WatchArgs {
     /// Run one tick and exit
     #[arg(long)]
     pub once: bool,
+    /// Clear the screen before the first frame (atomically, inside it)
+    #[arg(long)]
+    pub clear: bool,
     /// Leave the cursor visible
     #[arg(long)]
     pub no_hide_cursor: bool,

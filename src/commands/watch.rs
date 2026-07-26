@@ -29,7 +29,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
     // content so `rat watch | tee log` stays readable.
     let mut renderer = InlineRenderer::new(stdout.lock())
         .with_cursor_hidden(is_tty && !args.no_hide_cursor)
-        .with_sync_output(is_tty && !args.no_sync);
+        .with_sync_output(is_tty && !args.no_sync)
+        .with_clear_screen(is_tty && args.clear);
 
     let title_line = args.title.as_ref().map(|title| {
         StyleSpec {

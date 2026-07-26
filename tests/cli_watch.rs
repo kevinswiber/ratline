@@ -92,3 +92,14 @@ fn shell_mode_runs_through_sh() {
         .success()
         .stdout(predicates::str::contains("42"));
 }
+
+#[test]
+fn clear_flag_stays_silent_when_piped() {
+    let assert = rat()
+        .args(["watch", "--clear", "--once", "--", "echo", "hi"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(!stdout.contains("\x1b[2J"), "piped output must stay plain");
+    assert!(stdout.contains("hi"));
+}
