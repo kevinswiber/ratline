@@ -14,19 +14,21 @@ rigging by. This one is also a nod to [ratatui](https://ratatui.rs), which
 does the rendering under the hood (this project is not affiliated with
 ratatui).
 
-```fish
+```sh
 # The pitch, in one line: a flicker-free dashboard loop with zero escape codes.
-rat watch --interval 2s -- ./render-status.fish
+rat watch --interval 2s -- ./render-status.sh
 ```
 
 ## Install
 
 ```sh
 cargo install ratline
-rat completion fish > ~/.config/fish/completions/rat.fish
+rat completion bash > ~/.local/share/bash-completion/completions/rat
+rat completion fish > ~/.config/fish/completions/rat.fish   # zsh/powershell/elvish too
 ```
 
-Works in any shell; examples here use fish. Synchronized-output repainting
+Works in any shell; examples here are plain bash, and [`examples/`](examples/)
+has full scripts in bash, zsh, and fish. Synchronized-output repainting
 uses terminal mode 2026 (Ghostty, Kitty, Alacritty, WezTerm, iTerm2, Windows
 Terminal, …). Terminals without it just ignore the escapes — everything still
 works. Check yours with `rat doctor`.
@@ -51,14 +53,14 @@ child pass through untouched. Piped output degrades to plain text, so
 
 When you want your own loop, pipe each frame's content through `rat frame`:
 
-```fish
-while true
-    begin
+```sh
+while true; do
+    {
         rat style --bold --foreground 212 'My Dashboard'
-        rat bar --label build --value $done --total $total
-    end | rat frame
+        rat bar --label build --value "$done" --total "$total"
+    } | rat frame
     sleep 2
-end
+done
 rat frame --finish   # show the cursor again when done
 ```
 
@@ -124,7 +126,7 @@ rat log --time '%H:%M:%S' --level info up    # timestamped
 ```
 
 Colors survive command substitution — capability is detected from the
-terminal, never from stdout, so `set banner (rat style --bold hi)` keeps its
+terminal, never from stdout, so `banner=$(rat style --bold hi)` keeps its
 escapes. `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` are honored;
 `--color always|never|auto` overrides.
 
@@ -132,14 +134,14 @@ escapes. `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` are honored;
 
 The gum staples, rendering to `/dev/tty` so stdout stays clean:
 
-```fish
-set fruit (rat choose apple banana cherry)
-set names (rat choose --no-limit alice bob carol)   # space selects, enter confirms
-rat confirm 'Ship it?'; and deploy                  # exit 0 = yes, 1 = no
-set name (rat input --placeholder 'Your name')
-set pw (rat input --password)
-set branch (git branch --format '%(refname:short)' | rat filter)
-rat spin --title 'Building...' -- cargo build       # child exit code passes through
+```sh
+fruit=$(rat choose apple banana cherry)
+names=$(rat choose --no-limit alice bob carol)   # space selects, enter confirms
+rat confirm 'Ship it?' && deploy                 # exit 0 = yes, 1 = no
+name=$(rat input --placeholder 'Your name')
+pw=$(rat input --password)
+branch=$(git branch --format='%(refname:short)' | rat filter)
+rat spin --title 'Building...' -- cargo build    # child exit code passes through
 ```
 
 Exit codes everywhere: `0` success, `1` no selection / negative / error,
@@ -148,25 +150,26 @@ Exit codes everywhere: `0` success, `1` no selection / negative / error,
 
 ## A complete dashboard
 
-```fish
-#!/usr/bin/env fish
-function render
+```sh
+#!/usr/bin/env bash
+render() {
     rat style --bold --foreground 212 'Build pipeline'
-    rat style --faint (date)
+    rat style --faint "$(date)"
     echo
-    printf '%s\t%s\t%s\n' compile $compiled 128 test $tested 96 | \
+    printf 'compile\t%s\t128\ntest\t%s\t96\n' "$compiled" "$tested" |
         rat bar --thresholds '50:214,100:42'
     echo
-    rat log --level info "last artifact "(rat date --relative $last_epoch)
-end
+    rat log --level info "last artifact $(rat date --relative "$last_epoch")"
+}
 
-switch "$argv[1]"
-    case --render
-        render
-    case '*'
-        exec rat watch --interval 2s -- fish (status filename) --render
-end
+case "${1:-}" in
+    --render) render ;;
+    *) exec rat watch --clear --interval 2s -- "$0" --render ;;
+esac
 ```
+
+Runnable versions of this — plus the interactive prompts chained together —
+live in [`examples/`](examples/) for bash, zsh, and fish.
 
 ## Differences from gum
 
