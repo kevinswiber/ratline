@@ -8,6 +8,7 @@ fn rat() -> Command {
         "TERM",
         "COLORTERM",
         "CLICOLOR_FORCE",
+        "CI",
         "RAT_LOG_LEVEL",
     ] {
         cmd.env_remove(var);
