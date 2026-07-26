@@ -53,7 +53,18 @@ impl UiStream {
 impl Write for UiStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match &mut self.inner {
-            Inner::Tty(file) => file.write(buf),
+            Inner::Tty(file) => {
+                // Raw writes to CONOUT$ are decoded with the legacy console
+                // codepage, garbling UTF-8 glyphs; go through WriteConsoleW
+                // like std does for its own console handles.
+                #[cfg(windows)]
+                {
+                    if let Some(n) = write_console_utf16(file, buf) {
+                        return Ok(n);
+                    }
+                }
+                file.write(buf)
+            }
             Inner::Stderr(err) => err.write(buf),
         }
     }
@@ -64,6 +75,39 @@ impl Write for UiStream {
             Inner::Stderr(err) => err.flush(),
         }
     }
+}
+
+/// Write UTF-8 bytes to a console handle as UTF-16. Returns None when the
+/// handle rejects console writes (then the caller falls back to raw bytes).
+#[cfg(windows)]
+fn write_console_utf16(file: &File, buf: &[u8]) -> Option<usize> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Console::WriteConsoleW;
+
+    let text = String::from_utf8_lossy(buf);
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut offset = 0usize;
+    while offset < wide.len() {
+        let mut written: u32 = 0;
+        let ok = unsafe {
+            WriteConsoleW(
+                file.as_raw_handle(),
+                wide[offset..].as_ptr().cast(),
+                (wide.len() - offset) as u32,
+                &mut written,
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        offset += written as usize;
+        if written == 0 {
+            return None;
+        }
+    }
+    Some(buf.len())
 }
 
 /// Raw mode for the guard's lifetime; restored on drop (including panic).
