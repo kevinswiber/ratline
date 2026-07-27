@@ -410,6 +410,23 @@ mod tests {
     }
 
     #[test]
+    fn light_reproduces_the_shipping_indices() {
+        let p = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        assert_eq!(p.accent, Color::Indexed(129));
+        assert_eq!(p.on_accent, Color::White);
+        assert_eq!(p.muted, Color::Indexed(242));
+        assert_eq!(p.border, Color::Indexed(249));
+        assert_eq!(p.ok, Color::Indexed(28));
+        assert_eq!(p.warn, Color::Indexed(172));
+        assert_eq!(p.error, Color::Indexed(160));
+        assert_eq!(p.debug, Color::Indexed(25));
+        assert_eq!(p.info, Color::Indexed(30));
+        assert_eq!(p.fatal, Color::Indexed(91));
+        assert_eq!(p.log_warn, Color::Indexed(100));
+        assert_eq!(p.log_error, Color::Indexed(161));
+    }
+
+    #[test]
     fn light_differs_from_dark_on_every_token() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
