@@ -260,7 +260,7 @@ literal colors; each name resolves through the selected palette
 
 | Token | Meaning |
 | --- | --- |
-| `accent` | the brand highlight: bar fill, prompts, the selected row |
+| `accent` | the brand highlight: bar fill and prompts |
 | `on-accent` | text drawn *on* `accent` |
 | `muted` | secondary text and the unfilled part of a bar |
 | `border` | box and frame rules |
@@ -270,6 +270,14 @@ literal colors; each name resolves through the selected palette
 | `debug` | the `DEBU` log tag |
 | `info` | the `INFO` log tag |
 | `fatal` | the `FATA` log tag |
+| `selection` | the row under the cursor in `rat choose` and `rat filter` |
+| `match` | the matched characters in `rat filter` |
+| `cursor` | the `rat input` caret cell — the terminal's default foreground |
+| `placeholder` | placeholder text in `rat input` and `rat filter` — the terminal's default foreground, drawn faint |
+
+`cursor` and `placeholder` resolve to the terminal's default foreground in
+both palettes, so naming them in `--foreground` yields uncolored text;
+placeholder text is set apart by its faint attribute rather than a hue.
 
 `--empty-color`'s default is the `muted` token rather than a literal
 index, and `--fill-color`'s default is `accent`. `rat doctor` reports the
