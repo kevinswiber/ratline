@@ -48,6 +48,10 @@ and terminal restore on exit/ctrl-c are all built in. ANSI colors from the
 child pass through untouched. Piped output degrades to plain text, so
 `rat watch ... | tee log` stays readable.
 
+Every tick, the child runs with `RAT_WIDTH` and `RAT_HEIGHT` set to the
+current terminal size, so scripts can adapt their layout (branch on width,
+or just pass `--fit` to `rat join`) and re-adapt live on resize.
+
 While watching: `q` quits, and `v` (or Enter) opens the full untruncated
 frame in your pager — resolved bat-style from `RAT_PAGER`, then `PAGER`,
 then `less` (with `-R` ensured so colors survive; quit the pager and the
@@ -152,6 +156,12 @@ Capture blocks with `"$(…)"` in bash/zsh, `(… | string collect)` in fish,
 and `(… | Out-String)` in PowerShell. `--vertical` stacks instead, with
 `--gap` blank lines between; `--align` takes top/middle/bottom beside and
 left/center/right stacked.
+
+Add `--fit` for responsive dashboards: when the joined width would exceed
+the available width, the blocks stack vertically instead. Available width
+resolves from `--max-width`, then `RAT_WIDTH` (which `rat watch` sets for
+its children), then the terminal; with no signal at all the blocks stay
+side by side, so plain pipelines remain deterministic.
 
 ### `rat spark` — sparklines
 
