@@ -244,8 +244,8 @@ nothing back.
 
 `--appearance light|dark|auto` (global, default `auto`, also read from
 `RAT_APPEARANCE`) selects the palette behind the semantic color tokens
-below. Under `auto`, `rat` asks the terminal for its background color once
-per process and falls back to `COLORFGBG`, then to dark. The question is
+below. Under `auto`, `rat` asks the terminal for its background color at
+startup and falls back to `COLORFGBG`, then to dark. The question is
 only asked when stderr is a terminal and the process is in the foreground,
 so redirected or backgrounded runs simply use the fallback. Passing
 `--appearance` alongside `--color never` (or under `NO_COLOR`) is accepted
@@ -274,6 +274,29 @@ literal colors; each name resolves through the selected palette
 `--empty-color`'s default is the `muted` token rather than a literal
 index, and `--fill-color`'s default is `accent`. `rat doctor` reports the
 resolved appearance and where it came from, in both text and `--json`.
+
+On unix, `rat watch` also follows the terminal while it runs. With
+`--appearance auto` and a terminal that announces theme changes — Ghostty,
+kitty, or tmux 3.7+ passing one through — switching your system or
+terminal between light and dark repaints the dashboard and re-renders its
+children in the new palette, without a restart. `rat` re-measures the
+terminal's colors when it is told something changed, so a terminal whose
+colors are pinned independently of the desktop theme keeps the palette
+that matches what is actually on screen.
+
+Opting out is the same pin as everywhere else: `--appearance light|dark`
+or `RAT_APPEARANCE` fixes the palette for the run. Nothing is subscribed
+to at all under `--color never`, `NO_COLOR`, `CI`, `--once`, or when
+output is piped. Two limits worth knowing: a change that happens while the
+pager (`v`) has the screen is picked up at the *next* change after you
+leave the pager, and on Windows a `watch` session keeps the appearance it
+resolved at startup.
+
+While the dashboard runs, `rat watch` asks the terminal to announce theme
+changes, and tells it to stop before exiting — on `q`, Ctrl-C, or a
+signal. If a session is killed outright (`kill -9`, a terminal window
+crash), the terminal can keep announcing changes to whatever runs next;
+`printf '\033[?2031l'` or `reset` clears it.
 
 ## Interactive prompts
 
@@ -344,12 +367,12 @@ the dashboard toolkit above.
 ratto builds and runs on Windows (PowerShell, Windows Terminal, conhost,
 or ssh'd into from any terminal). Native sessions get full color with no
 `TERM` needed — a bare Windows console reports truecolor — and light/dark
-detection is live where the terminal answers the background query (Windows
+is detected where the terminal answers the background query (Windows
 Terminal does; others fall back to dark). The UI stream uses `CONOUT$`
 where unix uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`;
 `rat` enables VT processing on the console itself, so escapes are
 processed even in legacy conhost, which simply ignores the synchronized-
-output mode it doesn't implement (Windows Terminal supports it). Two
+output mode it doesn't implement (Windows Terminal supports it). Three
 notes:
 
 - The `v` key in `watch` prefers `less.exe` on PATH (Git for Windows,
@@ -358,6 +381,9 @@ notes:
   correctly; set `RAT_PAGER` to override.
 - `rat frame`'s default state file is keyed per terminal session; when
   running several dashboards in one console session, pass `--state`.
+- Following the terminal's light/dark switch while `watch` runs is
+  unix-only; on Windows a session keeps the appearance it resolved at
+  startup.
 
 ## Exit codes
 
