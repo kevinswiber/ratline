@@ -9,6 +9,7 @@ fn rat() -> Command {
         "CI",
         "COLORTERM",
         "TERM",
+        "RAT_WIDTH",
     ] {
         cmd.env_remove(var);
     }
@@ -108,4 +109,48 @@ fn a_missing_file_is_an_error() {
         .assert()
         .code(1)
         .stderr(predicates::str::contains("definitely-not-here.txt"));
+}
+
+#[test]
+fn fit_stacks_when_rat_width_is_too_narrow() {
+    rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "8")
+        .args(["join", "--fit", "--gap", "1", "aaaa", "bbbb"])
+        .assert()
+        .success()
+        .stdout("aaaa\n\nbbbb\n");
+}
+
+#[test]
+fn fit_keeps_blocks_beside_when_they_fit() {
+    rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "20")
+        .args(["join", "--fit", "--gap", "1", "aaaa", "bbbb"])
+        .assert()
+        .success()
+        .stdout("aaaa bbbb\n");
+}
+
+#[test]
+fn max_width_beats_the_env_and_implies_fit() {
+    rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "80")
+        .args(["join", "--max-width", "5", "aaaa", "bbbb"])
+        .assert()
+        .success()
+        .stdout("aaaa\nbbbb\n");
+}
+
+#[test]
+fn a_garbage_rat_width_is_ignored() {
+    rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "not-a-number")
+        .args(["join", "--fit", "--max-width", "40", "aa", "bb"])
+        .assert()
+        .success()
+        .stdout("aabb\n");
 }

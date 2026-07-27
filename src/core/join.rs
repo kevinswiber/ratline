@@ -51,6 +51,15 @@ pub fn parse_block(text: &str) -> Vec<String> {
     text.lines().map(str::to_string).collect()
 }
 
+/// Cells a horizontal join would occupy: block widths plus the gaps.
+pub fn horizontal_width(blocks: &[Vec<String>], gap: usize) -> usize {
+    let widths: usize = blocks
+        .iter()
+        .map(|block| block.iter().map(|l| display_width(l)).max().unwrap_or(0))
+        .sum();
+    widths + gap * blocks.len().saturating_sub(1)
+}
+
 /// Place blocks side by side: each block's lines pad to its widest line,
 /// rows join with `gap` spaces, and nothing after the last non-empty
 /// segment is emitted.
@@ -207,6 +216,14 @@ mod tests {
         assert!(JoinAlign::Center.vertical().is_err());
         assert_eq!(JoinAlign::Top.vertical().unwrap(), VAlign::Top);
         assert_eq!(JoinAlign::Right.horizontal().unwrap(), Align::Right);
+    }
+
+    #[test]
+    fn horizontal_width_totals_blocks_and_gaps() {
+        let blocks = vec![parse_block("aaaa\n"), parse_block("bb\ncc\n")];
+        assert_eq!(horizontal_width(&blocks, 2), 8);
+        assert_eq!(horizontal_width(&blocks, 0), 6);
+        assert_eq!(horizontal_width(&[], 2), 0);
     }
 
     #[test]

@@ -218,6 +218,13 @@ pub struct JoinArgs {
     /// Block alignment: top/middle/bottom beside, left/center/right stacked
     #[arg(long, value_enum)]
     pub align: Option<crate::core::join::JoinAlign>,
+    /// Stack vertically when the joined width exceeds the available width
+    /// (RAT_WIDTH, then the terminal; no signal keeps blocks beside)
+    #[arg(long, conflicts_with = "vertical")]
+    pub fit: bool,
+    /// Available width for --fit in display cells (implies --fit)
+    #[arg(long, conflicts_with = "vertical")]
+    pub max_width: Option<u16>,
 }
 
 #[derive(clap::Args)]
