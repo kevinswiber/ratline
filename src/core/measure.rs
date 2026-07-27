@@ -161,20 +161,115 @@ pub fn truncate_display(s: &str, max: usize, marker: &str) -> String {
     out
 }
 
-/// Whether the string ends with SGR styling still open (an SGR sequence seen
-/// after the last reset).
-fn sgr_left_open(s: &str) -> bool {
-    let mut open = false;
-    for chunk in chunks(s) {
-        if let Chunk::Escape(e) = chunk {
-            if e == "\x1b[0m" || e == "\x1b[m" {
-                open = false;
-            } else if e.starts_with("\x1b[") && e.ends_with('m') {
-                open = true;
+/// The SGR sequences a prefix of a string leaves open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SgrState {
+    open: Vec<String>,
+}
+
+impl SgrState {
+    /// Feed one escape sequence; non-SGR escapes are ignored.
+    pub fn apply(&mut self, escape: &str) {
+        if escape == "\x1b[0m" || escape == "\x1b[m" {
+            self.open.clear();
+        } else if escape.starts_with("\x1b[") && escape.ends_with('m') {
+            self.open.push(escape.to_string());
+        }
+    }
+
+    /// Feed every escape sequence in a string.
+    fn apply_all(&mut self, s: &str) {
+        for chunk in chunks(s) {
+            if let Chunk::Escape(e) = chunk {
+                self.apply(e);
             }
         }
     }
-    open
+
+    /// The sequence that reopens this state, or "" when nothing is open.
+    pub fn prefix(&self) -> String {
+        self.open.concat()
+    }
+
+    /// Whether a reset is needed to close what is open.
+    pub fn is_open(&self) -> bool {
+        !self.open.is_empty()
+    }
+}
+
+fn sgr_left_open(s: &str) -> bool {
+    let mut state = SgrState::default();
+    state.apply_all(s);
+    state.is_open()
+}
+
+/// Break one line into lines of at most `width` display cells, preferring
+/// spaces and hard-breaking over-long words. SGR open at a break is closed
+/// at the line end and reopened on the next line.
+pub fn wrap_display(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut state = SgrState::default();
+    let mut emit = |line: &str, state: &mut SgrState| {
+        let mut built = format!("{}{line}", state.prefix());
+        state.apply_all(line);
+        if state.is_open() {
+            built.push_str("\x1b[0m");
+        }
+        out.push(built);
+    };
+    let mut rest = s;
+    loop {
+        if display_width(rest) <= width {
+            emit(rest, &mut state);
+            break;
+        }
+        let (head, tail) = split_at_width(rest, width);
+        let tail_starts_with_space = matches!(chunks(tail).next(), Some(Chunk::Text(" ", _)));
+        let line_end = if tail_starts_with_space {
+            head.len()
+        } else {
+            last_space_offset(head)
+                .filter(|&pos| pos > 0)
+                .unwrap_or(head.len())
+        };
+        emit(rest[..line_end].trim_end_matches(' '), &mut state);
+        rest = skip_leading_spaces(&rest[line_end..]);
+    }
+    out
+}
+
+/// Byte offset of the last plain-space chunk, if any.
+fn last_space_offset(s: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut last = None;
+    for chunk in chunks(s) {
+        match chunk {
+            Chunk::Escape(e) => offset += e.len(),
+            Chunk::Text(t, _) => {
+                if t == " " {
+                    last = Some(offset);
+                }
+                offset += t.len();
+            }
+        }
+    }
+    last
+}
+
+/// Drop leading plain-space chunks. Stops at the first escape so a style
+/// change opening the next word is never discarded.
+fn skip_leading_spaces(s: &str) -> &str {
+    let mut offset = 0;
+    for chunk in chunks(s) {
+        match chunk {
+            Chunk::Text(" ", _) => offset += 1,
+            _ => break,
+        }
+    }
+    &s[offset..]
 }
 
 #[cfg(test)]
@@ -250,5 +345,62 @@ mod tests {
             truncate_display("\x1b[31mabcdef\x1b[0m", 4, "…"),
             "\x1b[31mabc…\x1b[0m"
         );
+    }
+
+    #[test]
+    fn sgr_state_tracks_open_codes() {
+        let mut state = SgrState::default();
+        state.apply("\x1b[31m");
+        assert!(state.is_open());
+        assert_eq!(state.prefix(), "\x1b[31m");
+        state.apply("\x1b[1m");
+        assert_eq!(state.prefix(), "\x1b[31m\x1b[1m");
+        state.apply("\x1b[0m");
+        assert!(!state.is_open());
+        assert_eq!(state.prefix(), "");
+        state.apply("\x1b]0;title\x07"); // non-SGR escapes are ignored
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces() {
+        assert_eq!(
+            wrap_display("the quick brown fox", 10),
+            vec!["the quick", "brown fox"]
+        );
+    }
+
+    #[test]
+    fn wrap_hard_breaks_a_long_word() {
+        assert_eq!(wrap_display("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn wrap_lines_never_exceed_the_width() {
+        for line in wrap_display("日本語 mixed ちゃんと wrapping", 7) {
+            assert!(display_width(&line) <= 7, "too wide: {line:?}");
+        }
+    }
+
+    #[test]
+    fn wrap_reopens_styling_on_each_line() {
+        assert_eq!(
+            wrap_display("\x1b[31mthe quick brown\x1b[0m", 9),
+            vec!["\x1b[31mthe quick\x1b[0m", "\x1b[31mbrown\x1b[0m"]
+        );
+    }
+
+    #[test]
+    fn wrap_keeps_an_escape_that_starts_the_next_word() {
+        assert_eq!(
+            wrap_display("aa \x1b[31mbb\x1b[0m", 2),
+            vec!["aa", "\x1b[31mbb\x1b[0m"]
+        );
+    }
+
+    #[test]
+    fn wrap_of_empty_and_zero_width_terminates() {
+        assert_eq!(wrap_display("", 5), vec![String::new()]);
+        assert_eq!(wrap_display("abc", 0), vec!["abc".to_string()]);
     }
 }
