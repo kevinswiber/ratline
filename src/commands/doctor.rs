@@ -215,6 +215,9 @@ fn profile_reason(is_tty: bool) -> String {
     }
     match get("TERM") {
         Some(term) => format!("TERM={term}"),
+        #[cfg(windows)]
+        None => "Windows console (no TERM)".into(),
+        #[cfg(not(windows))]
         None => "TERM is unset".into(),
     }
 }

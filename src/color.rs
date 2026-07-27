@@ -103,9 +103,24 @@ fn term_capability(env: &dyn EnvSource) -> ColorProfile {
         ColorProfile::Ansi256
     } else if term.contains("color") || term.contains("ansi") {
         ColorProfile::Ansi
+    } else if term.is_empty() {
+        bare_console_profile()
     } else {
         ColorProfile::Ascii
     }
+}
+
+/// What a console with no TERM at all can render. Native Windows sessions
+/// never set TERM, and every OS this binary supports has a VT-capable,
+/// 24-bit console; unix without TERM is an unknown terminal.
+#[cfg(windows)]
+fn bare_console_profile() -> ColorProfile {
+    ColorProfile::TrueColor
+}
+
+#[cfg(not(windows))]
+fn bare_console_profile() -> ColorProfile {
+    ColorProfile::Ascii
 }
 
 pub fn resolve_profile(mode: ColorMode, env: &dyn EnvSource, is_tty: bool) -> ColorProfile {
@@ -174,6 +189,33 @@ mod tests {
         #[case] expected: ColorProfile,
     ) {
         assert_eq!(detect_profile(&env(pairs), is_tty), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_bare_console_defaults_to_truecolor() {
+        // Native Windows sessions don't set TERM; modern consoles all
+        // speak VT with 24-bit color.
+        assert_eq!(detect_profile(&env(&[]), true), ColorProfile::TrueColor);
+        // An explicit TERM still wins, dumb included.
+        assert_eq!(
+            detect_profile(&env(&[("TERM", "dumb")]), true),
+            ColorProfile::Ascii
+        );
+        // The kill switches still kill.
+        assert_eq!(
+            detect_profile(&env(&[("NO_COLOR", "1")]), true),
+            ColorProfile::Ascii
+        );
+        // Not-a-tty still means no color.
+        assert_eq!(detect_profile(&env(&[]), false), ColorProfile::Ascii);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_bare_environment_stays_colorless() {
+        // No TERM on unix means an unknown terminal: no color.
+        assert_eq!(detect_profile(&env(&[]), true), ColorProfile::Ascii);
     }
 
     #[test]
