@@ -4,14 +4,14 @@
 set -euo pipefail
 
 render() {
-    rat style --bold --foreground 212 'System dashboard'
+    rat style --bold --foreground accent 'System dashboard'
     rat style --faint "$(date)"
     echo
 
     # Disk usage: df rows become one aligned block of threshold-colored bars.
     df -Pk / 2>/dev/null | awk 'NR == 2 {
         printf "disk /\t%d\t%d\n", ($3 / 1024 / 1024), (($3 + $4) / 1024 / 1024)
-    }' | rat bar --width 24 --thresholds '70:42,90:214,100:196' --annotation percent
+    }' | rat bar --width 24 --thresholds '70:ok,90:warn,100:error' --annotation percent
 
     # A simulated deploy that animates with the clock.
     step=$(( $(date +%s) % 120 ))

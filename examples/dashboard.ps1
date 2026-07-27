@@ -5,7 +5,7 @@
 param([switch]$Render, [switch]$Once)
 
 function Show-Frame {
-    rat style --bold --foreground 212 'System dashboard'
+    rat style --bold --foreground accent 'System dashboard'
     rat style --faint (Get-Date).ToString()
     Write-Output ''
 
@@ -16,7 +16,7 @@ function Show-Frame {
         $usedGiB = [math]::Round($drive.Used / 1GB)
         $totalGiB = [math]::Round(($drive.Used + $drive.Free) / 1GB)
         "disk $($drive.Name)`t$usedGiB`t$totalGiB" |
-            rat bar --width 24 --thresholds '70:42,90:214,100:196' --annotation percent
+            rat bar --width 24 --thresholds '70:ok,90:warn,100:error' --annotation percent
     }
 
     # A simulated deploy that animates with the clock.

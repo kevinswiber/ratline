@@ -50,7 +50,10 @@ child pass through untouched. Piped output degrades to plain text, so
 
 Every tick, the child runs with `RAT_WIDTH` and `RAT_HEIGHT` set to the
 current terminal size, so scripts can adapt their layout (branch on width,
-or just pass `--fit` to `rat join`) and re-adapt live on resize.
+or just pass `--fit` to `rat join`) and re-adapt live on resize. The child
+also gets `RAT_APPEARANCE` set to the parent's light/dark verdict, so it
+inherits the theme instead of asking the terminal itself — which it must
+not do while `watch` owns the keyboard.
 
 While watching: `q` quits, and `v` (or Enter) opens the full untruncated
 frame in your pager — resolved bat-style from `RAT_PAGER`, then `PAGER`,
@@ -236,6 +239,41 @@ To strip ANSI coming from *other* programs, pipe through a bare
 `rat style`: input escapes are removed by default and an empty style adds
 nothing back.
 
+### Light and dark themes
+
+`--appearance light|dark|auto` (global, default `auto`, also read from
+`RAT_APPEARANCE`) selects the palette behind the semantic color tokens
+below. Under `auto`, `rat` asks the terminal for its background color once
+per process and falls back to `COLORFGBG`, then to dark. The question is
+only asked when stderr is a terminal and the process is in the foreground,
+so redirected or backgrounded runs simply use the fallback. Passing
+`--appearance` alongside `--color never` (or under `NO_COLOR`) is accepted
+and silently does nothing — output is plain either way, which composes
+better in scripts than a warning would.
+
+Every flag that takes a color (`--foreground`, `--background`,
+`--border-color`, `--fill-color`, `--empty-color`, `--spark-color`, and
+each half of `--thresholds`) accepts these token names in addition to
+literal colors; each name resolves through the selected palette
+(`on-accent` intentionally stays black in both palettes):
+
+| Token | Meaning |
+| --- | --- |
+| `accent` | the brand highlight: bar fill, prompts, the selected row |
+| `on-accent` | text drawn *on* `accent` |
+| `muted` | secondary text and the unfilled part of a bar |
+| `border` | box and frame rules |
+| `ok` | healthy / passing |
+| `warn` | needs attention |
+| `error` | failing |
+| `debug` | the `DEBU` log tag |
+| `info` | the `INFO` log tag |
+| `fatal` | the `FATA` log tag |
+
+`--empty-color`'s default is the `muted` token rather than a literal
+index, and `--fill-color`'s default is `accent`. `rat doctor` reports the
+resolved appearance and where it came from, in both text and `--json`.
+
 ## Interactive prompts
 
 The gum staples, rendering to `/dev/tty` so stdout stays clean:
@@ -259,11 +297,11 @@ Exit codes everywhere: `0` success, `1` no selection / negative / error,
 ```sh
 #!/usr/bin/env bash
 render() {
-    rat style --bold --foreground 212 'Build pipeline'
+    rat style --bold --foreground accent 'Build pipeline'
     rat style --faint "$(date)"
     echo
     printf 'compile\t%s\t128\ntest\t%s\t96\n' "$compiled" "$tested" |
-        rat bar --thresholds '50:214,100:42'
+        rat bar --thresholds '50:warn,100:ok'
     echo
     rat log --level info "last artifact $(rat date --relative "$last_epoch")"
 }
@@ -289,7 +327,9 @@ the dashboard toolkit above.
 - **`rat table` is a layout filter**, not gum's interactive row picker — no
   selection or sorting, and per-column config is positional comma lists
   (`--widths 27,,8`).
-- **Named colors are accepted** (`--foreground red`); gum silently drops them.
+- **Named colors are accepted** (`--foreground red`); gum silently drops
+  them — and so are semantic token names (`accent`, `ok`, `warn`, …) that
+  follow the terminal's light or dark background.
 - **UI goes to `/dev/tty`** with an stderr fallback, so prompts survive
   `2>/dev/null`; gum writes UI to stderr only.
 - **`rat filter` quits on one Esc press**; gum needs two.
