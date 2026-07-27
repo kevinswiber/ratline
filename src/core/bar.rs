@@ -2,6 +2,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::color::ColorProfile;
 use crate::style_spec::StyleSpec;
+use crate::theme::Palette;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum Annotation {
@@ -179,7 +180,7 @@ pub struct Threshold {
 }
 
 /// Parse `"33:196,66:214,100:42"` into ascending percentage bands.
-pub fn parse_thresholds(s: &str) -> anyhow::Result<Vec<Threshold>> {
+pub fn parse_thresholds(s: &str, palette: &Palette) -> anyhow::Result<Vec<Threshold>> {
     let mut thresholds = Vec::new();
     for part in s.split(',') {
         let (at, color) = part
@@ -190,7 +191,7 @@ pub fn parse_thresholds(s: &str) -> anyhow::Result<Vec<Threshold>> {
                 .trim()
                 .parse()
                 .map_err(|_| anyhow::anyhow!("threshold {at:?} is not a number"))?,
-            color: crate::style_spec::parse_color(color.trim())?,
+            color: palette.resolve(color.trim())?,
         });
     }
     thresholds.sort_by(|a, b| a.at.total_cmp(&b.at));
@@ -462,9 +463,28 @@ mod batch_tests {
         assert_eq!(lines[0].find(['#', '-']).unwrap(), 11);
     }
 
+    fn palette() -> crate::theme::Palette {
+        crate::theme::Palette::builtin(
+            crate::theme::Appearance::Dark,
+            crate::theme::AppearanceSource::Default,
+        )
+    }
+
+    #[test]
+    fn thresholds_accept_token_names() {
+        let p = palette();
+        let by_name = parse_thresholds("50:warn,100:ok", &p).unwrap();
+        let by_index = parse_thresholds("50:214,100:42", &p).unwrap();
+        assert_eq!(by_name.len(), by_index.len());
+        for (a, b) in by_name.iter().zip(by_index.iter()) {
+            assert_eq!(a.at, b.at);
+            assert_eq!(a.color, b.color);
+        }
+    }
+
     #[test]
     fn thresholds_parse_and_band() {
-        let t = parse_thresholds("33:196,66:214,100:42").unwrap();
+        let t = parse_thresholds("33:196,66:214,100:42", &palette()).unwrap();
         assert_eq!(t.len(), 3);
         assert_eq!(color_for(0.0, &t, None), Some(Color::Indexed(196)));
         assert_eq!(color_for(33.0, &t, None), Some(Color::Indexed(196)));
@@ -478,8 +498,8 @@ mod batch_tests {
 
     #[test]
     fn bad_thresholds_are_errors() {
-        assert!(parse_thresholds("nope").is_err());
-        assert!(parse_thresholds("33:notacolor").is_err());
+        assert!(parse_thresholds("nope", &palette()).is_err());
+        assert!(parse_thresholds("33:notacolor", &palette()).is_err());
     }
 
     #[test]

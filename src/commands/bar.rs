@@ -10,10 +10,9 @@ use crate::core::bar::{
     render_indeterminate, render_rows,
 };
 use crate::exit::AppResult;
-use crate::style_spec::{StyleSpec, parse_color};
+use crate::style_spec::StyleSpec;
 use crate::theme::Palette;
 
-const DEFAULT_FILL_COLOR: Color = Color::Indexed(212);
 const DEFAULT_LABEL_WIDTH: u16 = 34;
 
 fn fg(color: Color) -> StyleSpec {
@@ -23,15 +22,19 @@ fn fg(color: Color) -> StyleSpec {
     }
 }
 
-pub fn run(args: BarArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: BarArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     if args.total < 0.0 {
         return Err(anyhow!("total must be non-negative").into());
     }
-    let explicit_fill = args.fill_color.as_deref().map(parse_color).transpose()?;
+    let explicit_fill = args
+        .fill_color
+        .as_deref()
+        .map(|s| palette.resolve(s))
+        .transpose()?;
     let thresholds = args
         .thresholds
         .as_deref()
-        .map(parse_thresholds)
+        .map(|s| parse_thresholds(s, &palette))
         .transpose()?
         .unwrap_or_default();
     // Explicit --fill-color wins; otherwise thresholds pick by percent.
@@ -43,7 +46,7 @@ pub fn run(args: BarArgs, profile: ColorProfile, _palette: Palette) -> AppResult
         };
         explicit_fill
             .or_else(|| color_for(pct, &thresholds, None))
-            .unwrap_or(DEFAULT_FILL_COLOR)
+            .unwrap_or(palette.accent)
     };
 
     let (preset_fill, preset_empty) = args.preset.chars();
@@ -54,7 +57,7 @@ pub fn run(args: BarArgs, profile: ColorProfile, _palette: Palette) -> AppResult
         fill: args.fill.unwrap_or(preset_fill),
         empty: args.empty.unwrap_or(preset_empty),
         fill_style: StyleSpec::default(),
-        empty_style: fg(parse_color(&args.empty_color)?),
+        empty_style: fg(palette.resolve(&args.empty_color)?),
         label: args.label.as_deref(),
         label_width: args.label_width.unwrap_or(DEFAULT_LABEL_WIDTH),
         annotation: args.annotation,
@@ -63,7 +66,7 @@ pub fn run(args: BarArgs, profile: ColorProfile, _palette: Palette) -> AppResult
 
     if args.indeterminate {
         let spec = BarSpec {
-            fill_style: fg(explicit_fill.unwrap_or(DEFAULT_FILL_COLOR)),
+            fill_style: fg(explicit_fill.unwrap_or(palette.accent)),
             annotation: Annotation::None,
             ..base
         };
@@ -97,7 +100,7 @@ pub fn run(args: BarArgs, profile: ColorProfile, _palette: Palette) -> AppResult
     if thresholds.is_empty() {
         // One shared fill style: render as an aligned block.
         let spec = BarSpec {
-            fill_style: fg(explicit_fill.unwrap_or(DEFAULT_FILL_COLOR)),
+            fill_style: fg(explicit_fill.unwrap_or(palette.accent)),
             label_width,
             ..base
         };

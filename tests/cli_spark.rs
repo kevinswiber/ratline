@@ -57,3 +57,23 @@ fn color_wraps_the_line() {
 fn non_numeric_input_is_an_error() {
     rat().args(["spark", "abc"]).assert().code(1);
 }
+
+#[test]
+fn the_accent_token_colors_the_line() {
+    rat()
+        .env("TERM", "xterm-256color")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "spark",
+            "--spark-color",
+            "accent",
+            "1",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout("\x1b[38;5;212m▁█\x1b[0m\n");
+}

@@ -222,3 +222,119 @@ fn bar_indeterminate_moves_with_tick() {
     assert_ne!(render("0"), render("1"));
     assert_eq!(render("0"), render("16"));
 }
+
+fn stdout_of(args: &[&str]) -> Vec<u8> {
+    rat()
+        .env("TERM", "xterm-256color")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone()
+}
+
+#[test]
+fn theme_tokens_equal_their_dark_indices() {
+    let base = [
+        "--color",
+        "always",
+        "--appearance",
+        "dark",
+        "bar",
+        "--value",
+        "50",
+    ];
+    let with = |extra: [&str; 2]| -> Vec<u8> {
+        let mut args = base.to_vec();
+        args.extend_from_slice(&extra);
+        stdout_of(&args)
+    };
+    assert_eq!(
+        with(["--fill-color", "accent"]),
+        with(["--fill-color", "212"])
+    );
+    assert_eq!(
+        with(["--empty-color", "muted"]),
+        with(["--empty-color", "240"])
+    );
+}
+
+#[test]
+fn threshold_tokens_equal_their_dark_indices() {
+    let named = stdout_of(&[
+        "--color",
+        "always",
+        "--appearance",
+        "dark",
+        "bar",
+        "--value",
+        "10",
+        "--total",
+        "100",
+        "--thresholds",
+        "50:warn,100:ok",
+    ]);
+    let indexed = stdout_of(&[
+        "--color",
+        "always",
+        "--appearance",
+        "dark",
+        "bar",
+        "--value",
+        "10",
+        "--total",
+        "100",
+        "--thresholds",
+        "50:214,100:42",
+    ]);
+    assert_eq!(named, indexed);
+}
+
+// Green before and after: the pin that the default flip changes no bytes.
+#[test]
+fn the_empty_color_default_is_unchanged_under_dark() {
+    assert_eq!(
+        stdout_of(&[
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "bar",
+            "--value",
+            "50"
+        ]),
+        stdout_of(&[
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "bar",
+            "--value",
+            "50",
+            "--empty-color",
+            "240",
+        ]),
+    );
+}
+
+#[test]
+fn a_colorless_profile_ignores_the_appearance() {
+    let plain = rat()
+        .env("NO_COLOR", "1")
+        .args(["bar", "--value", "50"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let themed = rat()
+        .env("NO_COLOR", "1")
+        .args(["--appearance", "light", "bar", "--value", "50"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(plain, themed);
+}

@@ -6,18 +6,26 @@ use crate::cli::StyleArgs;
 use crate::color::ColorProfile;
 use crate::core::box_model::{BoxSpec, parse_sides, render_box};
 use crate::exit::AppResult;
-use crate::style_spec::{StyleSpec, parse_color};
+use crate::style_spec::StyleSpec;
 use crate::theme::Palette;
 
-pub fn run(args: StyleArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: StyleArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let spec = StyleSpec {
         bold: args.bold,
         faint: args.faint,
         italic: args.italic,
         underline: args.underline,
         strikethrough: args.strikethrough,
-        foreground: args.foreground.as_deref().map(parse_color).transpose()?,
-        background: args.background.as_deref().map(parse_color).transpose()?,
+        foreground: args
+            .foreground
+            .as_deref()
+            .map(|s| palette.resolve(s))
+            .transpose()?,
+        background: args
+            .background
+            .as_deref()
+            .map(|s| palette.resolve(s))
+            .transpose()?,
     };
 
     let text = if args.text.is_empty() {
@@ -63,7 +71,11 @@ pub fn run(args: StyleArgs, profile: ColorProfile, _palette: Palette) -> AppResu
             .unwrap_or_default(),
         border: args.border,
         border_style: StyleSpec {
-            foreground: args.border_color.as_deref().map(parse_color).transpose()?,
+            foreground: args
+                .border_color
+                .as_deref()
+                .map(|s| palette.resolve(s))
+                .transpose()?,
             ..StyleSpec::default()
         },
         title: args.title.as_deref(),

@@ -242,3 +242,55 @@ fn tabs_survive_the_default_strip() {
         .success()
         .stdout("a\tb\n");
 }
+
+#[test]
+fn a_token_name_is_accepted_where_a_color_is() {
+    rat()
+        .env("TERM", "xterm-256color")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "style",
+            "--bold",
+            "--foreground",
+            "accent",
+            "X",
+        ])
+        .assert()
+        .success()
+        .stdout("\x1b[1;38;5;212mX\x1b[0m\n");
+}
+
+#[test]
+fn the_color_env_vars_accept_token_names() {
+    rat()
+        .env("TERM", "xterm-256color")
+        .env("FOREGROUND", "accent")
+        .args(["--color", "always", "--appearance", "dark", "style", "X"])
+        .assert()
+        .success()
+        .stdout("\x1b[38;5;212mX\x1b[0m\n");
+}
+
+#[test]
+fn the_border_token_matches_the_border_index() {
+    rat()
+        .env("TERM", "xterm-256color")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "style",
+            "--border",
+            "normal",
+            "--border-color",
+            "border",
+            "x",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\x1b[38;5;240m\u{250c}"));
+}

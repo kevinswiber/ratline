@@ -171,10 +171,10 @@ pub struct BarArgs {
     /// Override the empty character
     #[arg(long)]
     pub empty: Option<char>,
-    /// Fill color; wins over --thresholds when given (default 212)
+    /// Fill color; wins over --thresholds when given (default: accent)
     #[arg(long)]
     pub fill_color: Option<String>,
-    #[arg(long, default_value = "240")]
+    #[arg(long, default_value = "muted")]
     pub empty_color: String,
     /// State word appended after the annotations
     #[arg(long)]

@@ -6,10 +6,10 @@ use crate::cli::SparkArgs;
 use crate::color::ColorProfile;
 use crate::core::spark::sparkline;
 use crate::exit::AppResult;
-use crate::style_spec::{StyleSpec, parse_color};
+use crate::style_spec::StyleSpec;
 use crate::theme::Palette;
 
-pub fn run(args: SparkArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: SparkArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let raw = if args.values.is_empty() {
         let mut buf = String::new();
         std::io::stdin()
@@ -31,7 +31,7 @@ pub fn run(args: SparkArgs, profile: ColorProfile, _palette: Palette) -> AppResu
     let line = sparkline(&values, args.min, args.max);
     let styled = match &args.spark_color {
         Some(color) if !line.is_empty() => StyleSpec {
-            foreground: Some(parse_color(color)?),
+            foreground: Some(palette.resolve(color)?),
             ..StyleSpec::default()
         }
         .render(&line, profile),
