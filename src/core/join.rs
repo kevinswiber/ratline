@@ -1,6 +1,3 @@
-// Consumed by the join command, which lands with its wiring.
-#![allow(dead_code)]
-
 use crate::core::measure::{Align, display_width, pad_display};
 
 /// Where a shorter block sits beside a taller one.

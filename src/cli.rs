@@ -32,6 +32,8 @@ pub enum Command {
     Bar(BarArgs),
     /// Align delimiter-separated rows into columns
     Table(TableArgs),
+    /// Place text blocks side by side or stacked
+    Join(JoinArgs),
     /// Format and parse durations
     Duration(DurationArgs),
     /// Parse, format, and diff timestamps portably
@@ -194,6 +196,28 @@ pub struct TableArgs {
     /// Marker appended to a truncated cell
     #[arg(long, default_value = "…")]
     pub ellipsis: String,
+}
+
+#[derive(clap::Args)]
+pub struct JoinArgs {
+    /// Text blocks to join, one positional argument each
+    #[arg(required_unless_present = "file", conflicts_with = "file")]
+    pub blocks: Vec<String>,
+    /// Read a block from a file (repeatable; - reads stdin)
+    #[arg(long, short = 'f')]
+    pub file: Vec<std::path::PathBuf>,
+    /// Join side by side (default)
+    #[arg(long, conflicts_with = "vertical")]
+    pub horizontal: bool,
+    /// Stack blocks instead of joining side by side
+    #[arg(long)]
+    pub vertical: bool,
+    /// Spaces (horizontal) or blank lines (vertical) between blocks
+    #[arg(long, default_value_t = 0)]
+    pub gap: u16,
+    /// Block alignment: top/middle/bottom beside, left/center/right stacked
+    #[arg(long, value_enum)]
+    pub align: Option<crate::core::join::JoinAlign>,
 }
 
 #[derive(clap::Args)]

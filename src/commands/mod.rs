@@ -8,6 +8,7 @@ pub mod duration;
 pub mod filter;
 pub mod frame;
 pub mod input;
+pub mod join;
 pub mod log;
 pub mod spark;
 pub mod spin;
