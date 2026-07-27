@@ -230,7 +230,8 @@ Under the default `--color auto`, output goes plain only when:
 - `NO_COLOR` is set (wins over everything, including `CLICOLOR_FORCE`);
 - `CLICOLOR=0` is set (unless `CLICOLOR_FORCE` overrides it);
 - `CI` is set — CI logs are treated as not-a-terminal;
-- `TERM` is `dumb`, unset, or names no color support.
+- `TERM` is `dumb` or names no color support — or, on unix, is unset
+  (native Windows consoles never set `TERM` and get full color).
 
 `--color always` and `--color never` beat the environment entirely: an
 explicit flag outranks ambient variables, so `always` colors at full
@@ -341,10 +342,15 @@ the dashboard toolkit above.
 ## Windows
 
 ratto builds and runs on Windows (PowerShell, Windows Terminal, conhost,
-or ssh'd into from any terminal). The UI stream uses `CONOUT$` where unix
-uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`; synchronized
-output works in Windows Terminal and is harmlessly ignored by legacy
-conhost. Two notes:
+or ssh'd into from any terminal). Native sessions get full color with no
+`TERM` needed — a bare Windows console reports truecolor — and light/dark
+detection is live where the terminal answers the background query (Windows
+Terminal does; others fall back to dark). The UI stream uses `CONOUT$`
+where unix uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`;
+`rat` enables VT processing on the console itself, so escapes are
+processed even in legacy conhost, which simply ignores the synchronized-
+output mode it doesn't implement (Windows Terminal supports it). Two
+notes:
 
 - The `v` key in `watch` prefers `less.exe` on PATH (Git for Windows,
   scoop, and winget all provide one) and falls back to the stock `more.com`,
