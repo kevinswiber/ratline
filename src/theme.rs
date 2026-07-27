@@ -44,6 +44,9 @@ pub enum AppearanceSource {
     Osc,
     ColorFgBg,
     Default,
+    // A palette re-resolved from a terminal-pushed theme report.
+    #[allow(dead_code)] // Constructed once watch adopts pushed reports.
+    Notification,
 }
 
 /// The resolved token table. `Copy`, so it threads like `ColorProfile`.

@@ -192,6 +192,7 @@ fn appearance_reason(source: AppearanceSource) -> &'static str {
         AppearanceSource::Osc => "osc",
         AppearanceSource::ColorFgBg => "colorfgbg",
         AppearanceSource::Default => "default",
+        AppearanceSource::Notification => "notification",
     }
 }
 
@@ -250,6 +251,14 @@ mod tests {
     #[test]
     fn reply_embedded_in_other_bytes_is_found() {
         assert_eq!(parse_decrpm(b"noise\x1b[?2026;2$ymore"), SyncSupport::Reset);
+    }
+
+    #[test]
+    fn appearance_reason_names_a_pushed_notification() {
+        assert_eq!(
+            appearance_reason(AppearanceSource::Notification),
+            "notification"
+        );
     }
 
     #[test]
