@@ -109,3 +109,87 @@ fn file_appends_plain_text() {
     let content = std::fs::read_to_string(&path).unwrap();
     assert_eq!(content, "INFO to file\n");
 }
+
+#[test]
+fn info_is_the_light_hue_under_a_light_appearance() {
+    rat()
+        .env("TERM", "xterm-256color")
+        .env("RAT_APPEARANCE", "light")
+        .args(["--color", "always", "log", "--level", "info", "hi"])
+        .assert()
+        .success()
+        .stderr("\x1b[1;38;5;30mINFO\x1b[0m hi\n");
+}
+
+#[test]
+fn the_appearance_flag_beats_the_environment() {
+    // The only test that exercises flag-over-environment precedence.
+    rat()
+        .env("TERM", "xterm-256color")
+        .env("RAT_APPEARANCE", "dark")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "light",
+            "log",
+            "--level",
+            "info",
+            "hi",
+        ])
+        .assert()
+        .success()
+        .stderr("\x1b[1;38;5;30mINFO\x1b[0m hi\n");
+    // …and the mirror image, so neither side is accidentally hardcoded.
+    rat()
+        .env("TERM", "xterm-256color")
+        .env("RAT_APPEARANCE", "light")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "log",
+            "--level",
+            "info",
+            "hi",
+        ])
+        .assert()
+        .success()
+        .stderr("\x1b[1;38;5;86mINFO\x1b[0m hi\n");
+}
+
+#[test]
+fn log_warn_keeps_its_own_hue_apart_from_the_threshold_convention() {
+    // The warn a log line uses is not the warn a threshold band uses.
+    rat()
+        .env("TERM", "xterm-256color")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "dark",
+            "log",
+            "--level",
+            "warn",
+            "x",
+        ])
+        .assert()
+        .success()
+        .stderr("\x1b[1;38;5;192mWARN\x1b[0m x\n");
+    rat()
+        .env("TERM", "xterm-256color")
+        .args([
+            "--color",
+            "always",
+            "--appearance",
+            "light",
+            "log",
+            "--level",
+            "warn",
+            "x",
+        ])
+        .assert()
+        .success()
+        .stderr("\x1b[1;38;5;100mWARN\x1b[0m x\n");
+}

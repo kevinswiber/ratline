@@ -9,7 +9,7 @@ use crate::exit::AppResult;
 use crate::style_spec::StyleSpec;
 use crate::theme::Palette;
 
-pub fn run(args: LogArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: LogArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     // Unleveled messages bypass the minimum-level filter.
     if let (Some(level), Some(min)) = (args.level, args.min_level)
         && (level as u8) < (min as u8)
@@ -28,7 +28,7 @@ pub fn run(args: LogArgs, profile: ColorProfile, _palette: Palette) -> AppResult
         plain_prefix.clone_from(&prefix);
     }
     if let Some(level) = args.level {
-        prefix.push_str(&level.styled_tag(profile));
+        prefix.push_str(&level.styled_tag(profile, &palette));
         prefix.push(' ');
         plain_prefix.push_str(level.tag());
         plain_prefix.push(' ');
@@ -60,21 +60,20 @@ impl LogLevel {
         }
     }
 
-    fn color(self) -> ratatui::style::Color {
-        let index = match self {
-            LogLevel::Debug => 63,
-            LogLevel::Info => 86,
-            LogLevel::Warn => 192,
-            LogLevel::Error => 204,
-            LogLevel::Fatal => 134,
-        };
-        ratatui::style::Color::Indexed(index)
+    fn color(self, palette: &Palette) -> ratatui::style::Color {
+        match self {
+            LogLevel::Debug => palette.debug,
+            LogLevel::Info => palette.info,
+            LogLevel::Warn => palette.log_warn,
+            LogLevel::Error => palette.log_error,
+            LogLevel::Fatal => palette.fatal,
+        }
     }
 
-    fn styled_tag(self, profile: ColorProfile) -> String {
+    fn styled_tag(self, profile: ColorProfile, palette: &Palette) -> String {
         StyleSpec {
             bold: true,
-            foreground: Some(self.color()),
+            foreground: Some(self.color(palette)),
             ..StyleSpec::default()
         }
         .render(self.tag(), profile)
