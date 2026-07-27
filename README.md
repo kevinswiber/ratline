@@ -103,6 +103,56 @@ rat bar --indeterminate --tick $i --width 16              # moving block
 
 Presets: `--preset blocks|shade|ascii|line|dots`.
 
+### `rat table` — columns without the arithmetic
+
+A layout filter: tab-separated rows in, aligned columns out. Widths are
+measured in display cells, so cells styled by `rat style` or `rat bar`
+line up correctly — escapes are free and wide glyphs count double, which
+is exactly what `column -t` and `printf '%-27s'` get wrong.
+
+```sh
+printf 'build\t8/10\tpassing\ndeploy\t2/10\twaiting\n' | rat table
+# build   8/10  passing
+# deploy  2/10  waiting
+```
+
+Per-column configuration is a positional comma list — an empty entry or a
+short list keeps that column's default (auto width, left, truncate):
+
+```sh
+ps -o pid=,etime=,command= | tr -s ' ' '\t' |
+    rat table --align r,r --widths ,,24
+# 42  03:06  cargo nextest run --no-…
+#  7  00:12  git push
+
+printf 'Worktree\tfix/layout @ 47dfd63 with a very long description\n' |
+    rat table --widths 10,28 --overflow ,wrap
+# Worktree    fix/layout @ 47dfd63 with a
+#             very long description
+```
+
+An explicit width is the column, so bars and tables from separate
+invocations share an edge: `rat table --widths 27 --separator ' '` lines up
+with `rat bar --label-width 27`.
+
+### `rat join` — blocks side by side
+
+Compose whole blocks: each positional argument (or `--file`, with `-` for
+stdin) is a block, padded to its own widest line and joined row by row.
+
+```sh
+rat join --gap 2 "$(rat style --border rounded 'left panel')" \
+                 "$(rat style --border rounded 'right')"
+# ╭──────────╮  ╭─────╮
+# │left panel│  │right│
+# ╰──────────╯  ╰─────╯
+```
+
+Capture blocks with `"$(…)"` in bash/zsh, `(… | string collect)` in fish,
+and `(… | Out-String)` in PowerShell. `--vertical` stacks instead, with
+`--gap` blank lines between; `--align` takes top/middle/bottom beside and
+left/center/right stacked.
+
 ### `rat spark` — sparklines
 
 ```sh
@@ -133,6 +183,25 @@ rat style --foreground '#04b575' 'ok'        # hex, 256 index, or names
 rat log --level warn 'disk space low'        # WARN disk space low (stderr)
 rat log --time '%H:%M:%S' --level info up    # timestamped
 ```
+
+`style` also owns the box model — borders, padding, margin, a title in the
+top border, and a pinned content width:
+
+```sh
+rat style --border rounded --title Deploy --padding '0 1' 'status: green'
+# ╭─ Deploy ──────╮
+# │ status: green │
+# ╰───────────────╯
+```
+
+Borders come in `rounded`, `normal`, `thick`, `double`, and `ascii`;
+`--border-color` styles the frame without touching the content, and the
+title is inserted verbatim, so a pre-styled title
+(`--title "$(rat style --bold Deploy)"`) keeps its own look. `--padding`
+and `--margin` take CSS shorthand (`'1'`, `'0 2'`, `'1 2 3 4'`). With a
+border, the painted width is the content `--width` plus horizontal padding
+plus two. `NO_COLOR` governs color, not glyphs — borders keep their box
+characters; `--border ascii` is the dumb-terminal opt-out.
 
 Colors survive command substitution — capability is detected from the
 terminal, never from stdout, so `banner=$(rat style --bold hi)` keeps its
@@ -201,9 +270,13 @@ live in [`examples/`](examples/) for bash, zsh, fish, and PowerShell.
 `rat` is not gum-complete, on purpose. It is gum's scripting primitives plus
 the dashboard toolkit above.
 
-- **Not ported:** `table`, `join`, `format`, `write`, `file`, `pager` — none
-  of them earn their keep in a dashboard script.
-- **Added:** `bar`, `spark`, `watch`, `frame`, `doctor`, `duration`, `date`.
+- **Not ported:** `format`, `write`, `file`, `pager` — none of them earn
+  their keep in a dashboard script.
+- **Added:** `bar`, `spark`, `watch`, `frame`, `doctor`, `duration`, `date`,
+  `table`.
+- **`rat table` is a layout filter**, not gum's interactive row picker — no
+  selection or sorting, and per-column config is positional comma lists
+  (`--widths 27,,8`).
 - **Named colors are accepted** (`--foreground red`); gum silently drops them.
 - **UI goes to `/dev/tty`** with an stderr fallback, so prompts survive
   `2>/dev/null`; gum writes UI to stderr only.
@@ -212,8 +285,6 @@ the dashboard toolkit above.
   get `CLICOLOR_FORCE=1` instead.
 - **`--color always` trusts `TERM`** even when piped, so forced color keeps
   its full depth in scripts and CI.
-- Box-model styling (`--border`, `--margin`, padding, alignment) is not
-  implemented.
 
 ## Windows
 

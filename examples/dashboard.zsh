@@ -23,6 +23,16 @@ render() {
     uptime | sed 's/.*load average[s]*: //' | tr -d ',' | rat spark --min 0
     echo
 
+    # Two bordered panels side by side; the left one holds a table.
+    tasks=$(printf 'build\t8/10\tgreen\ntest\t2/10\twaiting\n' |
+        rat table --align l,r,l |
+        rat style --border rounded --title tasks --padding '0 1')
+    facts=$(printf 'host\t%s\nshell\tzsh\n' "$(hostname -s)" |
+        rat table |
+        rat style --border rounded --title facts --padding '0 1')
+    rat join --gap 2 "$tasks" "$facts"
+    echo
+
     rat log --level info "frame rendered $(rat date --relative "$(date +%s)")"
 }
 

@@ -34,6 +34,18 @@ function Show-Frame {
     }
     Write-Output ''
 
+    # Two bordered panels side by side; the left one holds a table.
+    $tasks = ("build`t8/10`tgreen`ntest`t2/10`twaiting" |
+        rat table --align l,r,l |
+        rat style --border rounded --title tasks --padding '0 1' |
+        Out-String).TrimEnd()
+    $facts = ("host`t$([Environment]::MachineName)`nshell`tpwsh" |
+        rat table |
+        rat style --border rounded --title facts --padding '0 1' |
+        Out-String).TrimEnd()
+    rat join --gap 2 $tasks $facts
+    Write-Output ''
+
     rat log --level info "frame rendered $(rat date --relative ([DateTimeOffset]::Now.ToUnixTimeSeconds()))"
 }
 
