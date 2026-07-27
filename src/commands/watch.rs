@@ -259,6 +259,11 @@ fn run_child(args: &WatchArgs, interactive: bool) -> Result<ChildOutput, AppErro
     if interactive {
         command.stdin(std::process::Stdio::null());
     }
+    // Children lay out against the frame without a tty side channel: the
+    // size is re-measured every tick, so scripts adapt to resizes live.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    command.env("RAT_WIDTH", cols.to_string());
+    command.env("RAT_HEIGHT", rows.to_string());
     match command.output() {
         Ok(out) => Ok(ChildOutput {
             stdout: out.stdout,

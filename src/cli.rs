@@ -64,6 +64,16 @@ pub enum Command {
     #[cfg(debug_assertions)]
     #[command(name = "__exitcode", hide = true)]
     ExitCode(ExitCodeArgs),
+    /// Test harness: print an environment variable's value, or "unset".
+    #[cfg(debug_assertions)]
+    #[command(name = "__env", hide = true)]
+    Env(EnvArgs),
+}
+
+#[cfg(debug_assertions)]
+#[derive(clap::Args)]
+pub struct EnvArgs {
+    pub name: String,
 }
 
 #[cfg(debug_assertions)]

@@ -190,3 +190,19 @@ fn clear_flag_stays_silent_when_piped() {
     assert!(!stdout.contains("\x1b[2J"), "piped output must stay plain");
     assert!(stdout.contains("hi"));
 }
+
+#[test]
+fn children_receive_the_frame_size_env() {
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["watch", "--once", "--", &rat_bin(), "__env", "RAT_WIDTH"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_match(r"^[0-9]+\n$").unwrap());
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["watch", "--once", "--", &rat_bin(), "__env", "RAT_HEIGHT"])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_match(r"^[0-9]+\n$").unwrap());
+}

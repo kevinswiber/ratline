@@ -85,6 +85,14 @@ fn dispatch(command: Command, profile: ColorProfile) -> exit::AppResult {
         Command::Spin(args) => commands::spin::run(args, profile),
         Command::Completion(args) => commands::completion::run(args, profile),
         #[cfg(debug_assertions)]
+        Command::Env(args) => {
+            match std::env::var(&args.name) {
+                Ok(value) => println!("{value}"),
+                Err(_) => println!("unset"),
+            }
+            Ok(())
+        }
+        #[cfg(debug_assertions)]
         Command::ExitCode(args) => {
             if let Some(msg) = &args.stderr_msg {
                 eprintln!("{msg}");
