@@ -31,7 +31,7 @@ impl UiApp for ChooseApp {
     }
 
     fn render(&self, _area: Rect, buf: &mut Buffer) {
-        let accent = Style::default().fg(self.palette.accent);
+        let selection = Style::default().fg(self.palette.selection);
         buf.set_string(
             0,
             0,
@@ -57,7 +57,11 @@ impl UiApp for ChooseApp {
                 });
             }
             line.push_str(&self.state.items[idx]);
-            let style = if at_cursor { accent } else { Style::default() };
+            let style = if at_cursor {
+                selection
+            } else {
+                Style::default()
+            };
             buf.set_string(0, y, line, style);
             y += 1;
         }
@@ -216,12 +220,24 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_row_takes_its_accent_from_the_palette() {
+    fn the_cursor_row_reads_the_selection_token_not_the_accent() {
+        // Sentinel: selection and accent share a value by construction, so
+        // only a diverging palette proves the render reads `selection`.
+        let palette = Palette {
+            selection: Color::Indexed(99),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        assert_eq!(cursor_row_fg(palette), Color::Indexed(99));
+    }
+
+    #[test]
+    fn the_cursor_row_takes_its_selection_from_the_palette() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
-        assert_eq!(cursor_row_fg(dark), dark.accent);
+        assert_eq!(cursor_row_fg(dark), dark.selection);
+        // The literal is the byte-identity pin; the field name is routing.
         assert_eq!(cursor_row_fg(dark), Color::Indexed(212));
-        assert_eq!(cursor_row_fg(light), light.accent);
+        assert_eq!(cursor_row_fg(light), light.selection);
         assert_ne!(cursor_row_fg(dark), cursor_row_fg(light));
     }
 }
