@@ -28,6 +28,62 @@ pub fn parse_color_scheme_report(bytes: &[u8]) -> Option<Appearance> {
     }
 }
 
+/// OSC 10 (foreground) vs OSC 11 (background).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum OscColorKind {
+    Foreground,
+    Background,
+}
+
+/// One-shot over a complete OSC 10/11 reply. Accepts both a BEL and an
+/// ST (`ESC \`) terminator.
+pub fn parse_osc_color_reply(bytes: &[u8]) -> Option<(OscColorKind, xterm_color::Color)> {
+    let (kind, rest) = match strip_needle(bytes, b"\x1b]10;") {
+        Some(rest) => (OscColorKind::Foreground, rest),
+        None => (OscColorKind::Background, strip_needle(bytes, b"\x1b]11;")?),
+    };
+    let payload = strip_terminator(rest)?;
+    let color = xterm_color::Color::parse(payload).ok()?;
+    Some((kind, color))
+}
+
+fn strip_needle<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    let pos = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    Some(&bytes[pos + needle.len()..])
+}
+
+fn strip_terminator(bytes: &[u8]) -> Option<&[u8]> {
+    if let Some(pos) = bytes.iter().position(|&b| b == 0x07) {
+        return Some(&bytes[..pos]);
+    }
+    let pos = bytes.windows(2).position(|window| window == b"\x1b\\")?;
+    Some(&bytes[..pos])
+}
+
+/// Startup-parity classification: a direct port of
+/// `terminal-colorsaurus`'s `ColorPalette::theme_mode`, so a mid-session
+/// verification agrees with the startup probe on the same colors.
+pub fn classify_colors(fg: Option<&xterm_color::Color>, bg: &xterm_color::Color) -> Appearance {
+    let bg_l = bg.perceived_lightness();
+    let Some(fg) = fg else {
+        return if bg_l > 0.5 {
+            Appearance::Light
+        } else {
+            Appearance::Dark
+        };
+    };
+    let fg_l = fg.perceived_lightness();
+    if bg_l < fg_l {
+        Appearance::Dark
+    } else if bg_l > fg_l || bg_l > 0.5 {
+        Appearance::Light
+    } else {
+        Appearance::Dark
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +125,71 @@ mod tests {
             parse_color_scheme_report(b"noise\x1b[?997;2nmore"),
             Some(Appearance::Light)
         );
+    }
+
+    #[test]
+    fn kind_10_is_foreground_and_11_is_background() {
+        assert_eq!(
+            parse_osc_color_reply(b"\x1b]10;rgb:aaaa/bbbb/cccc\x07").map(|(kind, _)| kind),
+            Some(OscColorKind::Foreground)
+        );
+        assert_eq!(
+            parse_osc_color_reply(b"\x1b]11;rgb:aaaa/bbbb/cccc\x07").map(|(kind, _)| kind),
+            Some(OscColorKind::Background)
+        );
+    }
+
+    #[test]
+    fn bel_and_st_terminators_are_both_accepted() {
+        let want = xterm_color::Color::rgb(0x1111, 0x2222, 0x3333);
+        assert_eq!(
+            parse_osc_color_reply(b"\x1b]11;rgb:1111/2222/3333\x07").map(|(_, c)| c),
+            Some(want.clone())
+        );
+        assert_eq!(
+            parse_osc_color_reply(b"\x1b]11;rgb:1111/2222/3333\x1b\\").map(|(_, c)| c),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn short_and_four_digit_rgb_payloads_parse() {
+        let (kind, color) = parse_osc_color_reply(b"\x1b]11;rgb:f/e/d\x07").unwrap();
+        assert_eq!(kind, OscColorKind::Background);
+        assert_eq!(color, xterm_color::Color::rgb(0xffff, 0xeeee, 0xdddd));
+
+        let (_, color) = parse_osc_color_reply(b"\x1b]10;rgb:1e1e/1e1e/2e2e\x07").unwrap();
+        assert_eq!(color, xterm_color::Color::rgb(0x1e1e, 0x1e1e, 0x2e2e));
+    }
+
+    #[test]
+    fn malformed_or_unterminated_payloads_have_no_verdict() {
+        assert_eq!(parse_osc_color_reply(b"\x1b]11;not-a-color\x07"), None);
+        assert_eq!(parse_osc_color_reply(b"\x1b]11;rgb:1111/2222\x07"), None);
+        assert_eq!(parse_osc_color_reply(b"garbage, no OSC anywhere"), None);
+        assert_eq!(parse_osc_color_reply(b"\x1b]11;rgb:1111/2222/3333"), None);
+    }
+
+    #[test]
+    fn classify_prefers_the_darker_background_relation() {
+        let black = xterm_color::Color::rgb(0, 0, 0);
+        let white = xterm_color::Color::rgb(u16::MAX, u16::MAX, u16::MAX);
+
+        // bg < fg: light text on a dark background.
+        assert_eq!(classify_colors(Some(&white), &black), Appearance::Dark);
+        // bg > fg: dark text on a light background.
+        assert_eq!(classify_colors(Some(&black), &white), Appearance::Light);
+        // bg == fg and bg > 0.5: the `bg > 0.5` arm.
+        assert_eq!(classify_colors(Some(&white), &white), Appearance::Light);
+        // bg == fg and bg <= 0.5: the final `else` arm.
+        assert_eq!(classify_colors(Some(&black), &black), Appearance::Dark);
+    }
+
+    #[test]
+    fn a_missing_foreground_falls_back_to_the_background_threshold() {
+        let black = xterm_color::Color::rgb(0, 0, 0);
+        let white = xterm_color::Color::rgb(u16::MAX, u16::MAX, u16::MAX);
+        assert_eq!(classify_colors(None, &white), Appearance::Light);
+        assert_eq!(classify_colors(None, &black), Appearance::Dark);
     }
 }

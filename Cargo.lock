@@ -1404,6 +1404,7 @@ dependencies = [
  "terminal-colorsaurus",
  "unicode-width",
  "windows-sys 0.59.0",
+ "xterm-color",
 ]
 
 [[package]]
