@@ -206,3 +206,57 @@ fn children_receive_the_frame_size_env() {
         .success()
         .stdout(predicates::str::is_match(r"^[0-9]+\n$").unwrap());
 }
+
+#[test]
+fn children_receive_the_appearance_env() {
+    rat()
+        .env("NO_COLOR", "1")
+        .args([
+            "watch",
+            "--once",
+            "--",
+            &rat_bin(),
+            "__env",
+            "RAT_APPEARANCE",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::is_match(r"^(light|dark)\n$").unwrap());
+}
+
+#[test]
+fn the_parent_appearance_passes_through_to_children() {
+    rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_APPEARANCE", "light")
+        .args([
+            "watch",
+            "--once",
+            "--",
+            &rat_bin(),
+            "__env",
+            "RAT_APPEARANCE",
+        ])
+        .assert()
+        .success()
+        .stdout("light\n");
+}
+
+#[test]
+fn an_explicit_parent_appearance_reaches_children() {
+    rat()
+        .env("NO_COLOR", "1")
+        .args([
+            "--appearance",
+            "dark",
+            "watch",
+            "--once",
+            "--",
+            &rat_bin(),
+            "__env",
+            "RAT_APPEARANCE",
+        ])
+        .assert()
+        .success()
+        .stdout("dark\n");
+}

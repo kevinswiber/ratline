@@ -14,10 +14,10 @@ use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
-use crate::theme::Palette;
+use crate::theme::{Appearance, Palette};
 use crate::ui::key::{Key, from_crossterm};
 
-pub fn run(args: WatchArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let interval = parse_interval(&args.interval)?;
     let (interrupted, terminated) = register_signals()?;
 
@@ -55,7 +55,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, _palette: Palette) -> AppResu
     let mut full_lines: Vec<String> = Vec::new();
     let mut notice: Option<String> = None;
     loop {
-        let output = run_child(&args, interactive)?;
+        let output = run_child(&args, interactive, palette.appearance)?;
         let mut combined = output.stdout.clone();
         combined.extend_from_slice(&output.stderr);
         let hash = signature(&combined);
@@ -249,7 +249,11 @@ struct ChildOutput {
 /// stdin so it cannot eat keystrokes. Loop mode renders spawn failures as
 /// content so a transient failure does not tear down the dashboard; once
 /// mode fails loudly.
-fn run_child(args: &WatchArgs, interactive: bool) -> Result<ChildOutput, AppError> {
+fn run_child(
+    args: &WatchArgs,
+    interactive: bool,
+    appearance: Appearance,
+) -> Result<ChildOutput, AppError> {
     let mut command = if args.shell {
         shell_command(&args.command.join(" "))
     } else {
@@ -265,6 +269,10 @@ fn run_child(args: &WatchArgs, interactive: bool) -> Result<ChildOutput, AppErro
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     command.env("RAT_WIDTH", cols.to_string());
     command.env("RAT_HEIGHT", rows.to_string());
+    // Children inherit the controlling terminal, so a child that resolved its
+    // own appearance would query a terminal this process is reading from.
+    // Hand it the verdict instead.
+    command.env("RAT_APPEARANCE", appearance.as_str());
     match command.output() {
         Ok(out) => Ok(ChildOutput {
             stdout: out.stdout,
