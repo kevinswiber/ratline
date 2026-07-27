@@ -5,3 +5,4 @@ pub mod fuzzy;
 pub mod measure;
 pub mod pager;
 pub mod spark;
+pub mod table;
