@@ -14,7 +14,7 @@ use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
-use crate::theme::{Appearance, Palette};
+use crate::theme::{Appearance, AppearanceSource, Palette};
 use crate::ui::key::{Key, from_crossterm};
 
 pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResult {
@@ -51,7 +51,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         ..StyleSpec::default()
     };
 
-    let mut previous_key: Option<(u64, u16, u16)> = None;
+    let mut previous_key: Option<(u64, u16, u16, Appearance)> = None;
     let mut full_lines: Vec<String> = Vec::new();
     let mut notice: Option<String> = None;
     loop {
@@ -60,10 +60,12 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         combined.extend_from_slice(&output.stderr);
         let hash = signature(&combined);
         // The terminal size joins the change key: a resize must repaint
-        // even when the content is unchanged.
+        // even when the content is unchanged. So does the appearance: a
+        // palette swap must repaint even when the child prints the same
+        // bytes.
         let size = crossterm::terminal::size().unwrap_or((80, 24));
-        if previous_key != Some((hash, size.0, size.1)) || notice.is_some() {
-            previous_key = Some((hash, size.0, size.1));
+        if previous_key != Some((hash, size.0, size.1, palette.appearance)) || notice.is_some() {
+            previous_key = Some((hash, size.0, size.1, palette.appearance));
             let body = String::from_utf8_lossy(&output.stdout);
             let mut lines: Vec<String> = Vec::new();
             if let Some(title) = &title_line {
@@ -315,6 +317,18 @@ fn register_signals() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>), AppError> {
     ))
 }
 
+/// Adopt an appearance the terminal reported. Returns true when the verdict
+/// actually changed; a repeat is a no-op, so a terminal that re-announces an
+/// unchanged theme costs nothing.
+#[allow(dead_code)] // Pinned by the unit tests until the wait loop calls it.
+fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
+    if palette.appearance == reported {
+        return false;
+    }
+    *palette = Palette::builtin(reported, AppearanceSource::Notification);
+    true
+}
+
 fn signature(bytes: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
@@ -327,6 +341,43 @@ fn shell_command(script: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new("sh");
     cmd.arg("-c").arg(script);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+
+    #[test]
+    fn adopting_a_different_appearance_reresolves_the_palette() {
+        let mut palette = Palette::builtin(Appearance::Dark, AppearanceSource::Osc);
+        assert!(adopt(&mut palette, Appearance::Light));
+        assert_eq!(palette.appearance, Appearance::Light);
+        assert_eq!(palette.source, AppearanceSource::Notification);
+        assert_eq!(palette.accent, Color::Indexed(129));
+    }
+
+    #[test]
+    fn adopting_the_current_appearance_changes_nothing() {
+        let mut palette = Palette::builtin(Appearance::Dark, AppearanceSource::Osc);
+        assert!(!adopt(&mut palette, Appearance::Dark));
+        // Not even the provenance moves: a repeat report is not a new
+        // verdict, and `doctor` must keep reporting how the palette was
+        // actually reached.
+        assert_eq!(palette.source, AppearanceSource::Osc);
+        assert_eq!(palette.accent, Color::Indexed(212));
+    }
+
+    #[test]
+    fn adopting_back_restores_the_original_tokens() {
+        let mut palette = Palette::builtin(Appearance::Dark, AppearanceSource::Osc);
+        assert!(adopt(&mut palette, Appearance::Light));
+        assert!(adopt(&mut palette, Appearance::Dark));
+        assert_eq!(palette.appearance, Appearance::Dark);
+        assert_eq!(palette.accent, Color::Indexed(212));
+        assert_eq!(palette.on_accent, Color::Black);
+    }
 }
 
 #[cfg(windows)]
