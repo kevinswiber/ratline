@@ -88,44 +88,117 @@ pub const TOKEN_NAMES: [&str; 10] = [
     "fatal",
 ];
 
-const DARK: Palette = Palette {
-    appearance: Appearance::Dark,
-    source: AppearanceSource::Default,
-    accent: Color::Indexed(212),
-    on_accent: Color::Black,
-    muted: Color::Indexed(240),
-    border: Color::Indexed(240),
-    ok: Color::Indexed(42),
-    warn: Color::Indexed(214),
-    error: Color::Indexed(196),
-    debug: Color::Indexed(63),
-    info: Color::Indexed(86),
-    fatal: Color::Indexed(134),
-    log_warn: Color::Indexed(192),
-    log_error: Color::Indexed(204),
+/// Reference tier: the raw values one appearance is built from — hue roles,
+/// not uses. Not addressable by name from the CLI; `Palette::from_refs` is
+/// the only reader.
+///
+/// Slots are typed `Color`, not `u8`, so a later value source can supply
+/// `Rgb` or a low `Indexed` without changing this type or anything
+/// downstream of `Palette::from_refs`.
+///
+/// base24 correspondence (documentation only; nothing reads it):
+///
+/// | slot           | base24                                  | dark | light | feeds                        |
+/// |----------------|-----------------------------------------|------|-------|------------------------------|
+/// | `red`          | `base08`                                | 196  | 160   | `error`                      |
+/// | `orange`       | `base09`                                | 214  | 172   | `warn`                       |
+/// | `yellow_green` | `base0A`                                | 192  | 100   | `log_warn`                   |
+/// | `green`        | `base0B`                                | 42   | 28    | `ok`                         |
+/// | `cyan`         | `base0C`                                | 86   | 30    | `info`                       |
+/// | `blue`         | `base0D`                                | 63   | 25    | `debug`                      |
+/// | `violet`       | `base0E`                                | 134  | 91    | `fatal`                      |
+/// | `pink`         | `base17` (`base0E` under plain base16)  | 212  | 129   | `accent`                     |
+/// | `pink_red`     | `base12` (`base08` under plain base16)  | 204  | 161   | `log_error`                  |
+/// | `neutral_1`    | `base02`                                | 240  | 249   | `border`                     |
+/// | `neutral_2`    | `base03`                                | 240  | 242   | `muted`                      |
+///
+/// Neutrals are ordered by distance from the background: `neutral_1` is
+/// nearest (rules), `neutral_2` one step in (secondary text). Under dark
+/// they coincide at 240 — deliberate; the light values are what separates
+/// them.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct RefSlots {
+    red: Color,
+    orange: Color,
+    yellow_green: Color,
+    green: Color,
+    cyan: Color,
+    blue: Color,
+    violet: Color,
+    pink: Color,
+    pink_red: Color,
+    neutral_1: Color,
+    neutral_2: Color,
+}
+
+const DARK_REFS: RefSlots = RefSlots {
+    red: Color::Indexed(196),
+    orange: Color::Indexed(214),
+    yellow_green: Color::Indexed(192),
+    green: Color::Indexed(42),
+    cyan: Color::Indexed(86),
+    blue: Color::Indexed(63),
+    violet: Color::Indexed(134),
+    pink: Color::Indexed(212),
+    pink_red: Color::Indexed(204),
+    neutral_1: Color::Indexed(240),
+    neutral_2: Color::Indexed(240),
 };
 
-// Light-background partners for the values above. White-on-accent: the
-// light accent is darker than the dark palette's, so white text carries
-// better contrast on it than black does.
-const LIGHT: Palette = Palette {
-    appearance: Appearance::Light,
-    source: AppearanceSource::Default,
-    accent: Color::Indexed(129),
-    on_accent: Color::White,
-    muted: Color::Indexed(242),
-    border: Color::Indexed(249),
-    ok: Color::Indexed(28),
-    warn: Color::Indexed(172),
-    error: Color::Indexed(160),
-    debug: Color::Indexed(25),
-    info: Color::Indexed(30),
-    fatal: Color::Indexed(91),
-    log_warn: Color::Indexed(100),
-    log_error: Color::Indexed(161),
+const LIGHT_REFS: RefSlots = RefSlots {
+    red: Color::Indexed(160),
+    orange: Color::Indexed(172),
+    yellow_green: Color::Indexed(100),
+    green: Color::Indexed(28),
+    cyan: Color::Indexed(30),
+    blue: Color::Indexed(25),
+    violet: Color::Indexed(91),
+    pink: Color::Indexed(129),
+    pink_red: Color::Indexed(161),
+    neutral_1: Color::Indexed(249),
+    neutral_2: Color::Indexed(242),
 };
+
+/// Not ref-derived: a legibility pin against `accent`, not a hue of its
+/// own. White on the light accent because that accent is darker than the
+/// dark palette's, so white text carries better contrast on it than black
+/// does.
+const fn on_accent_for(appearance: Appearance) -> Color {
+    match appearance {
+        Appearance::Dark => Color::Black,
+        Appearance::Light => Color::White,
+    }
+}
+
+const DARK: Palette = Palette::from_refs(DARK_REFS, Appearance::Dark);
+const LIGHT: Palette = Palette::from_refs(LIGHT_REFS, Appearance::Light);
 
 impl Palette {
+    /// The one seam where a set of reference values becomes a token table.
+    /// `builtin` is its only caller today; a loader that reads a theme file
+    /// or the terminal's own ANSI palette adds a second caller and changes
+    /// nothing below this line.
+    const fn from_refs(refs: RefSlots, appearance: Appearance) -> Palette {
+        Palette {
+            appearance,
+            source: AppearanceSource::Default,
+            // semantic tier: meaning and state.
+            ok: refs.green,
+            warn: refs.orange,
+            error: refs.red,
+            info: refs.cyan,
+            debug: refs.blue,
+            fatal: refs.violet,
+            accent: refs.pink,
+            log_warn: refs.yellow_green,
+            log_error: refs.pink_red,
+            // ui tier: chrome and interaction.
+            muted: refs.neutral_2,
+            border: refs.neutral_1,
+            on_accent: on_accent_for(appearance),
+        }
+    }
+
     pub fn token(&self, name: &str) -> Option<Color> {
         Some(match name {
             "accent" => self.accent,
@@ -407,6 +480,70 @@ mod tests {
         assert_eq!(p.fatal, Color::Indexed(134));
         assert_eq!(p.log_warn, Color::Indexed(192));
         assert_eq!(p.log_error, Color::Indexed(204));
+    }
+
+    #[test]
+    fn semantic_tokens_take_their_values_from_ref_slots() {
+        for (appearance, refs) in [
+            (Appearance::Dark, DARK_REFS),
+            (Appearance::Light, LIGHT_REFS),
+        ] {
+            let p = Palette::builtin(appearance, AppearanceSource::Default);
+            let table: [(&str, Color, Color); 9] = [
+                ("ok", p.ok, refs.green),
+                ("warn", p.warn, refs.orange),
+                ("error", p.error, refs.red),
+                ("info", p.info, refs.cyan),
+                ("debug", p.debug, refs.blue),
+                ("fatal", p.fatal, refs.violet),
+                ("accent", p.accent, refs.pink),
+                ("log_warn", p.log_warn, refs.yellow_green),
+                ("log_error", p.log_error, refs.pink_red),
+            ];
+            for (name, actual, expected) in table {
+                assert_eq!(actual, expected, "{name} in {appearance:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ui_tokens_take_their_values_from_ref_slots_or_a_pin() {
+        for (appearance, refs) in [
+            (Appearance::Dark, DARK_REFS),
+            (Appearance::Light, LIGHT_REFS),
+        ] {
+            let p = Palette::builtin(appearance, AppearanceSource::Default);
+            assert_eq!(p.muted, refs.neutral_2, "muted in {appearance:?}");
+            assert_eq!(p.border, refs.neutral_1, "border in {appearance:?}");
+            // Deliberately not ref-derived: a legibility pin against `accent`.
+            assert_eq!(p.on_accent, on_accent_for(appearance));
+        }
+    }
+
+    #[test]
+    fn ref_slots_reproduce_the_shipping_indices() {
+        assert_eq!(DARK_REFS.red, Color::Indexed(196));
+        assert_eq!(DARK_REFS.orange, Color::Indexed(214));
+        assert_eq!(DARK_REFS.yellow_green, Color::Indexed(192));
+        assert_eq!(DARK_REFS.green, Color::Indexed(42));
+        assert_eq!(DARK_REFS.cyan, Color::Indexed(86));
+        assert_eq!(DARK_REFS.blue, Color::Indexed(63));
+        assert_eq!(DARK_REFS.violet, Color::Indexed(134));
+        assert_eq!(DARK_REFS.pink, Color::Indexed(212));
+        assert_eq!(DARK_REFS.pink_red, Color::Indexed(204));
+        assert_eq!(DARK_REFS.neutral_1, Color::Indexed(240));
+        assert_eq!(DARK_REFS.neutral_2, Color::Indexed(240));
+        assert_eq!(LIGHT_REFS.red, Color::Indexed(160));
+        assert_eq!(LIGHT_REFS.orange, Color::Indexed(172));
+        assert_eq!(LIGHT_REFS.yellow_green, Color::Indexed(100));
+        assert_eq!(LIGHT_REFS.green, Color::Indexed(28));
+        assert_eq!(LIGHT_REFS.cyan, Color::Indexed(30));
+        assert_eq!(LIGHT_REFS.blue, Color::Indexed(25));
+        assert_eq!(LIGHT_REFS.violet, Color::Indexed(91));
+        assert_eq!(LIGHT_REFS.pink, Color::Indexed(129));
+        assert_eq!(LIGHT_REFS.pink_red, Color::Indexed(161));
+        assert_eq!(LIGHT_REFS.neutral_1, Color::Indexed(249));
+        assert_eq!(LIGHT_REFS.neutral_2, Color::Indexed(242));
     }
 
     #[test]
