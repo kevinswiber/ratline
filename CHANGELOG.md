@@ -2,6 +2,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.6.0](https://github.com/kevinswiber/ratto/compare/bedddc52dd95ce9b57b010643034ba1d08f82d7d..v0.6.0) - 2026-07-27
+#### Features
+- add cursor and placeholder theme tokens - ([722d8a1](https://github.com/kevinswiber/ratto/commit/722d8a1a97a8be53b4fead598201669874b3825f)) - [@kevinswiber](https://github.com/kevinswiber)
+- add selection and match theme tokens - ([e1cb3ab](https://github.com/kevinswiber/ratto/commit/e1cb3ab6ded83f51dcd1dce24b6aa24e8b09231d)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- pin on-accent to the 256-color cube - ([945ca2f](https://github.com/kevinswiber/ratto/commit/945ca2fb06fcbc56ea2bd42d16af12c6d8722590)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- document the selection, match, cursor, and placeholder tokens - ([57aa2d1](https://github.com/kevinswiber/ratto/commit/57aa2d17b43bbc5cfea07bed7d5af327e40b4aed)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- read the input placeholder and caret from their ui tokens - ([c1a83a1](https://github.com/kevinswiber/ratto/commit/c1a83a18db205ba785142e94bf73c905064d7f19)) - [@kevinswiber](https://github.com/kevinswiber)
+- read the filter surface from its ui tokens - ([d0f5b9a](https://github.com/kevinswiber/ratto/commit/d0f5b9a06c709768aae13dc27e72c9488c190bcf)) - [@kevinswiber](https://github.com/kevinswiber)
+- read the choose cursor row from the selection token - ([a86c190](https://github.com/kevinswiber/ratto/commit/a86c1904dc36d9662d221de67acce3ae696dc0cb)) - [@kevinswiber](https://github.com/kevinswiber)
+- derive the palettes from a reference tier - ([89bc6cc](https://github.com/kevinswiber/ratto/commit/89bc6cc59861477259c3d4c775a507cdcb643f19)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.5.0](https://github.com/kevinswiber/ratto/compare/4c564934a9c180d246d0390b993fa03661e00f89..v0.5.0) - 2026-07-27
 #### Features
 - follow terminal theme changes live in watch on unix - ([3556c9f](https://github.com/kevinswiber/ratto/commit/3556c9f05e30d438a0dd09a44fc0e537ae89e746)) - [@kevinswiber](https://github.com/kevinswiber)
