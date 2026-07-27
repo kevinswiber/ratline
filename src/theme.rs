@@ -74,12 +74,18 @@ pub struct Palette {
     // physically appended after the internal log fields.
     pub selection: Color,
     pub r#match: Color,
+    /// `Color::Reset` because the caret carries no color today; a future
+    /// value source (or `reverse` support in `StyleSpec`) gives it one.
+    pub cursor: Color,
+    /// `Color::Reset` because placeholder text is faint-only today; the
+    /// attribute, not a hue, is what sets it apart.
+    pub placeholder: Color,
 }
 
 /// Every public token name, in declaration order. Pinned against `token()`
 /// by a unit test.
 #[allow(dead_code)] // Read by tests and documentation, not by commands.
-pub const TOKEN_NAMES: [&str; 12] = [
+pub const TOKEN_NAMES: [&str; 14] = [
     "accent",
     "on-accent",
     "muted",
@@ -92,6 +98,8 @@ pub const TOKEN_NAMES: [&str; 12] = [
     "fatal",
     "selection",
     "match",
+    "cursor",
+    "placeholder",
 ];
 
 /// Reference tier: the raw values one appearance is built from — hue roles,
@@ -204,6 +212,11 @@ impl Palette {
             on_accent: on_accent_for(appearance),
             selection: refs.pink,
             r#match: refs.pink,
+            // Colorless today (DIM/REVERSED carry the meaning): Reset is
+            // the one value that is a legal Color and emits nothing —
+            // style_spec drops it and buffer_ansi filters it from cells.
+            cursor: Color::Reset,
+            placeholder: Color::Reset,
         }
     }
 
@@ -221,6 +234,8 @@ impl Palette {
             "fatal" => self.fatal,
             "selection" => self.selection,
             "match" => self.r#match,
+            "cursor" => self.cursor,
+            "placeholder" => self.placeholder,
             _ => return None,
         })
     }
@@ -593,6 +608,17 @@ mod tests {
     }
 
     #[test]
+    fn cursor_and_placeholder_are_the_terminal_default() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let p = Palette::builtin(appearance, AppearanceSource::Default);
+            assert_eq!(p.cursor, Color::Reset);
+            assert_eq!(p.placeholder, Color::Reset);
+            assert_eq!(p.resolve("cursor").unwrap(), Color::Reset);
+            assert_eq!(p.resolve("placeholder").unwrap(), Color::Reset);
+        }
+    }
+
+    #[test]
     fn every_palette_color_is_a_ref_slot_or_a_declared_pin() {
         for (appearance, refs) in [
             (Appearance::Dark, DARK_REFS),
@@ -612,9 +638,13 @@ mod tests {
                 refs.neutral_1,
                 refs.neutral_2,
             ];
-            let pinned: [(&str, Color); 1] = [("on-accent", on_accent_for(appearance))];
+            let pinned: [(&str, Color); 3] = [
+                ("on-accent", on_accent_for(appearance)),
+                ("cursor", Color::Reset),
+                ("placeholder", Color::Reset),
+            ];
             // Over FIELDS, not TOKEN_NAMES: log_warn/log_error are included.
-            let fields: [(&str, Color); 14] = [
+            let fields: [(&str, Color); 16] = [
                 ("accent", p.accent),
                 ("on-accent", p.on_accent),
                 ("muted", p.muted),
@@ -629,6 +659,8 @@ mod tests {
                 ("log_error", p.log_error),
                 ("selection", p.selection),
                 ("match", p.r#match),
+                ("cursor", p.cursor),
+                ("placeholder", p.placeholder),
             ];
             for (name, value) in fields {
                 let is_ref = ref_values.contains(&value);
@@ -658,12 +690,37 @@ mod tests {
         assert_eq!(p.log_error, Color::Indexed(161));
     }
 
+    const APPEARANCE_NEUTRAL: [&str; 2] = ["cursor", "placeholder"];
+
     #[test]
-    fn light_differs_from_dark_on_every_token() {
+    fn every_hue_token_differs_between_appearances() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         for name in TOKEN_NAMES {
+            if APPEARANCE_NEUTRAL.contains(&name) {
+                continue;
+            }
             assert_ne!(dark.token(name), light.token(name), "{name} is unpaired");
+        }
+    }
+
+    #[test]
+    fn appearance_neutral_tokens_are_exactly_the_declared_set() {
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        for name in TOKEN_NAMES {
+            if APPEARANCE_NEUTRAL.contains(&name) {
+                // Neutral: identical across appearances, and always Reset.
+                assert_eq!(dark.token(name), Some(Color::Reset), "{name} in dark");
+                assert_eq!(light.token(name), Some(Color::Reset), "{name} in light");
+            } else {
+                // Anything else joining the exempt set is a bug, not a theme.
+                assert_ne!(
+                    dark.token(name),
+                    light.token(name),
+                    "{name} must not be appearance-neutral"
+                );
+            }
         }
     }
 
