@@ -1,7 +1,7 @@
 // Consumed by the table command, which lands with its wiring.
 #![allow(dead_code)]
 
-use crate::core::measure::{Align, ELLIPSIS, display_width};
+use crate::core::measure::{Align, ELLIPSIS, display_width, pad_display, truncate_display};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
 pub enum Overflow {
@@ -152,6 +152,58 @@ pub fn resolve_widths(rows: &[Row], columns: &[ColumnSpec]) -> Vec<usize> {
         .collect()
 }
 
+/// Render rows into aligned lines. Widths resolve once for the whole table;
+/// the final non-empty column is never right-padded and trailing empty
+/// columns drop their separators.
+pub fn render_table(rows: &[Row], spec: &TableSpec) -> Vec<String> {
+    let widths = resolve_widths(rows, &spec.columns);
+    rows.iter()
+        .map(|row| match row {
+            Row::Blank => String::new(),
+            Row::Cells(cells) => render_row(cells, &widths, spec),
+        })
+        .collect()
+}
+
+fn render_row(cells: &[String], widths: &[usize], spec: &TableSpec) -> String {
+    let rendered: Vec<String> = cells
+        .iter()
+        .zip(widths)
+        .map(|(cell, &width)| truncate_display(cell, width, &spec.ellipsis))
+        .collect();
+    let Some(last) = rendered.iter().rposition(|cell| !cell.is_empty()) else {
+        return String::new();
+    };
+    rendered[..=last]
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| {
+            let align = spec.columns.get(i).map(|c| c.align).unwrap_or_default();
+            if i < last {
+                pad_display(cell, widths[i], align)
+            } else {
+                pad_last_cell(cell, widths[i], align)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(&spec.separator)
+}
+
+/// The final column keeps only left-side alignment padding, so a line never
+/// ends in whitespace the layout invented.
+fn pad_last_cell(cell: &str, width: usize, align: Align) -> String {
+    let current = display_width(cell);
+    if current >= width {
+        return cell.to_string();
+    }
+    let missing = width - current;
+    match align {
+        Align::Left => cell.to_string(),
+        Align::Right => format!("{}{cell}", " ".repeat(missing)),
+        Align::Center => format!("{}{cell}", " ".repeat(missing / 2)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +297,106 @@ mod tests {
         assert!(err.contains("column 2"), "got: {err}");
         assert!(parse_columns(None, Some("l,x"), None).is_err());
         assert!(parse_columns(None, None, Some("wrapp")).is_err());
+    }
+
+    fn spec(columns: Vec<ColumnSpec>) -> TableSpec {
+        TableSpec {
+            columns,
+            ..TableSpec::default()
+        }
+    }
+
+    #[test]
+    fn render_pads_columns_to_a_shared_width() {
+        assert_eq!(
+            render_table(&parse_table("a\t1\nlonger\t22\n", '\t'), &spec(vec![])),
+            vec!["a       1", "longer  22"]
+        );
+    }
+
+    #[test]
+    fn right_aligned_columns_pad_on_the_left() {
+        let columns = vec![
+            ColumnSpec::default(),
+            ColumnSpec {
+                align: Align::Right,
+                ..ColumnSpec::default()
+            },
+        ];
+        assert_eq!(
+            render_table(&parse_table("a\t1\nb\t22\n", '\t'), &spec(columns)),
+            vec!["a   1", "b  22"]
+        );
+    }
+
+    #[test]
+    fn pinned_columns_truncate_with_the_ellipsis() {
+        let columns = vec![
+            ColumnSpec {
+                width: Some(4),
+                ..ColumnSpec::default()
+            },
+            ColumnSpec::default(),
+        ];
+        assert_eq!(
+            render_table(&parse_table("abcdefgh\tx\n", '\t'), &spec(columns)),
+            vec!["abc…  x"]
+        );
+    }
+
+    #[test]
+    fn ansi_cells_keep_their_escapes_and_their_width() {
+        assert_eq!(
+            render_table(
+                &parse_table("\x1b[31mab\x1b[0m\tx\nabcd\ty\n", '\t'),
+                &spec(vec![])
+            ),
+            vec!["\x1b[31mab\x1b[0m    x", "abcd  y"]
+        );
+    }
+
+    #[test]
+    fn a_row_styled_end_to_end_keeps_color_across_cells() {
+        // An SGR opened before the first cell and reset after the last one
+        // survives the split: the open code rides cell 1, the reset rides the
+        // final cell, and the padding between stays inside the colored span.
+        let rows = parse_table("\x1b[38;5;42m✓\t1.1\tland the fix\x1b[0m\n", '\t');
+        let out = render_table(&rows, &spec(vec![]));
+        assert_eq!(out, vec!["\x1b[38;5;42m✓  1.1  land the fix\x1b[0m"]);
+    }
+
+    #[test]
+    fn blank_rows_pass_through() {
+        assert_eq!(
+            render_table(&parse_table("a\tb\n\nc\td\n", '\t'), &spec(vec![])),
+            vec!["a  b", "", "c  d"]
+        );
+    }
+
+    #[test]
+    fn no_line_ends_in_invented_padding() {
+        for line in render_table(&parse_table("a\tb\nlonger\t\n", '\t'), &spec(vec![])) {
+            assert_eq!(line, line.trim_end(), "trailing padding: {line:?}");
+        }
+    }
+
+    #[test]
+    fn missing_trailing_cells_drop_their_separators() {
+        assert_eq!(
+            render_table(&parse_table("a\tb\tc\nlonger\n", '\t'), &spec(vec![]))[1],
+            "longer"
+        );
+    }
+
+    #[test]
+    fn a_custom_separator_sets_the_gutter() {
+        let s = TableSpec {
+            separator: " ".into(),
+            ..TableSpec::default()
+        };
+        assert_eq!(
+            render_table(&parse_table("ab\tx\n", '\t'), &s),
+            vec!["ab x"]
+        );
     }
 }
