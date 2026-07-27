@@ -547,6 +547,53 @@ mod tests {
     }
 
     #[test]
+    fn every_palette_color_is_a_ref_slot_or_a_declared_pin() {
+        for (appearance, refs) in [
+            (Appearance::Dark, DARK_REFS),
+            (Appearance::Light, LIGHT_REFS),
+        ] {
+            let p = Palette::builtin(appearance, AppearanceSource::Default);
+            let ref_values = [
+                refs.red,
+                refs.orange,
+                refs.yellow_green,
+                refs.green,
+                refs.cyan,
+                refs.blue,
+                refs.violet,
+                refs.pink,
+                refs.pink_red,
+                refs.neutral_1,
+                refs.neutral_2,
+            ];
+            let pinned: [(&str, Color); 1] = [("on-accent", on_accent_for(appearance))];
+            // Over FIELDS, not TOKEN_NAMES: log_warn/log_error are included.
+            let fields: [(&str, Color); 12] = [
+                ("accent", p.accent),
+                ("on-accent", p.on_accent),
+                ("muted", p.muted),
+                ("border", p.border),
+                ("ok", p.ok),
+                ("warn", p.warn),
+                ("error", p.error),
+                ("debug", p.debug),
+                ("info", p.info),
+                ("fatal", p.fatal),
+                ("log_warn", p.log_warn),
+                ("log_error", p.log_error),
+            ];
+            for (name, value) in fields {
+                let is_ref = ref_values.contains(&value);
+                let is_pin = pinned.iter().any(|(n, v)| *n == name && *v == value);
+                assert!(
+                    is_ref || is_pin,
+                    "{name} in {appearance:?} has an invented value {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn light_reproduces_the_shipping_indices() {
         let p = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         assert_eq!(p.accent, Color::Indexed(129));
