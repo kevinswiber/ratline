@@ -35,7 +35,8 @@ impl Appearance {
     }
 }
 
-/// Where the verdict came from. `doctor` reports it; nothing branches on it.
+/// Where the verdict came from. `doctor` reports it; the theme-notification
+/// subscription gate refuses to subscribe over an explicit choice.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum AppearanceSource {
     // The flag and the environment variable resolve to the same value, so

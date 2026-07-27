@@ -7,7 +7,20 @@
 //! input stream in raw mode — the same component that would otherwise
 //! receive the reply as a keystroke.
 
-use crate::theme::Appearance;
+use crate::color::ColorProfile;
+use crate::theme::{Appearance, AppearanceSource};
+
+/// True when this process may subscribe to theme-change notifications.
+/// Mirrors `may_detect` (`src/theme.rs`), but keys on the resolved
+/// palette's provenance and adds the raw-input term `may_detect` has no
+/// analogue for.
+pub fn may_subscribe(
+    source: AppearanceSource,
+    profile: ColorProfile,
+    owns_raw_input: bool,
+) -> bool {
+    owns_raw_input && profile != ColorProfile::Ascii && source != AppearanceSource::Explicit
+}
 
 /// Find a `CSI ? 997 ; Ps n` report anywhere in the byte stream. Ps=1
 /// dark, Ps=2 light — the single place that mapping is encoded.
@@ -86,7 +99,29 @@ pub fn classify_colors(fg: Option<&xterm_color::Color>, bg: &xterm_color::Color)
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
+    use crate::color::ColorProfile;
+
+    #[rstest]
+    // Only the row where every term permits it may subscribe.
+    #[case(true, ColorProfile::TrueColor, AppearanceSource::Osc, true)]
+    #[case(true, ColorProfile::TrueColor, AppearanceSource::Explicit, false)]
+    #[case(true, ColorProfile::Ascii, AppearanceSource::Osc, false)]
+    #[case(true, ColorProfile::Ascii, AppearanceSource::Explicit, false)]
+    #[case(false, ColorProfile::TrueColor, AppearanceSource::Osc, false)]
+    #[case(false, ColorProfile::TrueColor, AppearanceSource::Explicit, false)]
+    #[case(false, ColorProfile::Ascii, AppearanceSource::Osc, false)]
+    #[case(false, ColorProfile::Ascii, AppearanceSource::Explicit, false)]
+    fn may_subscribe_matrix(
+        #[case] owns_raw_input: bool,
+        #[case] profile: ColorProfile,
+        #[case] source: AppearanceSource,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(may_subscribe(source, profile, owns_raw_input), expected);
+    }
 
     #[test]
     fn parses_both_polarities() {
