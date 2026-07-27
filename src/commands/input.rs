@@ -6,6 +6,7 @@ use crate::cli::InputArgs;
 use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
 use crate::exit::AppResult;
+use crate::theme::Palette;
 use crate::ui::input::InputState;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, run_ui};
@@ -56,7 +57,7 @@ impl UiApp for InputApp {
     }
 }
 
-pub fn run(args: InputArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: InputArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let mut app = InputApp {
         state: InputState::new(args.value.clone(), args.password, args.char_limit),
         prompt: args.prompt.clone(),

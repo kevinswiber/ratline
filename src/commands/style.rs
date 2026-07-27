@@ -7,8 +7,9 @@ use crate::color::ColorProfile;
 use crate::core::box_model::{BoxSpec, parse_sides, render_box};
 use crate::exit::AppResult;
 use crate::style_spec::{StyleSpec, parse_color};
+use crate::theme::Palette;
 
-pub fn run(args: StyleArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: StyleArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let spec = StyleSpec {
         bold: args.bold,
         faint: args.faint,

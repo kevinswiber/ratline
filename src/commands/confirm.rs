@@ -6,6 +6,7 @@ use crate::cli::ConfirmArgs;
 use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
 use crate::exit::{AppError, AppResult};
+use crate::theme::Palette;
 use crate::ui::confirm::ConfirmState;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, run_ui};
@@ -51,7 +52,7 @@ impl UiApp for ConfirmApp {
     }
 }
 
-pub fn run(args: ConfirmArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: ConfirmArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let mut app = ConfirmApp {
         state: ConfirmState {
             affirmative: args.default_yes,

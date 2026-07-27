@@ -9,6 +9,7 @@ use crate::cli::ChooseArgs;
 use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
 use crate::exit::AppResult;
+use crate::theme::Palette;
 use crate::ui::choose::ChooseState;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, run_ui};
@@ -75,7 +76,7 @@ impl UiApp for ChooseApp {
     }
 }
 
-pub fn run(args: ChooseArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: ChooseArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let options = if args.options.is_empty() {
         let mut buf = String::new();
         std::io::stdin()

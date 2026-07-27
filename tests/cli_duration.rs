@@ -1,7 +1,11 @@
 use assert_cmd::Command;
 
 fn rat() -> Command {
-    Command::cargo_bin("rat").expect("rat binary builds")
+    let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
+    // Both can change which palette a run picks, so tests pin neither.
+    cmd.env_remove("RAT_APPEARANCE");
+    cmd.env_remove("COLORFGBG");
+    cmd
 }
 
 #[test]

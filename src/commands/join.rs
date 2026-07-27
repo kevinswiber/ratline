@@ -9,8 +9,9 @@ use crate::core::join::{
 };
 use crate::core::measure::Align;
 use crate::exit::AppResult;
+use crate::theme::Palette;
 
-pub fn run(args: JoinArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: JoinArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let texts: Vec<String> = if args.file.is_empty() {
         args.blocks
     } else {

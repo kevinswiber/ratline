@@ -23,7 +23,33 @@ const SUBCOMMANDS: [&str; 17] = [
 ];
 
 fn rat() -> Command {
-    Command::cargo_bin("rat").expect("rat binary builds")
+    let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
+    // Both can change which palette a run picks, so tests pin neither.
+    cmd.env_remove("RAT_APPEARANCE");
+    cmd.env_remove("COLORFGBG");
+    cmd
+}
+
+#[test]
+fn the_appearance_flag_is_global_and_accepted_everywhere() {
+    for mode in ["auto", "light", "dark"] {
+        rat()
+            .env("NO_COLOR", "1")
+            .args(["--appearance", mode, "style", "x"])
+            .assert()
+            .success()
+            .stdout("x\n");
+    }
+}
+
+#[test]
+fn the_appearance_flag_does_not_leak_into_the_environment() {
+    // The flag decides this process's palette; it does not export anything.
+    rat()
+        .args(["--appearance", "light", "__env", "RAT_APPEARANCE"])
+        .assert()
+        .success()
+        .stdout("unset\n");
 }
 
 #[test]

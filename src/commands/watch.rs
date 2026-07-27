@@ -14,9 +14,10 @@ use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
+use crate::theme::Palette;
 use crate::ui::key::{Key, from_crossterm};
 
-pub fn run(args: WatchArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: WatchArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let interval = parse_interval(&args.interval)?;
     let (interrupted, terminated) = register_signals()?;
 

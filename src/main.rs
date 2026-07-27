@@ -15,6 +15,7 @@ use crate::cli::{Cli, Command};
 use crate::color::ColorProfile;
 use crate::exit::{AppError, OK};
 use crate::term::tty::UiStream;
+use crate::theme::Palette;
 
 fn main() {
     // Die quietly on a closed pipe (`rat ... | head`) like other unix
@@ -53,7 +54,22 @@ fn real_main() -> i32 {
     // command substitution keeps color.
     let is_tty = UiStream::open().is_tty();
     let profile = color::resolve_profile(cli.color, &color::SystemEnv, is_tty);
-    match dispatch(cli.command, profile) {
+    // Asked at most once per process, here, before any command runs and long
+    // before anything claims raw mode. Commands never ask.
+    let detected = if theme::may_detect(cli.appearance, profile) {
+        term::appearance::probe(theme::PROBE_TIMEOUT)
+            .map(|a| (a, theme::AppearanceSource::Osc))
+            .or_else(|| {
+                theme::appearance_from_colorfgbg(&color::SystemEnv)
+                    .map(|a| (a, theme::AppearanceSource::ColorFgBg))
+            })
+    } else {
+        None
+    };
+    let (appearance, source) = theme::resolve_appearance(cli.appearance, detected);
+    let palette = theme::Palette::builtin(appearance, source);
+
+    match dispatch(cli.command, profile, palette) {
         Ok(()) => OK,
         Err(err) => {
             match &err {
@@ -66,25 +82,25 @@ fn real_main() -> i32 {
     }
 }
 
-fn dispatch(command: Command, profile: ColorProfile) -> exit::AppResult {
+fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::AppResult {
     match command {
-        Command::Style(args) => commands::style::run(args, profile),
-        Command::Bar(args) => commands::bar::run(args, profile),
-        Command::Table(args) => commands::table::run(args, profile),
-        Command::Join(args) => commands::join::run(args, profile),
-        Command::Duration(args) => commands::duration::run(args, profile),
-        Command::Date(args) => commands::date::run(args, profile),
-        Command::Spark(args) => commands::spark::run(args, profile),
-        Command::Log(args) => commands::log::run(args, profile),
-        Command::Frame(args) => commands::frame::run(args, profile),
-        Command::Watch(args) => commands::watch::run(args, profile),
-        Command::Doctor(args) => commands::doctor::run(args, profile),
-        Command::Choose(args) => commands::choose::run(args, profile),
-        Command::Confirm(args) => commands::confirm::run(args, profile),
-        Command::Input(args) => commands::input::run(args, profile),
-        Command::Filter(args) => commands::filter::run(args, profile),
-        Command::Spin(args) => commands::spin::run(args, profile),
-        Command::Completion(args) => commands::completion::run(args, profile),
+        Command::Style(args) => commands::style::run(args, profile, palette),
+        Command::Bar(args) => commands::bar::run(args, profile, palette),
+        Command::Table(args) => commands::table::run(args, profile, palette),
+        Command::Join(args) => commands::join::run(args, profile, palette),
+        Command::Duration(args) => commands::duration::run(args, profile, palette),
+        Command::Date(args) => commands::date::run(args, profile, palette),
+        Command::Spark(args) => commands::spark::run(args, profile, palette),
+        Command::Log(args) => commands::log::run(args, profile, palette),
+        Command::Frame(args) => commands::frame::run(args, profile, palette),
+        Command::Watch(args) => commands::watch::run(args, profile, palette),
+        Command::Doctor(args) => commands::doctor::run(args, profile, palette),
+        Command::Choose(args) => commands::choose::run(args, profile, palette),
+        Command::Confirm(args) => commands::confirm::run(args, profile, palette),
+        Command::Input(args) => commands::input::run(args, profile, palette),
+        Command::Filter(args) => commands::filter::run(args, profile, palette),
+        Command::Spin(args) => commands::spin::run(args, profile, palette),
+        Command::Completion(args) => commands::completion::run(args, profile, palette),
         #[cfg(debug_assertions)]
         Command::Env(args) => {
             match std::env::var(&args.name) {

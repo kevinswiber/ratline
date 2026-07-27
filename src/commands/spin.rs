@@ -9,8 +9,9 @@ use crate::core::duration::parse_interval;
 use crate::exit::{AppError, AppResult};
 use crate::term::inline::InlineRenderer;
 use crate::term::tty::UiStream;
+use crate::theme::Palette;
 
-pub fn run(args: SpinArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: SpinArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
 
     let mut command = std::process::Command::new(&args.command[0]);

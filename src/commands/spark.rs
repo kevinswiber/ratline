@@ -7,8 +7,9 @@ use crate::color::ColorProfile;
 use crate::core::spark::sparkline;
 use crate::exit::AppResult;
 use crate::style_spec::{StyleSpec, parse_color};
+use crate::theme::Palette;
 
-pub fn run(args: SparkArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: SparkArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let raw = if args.values.is_empty() {
         let mut buf = String::new();
         std::io::stdin()

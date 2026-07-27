@@ -2,7 +2,15 @@ use assert_cmd::Command;
 
 fn rat() -> Command {
     let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
-    for var in ["NO_COLOR", "TERM", "COLORTERM", "CLICOLOR_FORCE", "CI"] {
+    for var in [
+        "NO_COLOR",
+        "TERM",
+        "COLORTERM",
+        "CLICOLOR_FORCE",
+        "CI",
+        "RAT_APPEARANCE",
+        "COLORFGBG",
+    ] {
         cmd.env_remove(var);
     }
     cmd

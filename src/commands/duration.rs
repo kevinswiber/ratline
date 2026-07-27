@@ -6,8 +6,9 @@ use crate::core::duration::{
     DurationFormat, format_clock, format_compact, format_long, parse_duration,
 };
 use crate::exit::AppResult;
+use crate::theme::Palette;
 
-pub fn run(args: DurationArgs, _profile: ColorProfile) -> AppResult {
+pub fn run(args: DurationArgs, _profile: ColorProfile, _palette: Palette) -> AppResult {
     if args.seconds {
         println!("{}", parse_duration(&args.value)?);
         return Ok(());

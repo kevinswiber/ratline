@@ -11,6 +11,7 @@ use crate::core::bar::{
 };
 use crate::exit::AppResult;
 use crate::style_spec::{StyleSpec, parse_color};
+use crate::theme::Palette;
 
 const DEFAULT_FILL_COLOR: Color = Color::Indexed(212);
 const DEFAULT_LABEL_WIDTH: u16 = 34;
@@ -22,7 +23,7 @@ fn fg(color: Color) -> StyleSpec {
     }
 }
 
-pub fn run(args: BarArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: BarArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     if args.total < 0.0 {
         return Err(anyhow!("total must be non-negative").into());
     }

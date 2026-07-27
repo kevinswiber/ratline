@@ -8,8 +8,9 @@ use crate::color::ColorProfile;
 use crate::exit::AppResult;
 use crate::term::frame_state::{FrameState, STATE_VERSION, default_state_path};
 use crate::term::inline::{frame_bytes, rendered_rows};
+use crate::theme::Palette;
 
-pub fn run(args: FrameArgs, _profile: ColorProfile) -> AppResult {
+pub fn run(args: FrameArgs, _profile: ColorProfile, _palette: Palette) -> AppResult {
     let mut stdout = std::io::stdout().lock();
 
     match args.action {

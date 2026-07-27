@@ -20,6 +20,15 @@ const HELP_STYLES: Styles = Styles::styled()
 pub struct Cli {
     #[arg(long, value_enum, global = true, default_value_t = ColorMode::Auto)]
     pub color: ColorMode,
+    /// Which built-in palette to use; `auto` asks the terminal
+    #[arg(
+        long,
+        value_enum,
+        global = true,
+        default_value_t = crate::theme::AppearanceMode::Auto,
+        env = "RAT_APPEARANCE"
+    )]
+    pub appearance: crate::theme::AppearanceMode,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -591,6 +600,20 @@ mod tests {
     #[test]
     fn cli_is_well_formed() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_appearance_flag_parses_every_mode() {
+        // An explicit flag outranks the environment, so this is stable no
+        // matter what the developer's shell exports.
+        for (arg, expected) in [
+            ("auto", crate::theme::AppearanceMode::Auto),
+            ("light", crate::theme::AppearanceMode::Light),
+            ("dark", crate::theme::AppearanceMode::Dark),
+        ] {
+            let cli = super::Cli::parse_from(["rat", "--appearance", arg, "style", "x"]);
+            assert_eq!(cli.appearance, expected);
+        }
     }
 
     #[test]

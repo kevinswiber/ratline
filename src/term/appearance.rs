@@ -6,7 +6,6 @@
 //! from the foreground process group. Nothing here may be exercised by an
 //! automated test: a live call writes to whatever terminal is running the
 //! test, and a reply can be picked up by an unrelated interactive command.
-#![allow(dead_code)] // The caller lands next; remove this then.
 
 use std::io::IsTerminal;
 use std::time::Duration;

@@ -9,6 +9,7 @@ use crate::cli::FilterArgs;
 use crate::color::ColorProfile;
 use crate::core::duration::parse_interval;
 use crate::exit::AppResult;
+use crate::theme::Palette;
 use crate::ui::filter::FilterState;
 use crate::ui::key::Key;
 use crate::ui::loop_::{Outcome, UiApp, run_ui};
@@ -94,7 +95,7 @@ impl UiApp for FilterApp {
     }
 }
 
-pub fn run(args: FilterArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: FilterArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)

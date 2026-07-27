@@ -6,8 +6,9 @@ use crate::cli::TableArgs;
 use crate::color::ColorProfile;
 use crate::core::table::{TableSpec, parse_columns, parse_table, render_table};
 use crate::exit::AppResult;
+use crate::theme::Palette;
 
-pub fn run(args: TableArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: TableArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)

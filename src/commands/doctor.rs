@@ -10,6 +10,7 @@ use crate::cli::DoctorArgs;
 use crate::color::{ColorProfile, SystemEnv, detect_profile};
 use crate::exit::AppResult;
 use crate::term::tty::UiStream;
+use crate::theme::Palette;
 
 /// Terminal support for synchronized output (mode 2026), per DECRPM.
 // Only the unix probe constructs the positive variants.
@@ -127,7 +128,7 @@ fn probe_sync_support(ui: &mut UiStream) -> SyncSupport {
     result.unwrap_or(SyncSupport::NoReply)
 }
 
-pub fn run(args: DoctorArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: DoctorArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     let mut ui = UiStream::open();
     let is_tty = ui.is_tty();
     let is_dev_tty = ui.is_dev_tty();

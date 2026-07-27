@@ -7,8 +7,9 @@ use crate::color::ColorProfile;
 use crate::core::datetime::format_timestamp;
 use crate::exit::AppResult;
 use crate::style_spec::StyleSpec;
+use crate::theme::Palette;
 
-pub fn run(args: LogArgs, profile: ColorProfile) -> AppResult {
+pub fn run(args: LogArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
     // Unleveled messages bypass the minimum-level filter.
     if let (Some(level), Some(min)) = (args.level, args.min_level)
         && (level as u8) < (min as u8)

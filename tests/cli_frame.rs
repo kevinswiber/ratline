@@ -4,6 +4,8 @@ use tempfile::TempDir;
 fn rat_frame(dir: &TempDir, extra: &[&str], stdin: &str) -> assert_cmd::assert::Assert {
     let state = dir.path().join("state");
     let mut cmd = Command::cargo_bin("rat").expect("rat binary builds");
+    cmd.env_remove("RAT_APPEARANCE");
+    cmd.env_remove("COLORFGBG");
     cmd.arg("frame")
         .arg("--state")
         .arg(&state)

@@ -2,8 +2,9 @@ use crate::cli::DateArgs;
 use crate::color::ColorProfile;
 use crate::core::datetime::{format_timestamp, parse_timestamp, relative};
 use crate::exit::AppResult;
+use crate::theme::Palette;
 
-pub fn run(args: DateArgs, _profile: ColorProfile) -> AppResult {
+pub fn run(args: DateArgs, _profile: ColorProfile, _palette: Palette) -> AppResult {
     let value = parse_timestamp(args.value.as_deref().unwrap_or("now"))?;
 
     if let Some(since) = &args.since {

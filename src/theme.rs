@@ -159,6 +159,11 @@ impl Palette {
 /// terminal output shipped before appearance detection existed.
 pub const DEFAULT_APPEARANCE: Appearance = Appearance::Dark;
 
+/// How long to wait for the terminal to answer. Short enough not to be felt
+/// on a command that runs once per shell line; a terminal that will not
+/// answer at all is detected without waiting this long.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// True when the process is allowed to ask the terminal. An explicit mode is
 /// already an answer, and a colorless profile has nothing to ask about.
 pub fn may_detect(mode: AppearanceMode, profile: ColorProfile) -> bool {
