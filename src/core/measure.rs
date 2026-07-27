@@ -120,6 +120,18 @@ pub fn split_at_width(s: &str, max: usize) -> (&str, &str) {
     s.split_at(end)
 }
 
+/// Drop escape sequences, keeping every printable and control character.
+/// Unlike a vte-based stripper, tabs and carriage returns survive — they
+/// may be structural (table delimiters, CRLF) rather than presentation.
+pub fn strip_escapes(s: &str) -> String {
+    chunks(s)
+        .filter_map(|chunk| match chunk {
+            Chunk::Escape(_) => None,
+            Chunk::Text(t, _) => Some(t),
+        })
+        .collect()
+}
+
 /// Pad to `width` display cells with spaces. Strings already at or over
 /// `width` are returned untouched — padding never truncates.
 pub fn pad_display(s: &str, width: usize, align: Align) -> String {
@@ -342,6 +354,14 @@ mod tests {
             truncate_display("\x1b[31mabcdef\x1b[0m", 4, "…"),
             "\x1b[31mabc…\x1b[0m"
         );
+    }
+
+    #[test]
+    fn strip_escapes_keeps_tabs_and_text() {
+        assert_eq!(strip_escapes("\x1b[31ma\tb\x1b[0m"), "a\tb");
+        assert_eq!(strip_escapes("plain\ttext"), "plain\ttext");
+        assert_eq!(strip_escapes("\x1b]0;title\x07after"), "after");
+        assert_eq!(strip_escapes("日本\r\n"), "日本\r\n");
     }
 
     #[test]

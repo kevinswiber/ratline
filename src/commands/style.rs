@@ -36,7 +36,9 @@ pub fn run(args: StyleArgs, profile: ColorProfile) -> AppResult {
     let text = if args.no_strip_ansi {
         text
     } else {
-        strip_ansi_escapes::strip_str(&text)
+        // Escape-only stripping: tabs stay, so tab-delimited rows can be
+        // styled on their way to a table.
+        crate::core::measure::strip_escapes(&text)
     };
 
     let lines: Vec<String> = text

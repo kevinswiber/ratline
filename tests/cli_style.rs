@@ -229,3 +229,14 @@ fn a_bad_padding_shorthand_is_an_error() {
         .code(1)
         .stderr(predicates::str::contains("padding"));
 }
+
+#[test]
+fn tabs_survive_the_default_strip() {
+    rat()
+        .env("NO_COLOR", "1")
+        .arg("style")
+        .write_stdin("\x1b[1ma\tb\x1b[0m\n")
+        .assert()
+        .success()
+        .stdout("a\tb\n");
+}

@@ -31,16 +31,11 @@ pub fn run(args: JoinArgs, profile: ColorProfile) -> AppResult {
     let blocks: Vec<Vec<String>> = texts
         .iter()
         .map(|text| {
-            let mut lines = parse_block(text);
-            // Strip per line: the stripper eats control bytes, so a whole
-            // block through it would lose its newlines.
             if profile == ColorProfile::Ascii {
-                for line in lines.iter_mut() {
-                    let stripped = strip_ansi_escapes::strip_str(line.as_str());
-                    *line = stripped;
-                }
+                parse_block(&crate::core::measure::strip_escapes(text))
+            } else {
+                parse_block(text)
             }
-            lines
         })
         .collect();
 
