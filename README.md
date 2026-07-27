@@ -201,7 +201,9 @@ title is inserted verbatim, so a pre-styled title
 and `--margin` take CSS shorthand (`'1'`, `'0 2'`, `'1 2 3 4'`). With a
 border, the painted width is the content `--width` plus horizontal padding
 plus two. `NO_COLOR` governs color, not glyphs — borders keep their box
-characters; `--border ascii` is the dumb-terminal opt-out.
+characters; `--border ascii` is the dumb-terminal opt-out. To draw a box
+around *already styled* content (say, colored status lines), add
+`--no-strip-ansi` so the input's own escapes survive the trip.
 
 Colors survive command substitution — capability is detected from the
 terminal, never from stdout, so `banner=$(rat style --bold hi)` keeps its
