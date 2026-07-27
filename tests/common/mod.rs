@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[cfg(unix)]
+pub mod pty;
+
 use assert_cmd::Command;
 
 pub fn rat() -> Command {
