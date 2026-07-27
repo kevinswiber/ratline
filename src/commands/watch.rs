@@ -515,6 +515,14 @@ fn shell_command(script: &str) -> std::process::Command {
     cmd
 }
 
+#[cfg(windows)]
+fn shell_command(script: &str) -> std::process::Command {
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg("/C").arg(script);
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::style::Color;
@@ -601,12 +609,4 @@ mod tests {
             Some(Appearance::Light)
         );
     }
-}
-
-#[cfg(windows)]
-fn shell_command(script: &str) -> std::process::Command {
-    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
-    let mut cmd = std::process::Command::new(shell);
-    cmd.arg("/C").arg(script);
-    cmd
 }
