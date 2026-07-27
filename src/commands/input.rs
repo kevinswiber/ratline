@@ -35,7 +35,9 @@ impl UiApp for InputApp {
         let x = self.prompt.chars().count() as u16;
         let text = self.state.display(&self.placeholder);
         let style = if self.state.value.is_empty() {
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default()
+                .add_modifier(Modifier::DIM)
+                .fg(self.palette.placeholder)
         } else {
             Style::default()
         };
@@ -48,7 +50,9 @@ impl UiApp for InputApp {
                 cx,
                 y,
                 under.to_string(),
-                Style::default().add_modifier(Modifier::REVERSED),
+                Style::default()
+                    .add_modifier(Modifier::REVERSED)
+                    .fg(self.palette.cursor),
             );
         }
     }
@@ -133,6 +137,49 @@ mod tests {
             rendered(light, "abc", 1),
             ["\u{1b}[38;5;129m> \u{1b}[0mabc", ""]
         );
+    }
+
+    fn cell_at(palette: Palette, value: &str, cursor: usize, x: u16) -> ratatui::buffer::Cell {
+        let mut state = InputState::new(value.to_string(), false, 1000);
+        state.cursor = cursor;
+        let app = InputApp {
+            state,
+            prompt: "> ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        buf.cell((x, 0)).expect("cell is painted").clone()
+    }
+
+    #[test]
+    fn the_placeholder_reads_the_placeholder_token() {
+        // Sentinel: at the default the token is Reset (emits nothing), so
+        // only a diverging palette proves the render reads the field.
+        let palette = Palette {
+            placeholder: Color::Indexed(97),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let cell = cell_at(palette, "", 0, 2);
+        assert_eq!(cell.fg, Color::Indexed(97));
+        // DIM is what keeps the default byte-identical.
+        assert!(cell.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn the_caret_reads_the_cursor_token() {
+        let palette = Palette {
+            cursor: Color::Indexed(96),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let cell = cell_at(palette, "abc", 1, 3);
+        assert_eq!(cell.fg, Color::Indexed(96));
+        // REVERSED holds at the cell level even though cell_spec drops it
+        // on the way to the terminal (finding F-0).
+        assert!(cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
