@@ -2,7 +2,7 @@ mod common;
 
 use assert_cmd::Command;
 
-const SUBCOMMANDS: [&str; 15] = [
+const SUBCOMMANDS: [&str; 16] = [
     "style",
     "bar",
     "duration",
@@ -18,6 +18,7 @@ const SUBCOMMANDS: [&str; 15] = [
     "filter",
     "spin",
     "completion",
+    "table",
 ];
 
 fn rat() -> Command {

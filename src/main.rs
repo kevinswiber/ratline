@@ -69,6 +69,7 @@ fn dispatch(command: Command, profile: ColorProfile) -> exit::AppResult {
     match command {
         Command::Style(args) => commands::style::run(args, profile),
         Command::Bar(args) => commands::bar::run(args, profile),
+        Command::Table(args) => commands::table::run(args, profile),
         Command::Duration(args) => commands::duration::run(args, profile),
         Command::Date(args) => commands::date::run(args, profile),
         Command::Spark(args) => commands::spark::run(args, profile),

@@ -30,6 +30,8 @@ pub enum Command {
     Style(StyleArgs),
     /// Render one-shot progress bars
     Bar(BarArgs),
+    /// Align delimiter-separated rows into columns
+    Table(TableArgs),
     /// Format and parse durations
     Duration(DurationArgs),
     /// Parse, format, and diff timestamps portably
@@ -146,6 +148,28 @@ pub struct BarArgs {
     /// Animation step for --indeterminate
     #[arg(long, default_value_t = 0)]
     pub tick: u64,
+}
+
+#[derive(clap::Args)]
+pub struct TableArgs {
+    /// Field delimiter for stdin rows
+    #[arg(long, default_value_t = '\t')]
+    pub delimiter: char,
+    /// Per-column widths in display cells by position; empty entries auto-size ("27,,8")
+    #[arg(long)]
+    pub widths: Option<String>,
+    /// Per-column alignment by position: l, r, or c ("l,r,r")
+    #[arg(long)]
+    pub align: Option<String>,
+    /// Per-column overflow by position: truncate or wrap ("truncate,wrap")
+    #[arg(long)]
+    pub overflow: Option<String>,
+    /// Text placed between columns
+    #[arg(long, default_value = "  ")]
+    pub separator: String,
+    /// Marker appended to a truncated cell
+    #[arg(long, default_value = "…")]
+    pub ellipsis: String,
 }
 
 #[derive(clap::Args)]
@@ -497,10 +521,20 @@ pub struct CompletionArgs {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn cli_is_well_formed() {
         super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn table_ellipsis_default_matches_the_measure_constant() {
+        // clap's default_value wants a literal; this keeps the two in sync.
+        let cli = super::Cli::parse_from(["rat", "table"]);
+        let super::Command::Table(args) = cli.command else {
+            panic!("expected the table subcommand");
+        };
+        assert_eq!(args.ellipsis, crate::core::measure::ELLIPSIS);
     }
 }

@@ -1,6 +1,3 @@
-// Consumed by the layout commands, which land with their wiring.
-#![allow(dead_code)]
-
 use unicode_width::UnicodeWidthChar;
 
 /// Default truncation marker: one display cell.

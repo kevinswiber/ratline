@@ -12,4 +12,5 @@ pub mod log;
 pub mod spark;
 pub mod spin;
 pub mod style;
+pub mod table;
 pub mod watch;

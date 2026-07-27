@@ -1,6 +1,3 @@
-// Consumed by the table command, which lands with its wiring.
-#![allow(dead_code)]
-
 use crate::core::measure::{
     Align, ELLIPSIS, display_width, pad_display, truncate_display, wrap_display,
 };
