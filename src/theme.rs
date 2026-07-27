@@ -46,7 +46,6 @@ pub enum AppearanceSource {
     ColorFgBg,
     Default,
     // A palette re-resolved from a terminal-pushed theme report.
-    #[allow(dead_code)] // Constructed once watch adopts pushed reports.
     Notification,
 }
 

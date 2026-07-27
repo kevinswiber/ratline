@@ -17,12 +17,15 @@ use crate::term::tap::TapEvent;
 #[cfg(unix)]
 use crate::term::tap::{TapScanner, TtyTap};
 #[cfg(unix)]
-use crate::term::theme_notify::{ThemeNotifyGuard, may_subscribe};
+use crate::term::theme_notify::{OscColorKind, ThemeNotifyGuard, classify_colors, may_subscribe};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
 use crate::theme::{Appearance, AppearanceSource, Palette};
 use crate::ui::key::{Key, from_crossterm};
 
-pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResult {
+// The palette follows the terminal only where the reader can see its
+// reports; elsewhere it stays the startup verdict for the whole run.
+#[cfg_attr(windows, allow(unused_mut))]
+pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppResult {
     let interval = parse_interval(&args.interval)?;
     let (interrupted, terminated) = register_signals()?;
 
@@ -68,6 +71,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         .then(|| ThemeNotifyGuard::subscribe(std::io::stdout()))
         .transpose()
         .context("subscribing to theme notifications")?;
+    #[cfg(unix)]
+    let mut verify = VerifyState::default();
 
     let title_line = args.title.as_ref().map(|title| {
         StyleSpec {
@@ -168,6 +173,27 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
                 continue;
             }
             #[cfg(unix)]
+            if let Some(sub) = theme_sub.as_mut() {
+                if verify.pending && verify.in_flight_until.is_none() {
+                    verify.pending = false;
+                    // Ask once, and only while we own the input: the
+                    // replies land in our own reader and nowhere else.
+                    if sub.request_colors().is_ok() {
+                        verify.fg = None;
+                        verify.in_flight_until = Some(Instant::now() + crate::theme::PROBE_TIMEOUT);
+                    }
+                }
+                if verify
+                    .in_flight_until
+                    .is_some_and(|until| Instant::now() >= until)
+                {
+                    // The terminal did not answer. A later report can arm
+                    // another exchange.
+                    verify.in_flight_until = None;
+                    verify.fg = None;
+                }
+            }
+            #[cfg(unix)]
             let events = match tap.as_ref() {
                 Some(tap) => match tap.recv_timeout(nap) {
                     Some(chunk) => scanner.feed(&chunk),
@@ -221,16 +247,35 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
                             if let Some(sub) = theme_sub.as_mut() {
                                 let _ = sub.resume();
                             }
+                            // Whatever was in flight belongs to a terminal
+                            // state we stopped listening to.
+                            verify = VerifyState::default();
                         }
                         // Repaint immediately with fresh data.
                         previous_key = None;
                         break 'wait;
                     }
-                    // The terminal's own reports are parsed but not acted
-                    // on yet; matched explicitly so the keys above keep
-                    // their meaning.
-                    TapEvent::ThemeNotification(_) => {}
-                    TapEvent::OscColor(..) => {}
+                    // The reported value is ignored on purpose: it can
+                    // disagree with the colors actually on screen. Every
+                    // report re-arms, including one that arrives while an
+                    // exchange is already out — a terminal's first report
+                    // of a change can be measured too early.
+                    #[cfg(unix)]
+                    TapEvent::ThemeNotification(_) => {
+                        verify.pending = true;
+                    }
+                    #[cfg(unix)]
+                    TapEvent::OscColor(kind, color) => {
+                        if let Some(verdict) = verify.reply(kind, color)
+                            && adopt(&mut palette, verdict)
+                        {
+                            if std::env::var_os("RAT_DEBUG_APPEARANCE").is_some() {
+                                notice = Some(format!("appearance → {}", verdict.as_str()));
+                            }
+                            // Repaint now rather than at the next tick.
+                            break 'wait;
+                        }
+                    }
                     // Every other key, as before.
                     _ => {}
                 }
@@ -409,10 +454,44 @@ fn crossterm_slice(nap: Duration) -> anyhow::Result<Vec<TapEvent>> {
     }
 }
 
+/// A terminal's theme notification says *that* something changed, not what
+/// the colors now are — it reports the application's appearance, which can
+/// disagree with the palette actually on screen. So a notification only
+/// arms a measurement: one foreground/background exchange, classified by
+/// the same rule the startup probe uses.
+#[cfg(unix)]
+#[derive(Default)]
+struct VerifyState {
+    pending: bool,
+    fg: Option<xterm_color::Color>,
+    in_flight_until: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl VerifyState {
+    /// Feed one color reply. Returns the verdict once the background reply
+    /// completes an exchange this loop actually asked for.
+    fn reply(&mut self, kind: OscColorKind, color: xterm_color::Color) -> Option<Appearance> {
+        // A reply nobody asked for is never adopted.
+        self.in_flight_until?;
+        match kind {
+            OscColorKind::Foreground => {
+                self.fg = Some(color);
+                None
+            }
+            OscColorKind::Background => {
+                self.in_flight_until = None;
+                let verdict = classify_colors(self.fg.as_ref(), &color);
+                self.fg = None;
+                Some(verdict)
+            }
+        }
+    }
+}
+
 /// Adopt an appearance the terminal reported. Returns true when the verdict
 /// actually changed; a repeat is a no-op, so a terminal that re-announces an
 /// unchanged theme costs nothing.
-#[allow(dead_code)] // Pinned by the unit tests until the wait loop calls it.
 fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     if palette.appearance == reported {
         return false;
@@ -469,6 +548,57 @@ mod tests {
         assert_eq!(palette.appearance, Appearance::Dark);
         assert_eq!(palette.accent, Color::Indexed(212));
         assert_eq!(palette.on_accent, Color::Black);
+    }
+
+    #[cfg(unix)]
+    fn white() -> xterm_color::Color {
+        xterm_color::Color::rgb(u16::MAX, u16::MAX, u16::MAX)
+    }
+
+    #[cfg(unix)]
+    fn black() -> xterm_color::Color {
+        xterm_color::Color::rgb(0, 0, 0)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_nobody_asked_for_is_ignored() {
+        let mut verify = VerifyState::default();
+        assert_eq!(verify.reply(OscColorKind::Background, black()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_reply_completes_the_exchange() {
+        use crate::theme::PROBE_TIMEOUT;
+
+        let mut verify = VerifyState {
+            in_flight_until: Some(Instant::now() + PROBE_TIMEOUT),
+            ..VerifyState::default()
+        };
+        assert_eq!(verify.reply(OscColorKind::Foreground, white()), None);
+        assert_eq!(
+            verify.reply(OscColorKind::Background, black()),
+            Some(Appearance::Dark)
+        );
+        // The exchange is over: a straggler cannot move the verdict again.
+        assert!(verify.in_flight_until.is_none());
+        assert_eq!(verify.reply(OscColorKind::Background, white()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_background_reply_alone_still_classifies() {
+        use crate::theme::PROBE_TIMEOUT;
+
+        let mut verify = VerifyState {
+            in_flight_until: Some(Instant::now() + PROBE_TIMEOUT),
+            ..VerifyState::default()
+        };
+        assert_eq!(
+            verify.reply(OscColorKind::Background, white()),
+            Some(Appearance::Light)
+        );
     }
 }
 

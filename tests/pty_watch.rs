@@ -159,3 +159,60 @@ fn an_interactive_watch_subscribes_and_unsubscribes() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn a_terminal_theme_flip_repaints_children_in_the_new_palette() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "50ms",
+            "--",
+            // The child's stdout is captured through a pipe, so it needs an
+            // explicit color decision to emit SGR at all.
+            &rat_bin(),
+            "--color",
+            "always",
+            "style",
+            "--foreground",
+            "accent",
+            "text",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[38;5;212m",
+            Duration::from_secs(2)
+        ),
+        "expected the dark accent before any flip"
+    );
+
+    // The terminal's colors change, and then it announces the change. The
+    // announcement is realistic: one stale report followed by two corrected
+    // ones, which is what a real flip produces.
+    terminal.set("rgb:0000/0000/0000", "rgb:ffff/ffff/ffff");
+    session.write_bytes(b"\x1b[?997;1n\x1b[?997;2n\x1b[?997;2n");
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[38;5;129m",
+            Duration::from_secs(3)
+        ),
+        "expected the light accent after the terminal announced a change"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
