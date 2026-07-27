@@ -5,6 +5,7 @@
 use anyhow::anyhow;
 use ratatui::style::Color;
 
+use crate::color::{ColorProfile, EnvSource};
 use crate::style_spec::parse_color;
 
 /// What the user asked for. Mirrors `ColorMode` (`src/color.rs`).
@@ -153,12 +154,188 @@ impl Palette {
     }
 }
 
+/// What a run with no verdict looks like. Every built-in value is tuned for
+/// a dark background, so this keeps a no-verdict run identical to the
+/// terminal output shipped before appearance detection existed.
+pub const DEFAULT_APPEARANCE: Appearance = Appearance::Dark;
+
+/// True when the process is allowed to ask the terminal. An explicit mode is
+/// already an answer, and a colorless profile has nothing to ask about.
+pub fn may_detect(mode: AppearanceMode, profile: ColorProfile) -> bool {
+    mode == AppearanceMode::Auto && profile != ColorProfile::Ascii
+}
+
+/// Read the background palette index out of `COLORFGBG`. The value is either
+/// `<fg>;<bg>` or the urxvt variant `<fg>;default;<bg>`, so the last
+/// `;`-separated field is the background. A `default` or non-numeric field
+/// yields no verdict, and at least one `;` is required so a stray
+/// single-field value cannot be misread as a background index.
+pub fn appearance_from_colorfgbg(env: &dyn EnvSource) -> Option<Appearance> {
+    let value = env.get("COLORFGBG")?;
+    value.find(';')?;
+    let bg = value.rsplit(';').next()?.trim();
+    if bg.is_empty() || bg.eq_ignore_ascii_case("default") {
+        return None;
+    }
+    let bg = bg.parse::<u32>().ok()?;
+    if bg < 8 {
+        Some(Appearance::Dark)
+    } else {
+        Some(Appearance::Light)
+    }
+}
+
+/// Collapse the request and whatever was detected into one verdict. Never
+/// returns "maybe".
+pub fn resolve_appearance(
+    mode: AppearanceMode,
+    detected: Option<(Appearance, AppearanceSource)>,
+) -> (Appearance, AppearanceSource) {
+    match mode {
+        AppearanceMode::Light => (Appearance::Light, AppearanceSource::Explicit),
+        AppearanceMode::Dark => (Appearance::Dark, AppearanceSource::Explicit),
+        AppearanceMode::Auto => detected.unwrap_or((DEFAULT_APPEARANCE, AppearanceSource::Default)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use ratatui::style::Color;
+    use rstest::rstest;
 
     use super::*;
+    use crate::color::{ColorProfile, MapEnv};
     use crate::style_spec::parse_color;
+
+    fn env(pairs: &[(&str, &str)]) -> MapEnv {
+        MapEnv(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    #[rstest]
+    // Only Auto asks; an explicit mode is already an answer.
+    #[case(AppearanceMode::Auto, ColorProfile::Ansi256, true)]
+    #[case(AppearanceMode::Auto, ColorProfile::TrueColor, true)]
+    #[case(AppearanceMode::Auto, ColorProfile::Ansi, true)]
+    #[case(AppearanceMode::Light, ColorProfile::TrueColor, false)]
+    #[case(AppearanceMode::Dark, ColorProfile::TrueColor, false)]
+    // Ascii never asks, whatever the mode.
+    #[case(AppearanceMode::Auto, ColorProfile::Ascii, false)]
+    #[case(AppearanceMode::Light, ColorProfile::Ascii, false)]
+    #[case(AppearanceMode::Dark, ColorProfile::Ascii, false)]
+    fn may_detect_matrix(
+        #[case] mode: AppearanceMode,
+        #[case] profile: ColorProfile,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(may_detect(mode, profile), expected);
+    }
+
+    #[rstest]
+    // An explicit mode wins and is reported as explicit, whatever was found.
+    #[case(
+        AppearanceMode::Light,
+        None,
+        Appearance::Light,
+        AppearanceSource::Explicit
+    )]
+    #[case(
+        AppearanceMode::Dark,
+        None,
+        Appearance::Dark,
+        AppearanceSource::Explicit
+    )]
+    #[case(
+        AppearanceMode::Light,
+        Some((Appearance::Dark, AppearanceSource::Osc)),
+        Appearance::Light,
+        AppearanceSource::Explicit
+    )]
+    // Auto adopts the verdict and its provenance verbatim.
+    #[case(
+        AppearanceMode::Auto,
+        Some((Appearance::Light, AppearanceSource::Osc)),
+        Appearance::Light,
+        AppearanceSource::Osc
+    )]
+    #[case(
+        AppearanceMode::Auto,
+        Some((Appearance::Light, AppearanceSource::ColorFgBg)),
+        Appearance::Light,
+        AppearanceSource::ColorFgBg
+    )]
+    // Auto with no verdict falls to the documented default.
+    #[case(
+        AppearanceMode::Auto,
+        None,
+        Appearance::Dark,
+        AppearanceSource::Default
+    )]
+    fn resolve_appearance_matrix(
+        #[case] mode: AppearanceMode,
+        #[case] detected: Option<(Appearance, AppearanceSource)>,
+        #[case] appearance: Appearance,
+        #[case] source: AppearanceSource,
+    ) {
+        assert_eq!(resolve_appearance(mode, detected), (appearance, source));
+    }
+
+    #[test]
+    fn colorfgbg_two_field_form() {
+        let dark = env(&[("COLORFGBG", "15;0")]);
+        assert_eq!(appearance_from_colorfgbg(&dark), Some(Appearance::Dark));
+        let light = env(&[("COLORFGBG", "0;15")]);
+        assert_eq!(appearance_from_colorfgbg(&light), Some(Appearance::Light));
+        // The 8-index boundary: 7 is dark, 8 is light.
+        assert_eq!(
+            appearance_from_colorfgbg(&env(&[("COLORFGBG", "7;7")])),
+            Some(Appearance::Dark)
+        );
+        assert_eq!(
+            appearance_from_colorfgbg(&env(&[("COLORFGBG", "7;8")])),
+            Some(Appearance::Light)
+        );
+    }
+
+    #[test]
+    fn colorfgbg_three_field_form() {
+        // The urxvt variant `<fg>;default;<bg>`: the last field decides.
+        assert_eq!(
+            appearance_from_colorfgbg(&env(&[("COLORFGBG", "15;default;0")])),
+            Some(Appearance::Dark)
+        );
+        assert_eq!(
+            appearance_from_colorfgbg(&env(&[("COLORFGBG", "0;default;15")])),
+            Some(Appearance::Light)
+        );
+    }
+
+    #[test]
+    fn colorfgbg_skips_default_or_malformed_backgrounds() {
+        for value in [
+            "7;default",          // background `default` is no verdict
+            "15;default;default", // ditto in the three-field form
+            "7;banana",           // non-numeric background
+            "",                   // empty
+            ";",                  // separator with no fields
+            "7",                  // single field, even though it parses
+            "default",
+        ] {
+            assert_eq!(
+                appearance_from_colorfgbg(&env(&[("COLORFGBG", value)])),
+                None,
+                "{value:?} must yield no verdict"
+            );
+        }
+        // Unset is also no verdict.
+        assert_eq!(appearance_from_colorfgbg(&env(&[])), None);
+    }
 
     #[test]
     fn every_token_name_resolves_in_both_palettes() {
