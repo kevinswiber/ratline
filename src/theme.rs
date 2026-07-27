@@ -177,10 +177,17 @@ const LIGHT_REFS: RefSlots = RefSlots {
 /// own. White on the light accent because that accent is darker than the
 /// dark palette's, so white text carries better contrast on it than black
 /// does.
+///
+/// Pinned to the 256-color cube (16 = #000000, 231 = #ffffff), never the
+/// named ANSI colors: terminal themes remap the ANSI-16 palette — a light
+/// theme's "bright white" is usually a gray — while the accent underneath
+/// is an absolute cube value, so a named pairing can be rethemed into
+/// illegibility out from under us. The cube is the only surface terminals
+/// leave alone.
 const fn on_accent_for(appearance: Appearance) -> Color {
     match appearance {
-        Appearance::Dark => Color::Black,
-        Appearance::Light => Color::White,
+        Appearance::Dark => Color::Indexed(16),
+        Appearance::Light => Color::Indexed(231),
     }
 }
 
@@ -494,7 +501,7 @@ mod tests {
     fn dark_reproduces_the_shipping_indices() {
         let p = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         assert_eq!(p.accent, Color::Indexed(212));
-        assert_eq!(p.on_accent, Color::Black);
+        assert_eq!(p.on_accent, Color::Indexed(16));
         assert_eq!(p.muted, Color::Indexed(240));
         assert_eq!(p.border, Color::Indexed(240));
         assert_eq!(p.ok, Color::Indexed(42));
@@ -677,7 +684,7 @@ mod tests {
     fn light_reproduces_the_shipping_indices() {
         let p = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         assert_eq!(p.accent, Color::Indexed(129));
-        assert_eq!(p.on_accent, Color::White);
+        assert_eq!(p.on_accent, Color::Indexed(231));
         assert_eq!(p.muted, Color::Indexed(242));
         assert_eq!(p.border, Color::Indexed(249));
         assert_eq!(p.ok, Color::Indexed(28));

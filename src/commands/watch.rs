@@ -556,7 +556,7 @@ mod tests {
         assert!(adopt(&mut palette, Appearance::Dark));
         assert_eq!(palette.appearance, Appearance::Dark);
         assert_eq!(palette.accent, Color::Indexed(212));
-        assert_eq!(palette.on_accent, Color::Black);
+        assert_eq!(palette.on_accent, Color::Indexed(16));
     }
 
     #[cfg(unix)]

@@ -119,10 +119,10 @@ mod tests {
 
     #[test]
     fn the_rendered_confirm_frame_is_pinned() {
-        // Byte-identity golden: captured on v0.5.0 render code. The active
-        // button's foreground is the NAMED on-accent (SGR 30 dark / 97
-        // light), not an indexed sequence; the background is the indexed
-        // accent.
+        // The active button's foreground is the cube-pinned on-accent
+        // (16 / 231), deliberately not a named ANSI color: terminal themes
+        // remap the ANSI-16 palette (a light theme's "bright white" is
+        // usually gray), which broke the pairing over the absolute accent.
         let dark = rendered(Palette::builtin(
             Appearance::Dark,
             AppearanceSource::Default,
@@ -131,7 +131,7 @@ mod tests {
             dark,
             [
                 "\u{1b}[1mShip it?\u{1b}[0m",
-                "  \u{1b}[1;30;48;5;212m Yes \u{1b}[0m   \u{1b}[2m No \u{1b}[0m"
+                "  \u{1b}[1;38;5;16;48;5;212m Yes \u{1b}[0m   \u{1b}[2m No \u{1b}[0m"
             ]
         );
         let light = rendered(Palette::builtin(
@@ -142,7 +142,7 @@ mod tests {
             light,
             [
                 "\u{1b}[1mShip it?\u{1b}[0m",
-                "  \u{1b}[1;97;48;5;129m Yes \u{1b}[0m   \u{1b}[2m No \u{1b}[0m"
+                "  \u{1b}[1;38;5;231;48;5;129m Yes \u{1b}[0m   \u{1b}[2m No \u{1b}[0m"
             ]
         );
     }
@@ -165,7 +165,10 @@ mod tests {
     fn the_active_button_pairs_on_accent_over_accent() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
-        assert_eq!(active_button(dark), (Color::Black, Color::Indexed(212)));
+        assert_eq!(
+            active_button(dark),
+            (Color::Indexed(16), Color::Indexed(212))
+        );
         assert_eq!(active_button(light), (light.on_accent, light.accent));
     }
 }
