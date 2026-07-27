@@ -167,15 +167,7 @@ pub fn render_box(lines: &[String], spec: &BoxSpec<'_>, profile: ColorProfile) -
         Some(set) => {
             let run = inner + spec.padding.left + spec.padding.right;
             let mut boxed = Vec::with_capacity(interior.len() + 2);
-            boxed.push(spec.border_style.render(
-                &format!(
-                    "{}{}{}",
-                    set.top_left,
-                    set.horizontal_top.repeat(run),
-                    set.top_right
-                ),
-                profile,
-            ));
+            boxed.push(top_border(&set, run, spec, profile));
             for line in interior {
                 boxed.push(format!(
                     "{}{line}{}",
@@ -214,6 +206,43 @@ pub fn render_box(lines: &[String], spec: &BoxSpec<'_>, profile: ColorProfile) -
     // margin.right is accepted so the shorthand parses symmetrically, but
     // line output has no right edge to move.
     out
+}
+
+/// The top border, with the title spliced in when the box is wide enough.
+/// The title text is inserted verbatim — the border style never wraps it, so
+/// a pre-styled title keeps its own look.
+fn top_border(set: &Set<'_>, run: usize, spec: &BoxSpec<'_>, profile: ColorProfile) -> String {
+    if let Some(title) = spec.title
+        && run >= 4
+    {
+        {
+            let budget = run - 3;
+            let title = truncate_display(title, budget, spec.ellipsis);
+            let title_width = display_width(&title);
+            return format!(
+                "{} {title} {}",
+                spec.border_style
+                    .render(&format!("{}{}", set.top_left, set.horizontal_top), profile),
+                spec.border_style.render(
+                    &format!(
+                        "{}{}",
+                        set.horizontal_top.repeat(run - title_width - 3),
+                        set.top_right
+                    ),
+                    profile
+                ),
+            );
+        }
+    }
+    spec.border_style.render(
+        &format!(
+            "{}{}{}",
+            set.top_left,
+            set.horizontal_top.repeat(run),
+            set.top_right
+        ),
+        profile,
+    )
 }
 
 /// Alignment that never invents trailing whitespace (the open-edge path).
@@ -495,5 +524,71 @@ mod tests {
             render_box(&plain(&["x"]), &spec, ColorProfile::Ascii)[0],
             "╭─╮"
         );
+    }
+
+    #[test]
+    fn a_title_sits_in_the_top_border() {
+        let spec = BoxSpec {
+            border: BorderPreset::Normal,
+            title: Some("status"),
+            width: Some(12),
+            ..BoxSpec::default()
+        };
+        assert_eq!(
+            render_box(&plain(&["hi"]), &spec, ColorProfile::Ascii)[0],
+            "┌─ status ───┐"
+        );
+    }
+
+    #[test]
+    fn a_long_title_is_truncated_into_the_border() {
+        let spec = BoxSpec {
+            border: BorderPreset::Normal,
+            title: Some("a very long title"),
+            width: Some(8),
+            ..BoxSpec::default()
+        };
+        let top = &render_box(&plain(&["hi"]), &spec, ColorProfile::Ascii)[0];
+        assert_eq!(crate::core::measure::display_width(top), 10);
+        assert!(top.contains('…'), "got {top:?}");
+    }
+
+    #[test]
+    fn a_title_is_dropped_when_the_box_is_too_narrow() {
+        let spec = BoxSpec {
+            border: BorderPreset::Normal,
+            title: Some("status"),
+            width: Some(2),
+            ..BoxSpec::default()
+        };
+        assert_eq!(
+            render_box(&plain(&["hi"]), &spec, ColorProfile::Ascii)[0],
+            "┌──┐"
+        );
+    }
+
+    #[test]
+    fn a_title_without_a_border_is_ignored() {
+        let spec = BoxSpec {
+            title: Some("status"),
+            ..BoxSpec::default()
+        };
+        assert_eq!(
+            render_box(&plain(&["hi"]), &spec, ColorProfile::Ascii),
+            plain(&["hi"])
+        );
+    }
+
+    #[test]
+    fn a_styled_title_keeps_its_escapes_without_widening_the_box() {
+        let spec = BoxSpec {
+            border: BorderPreset::Normal,
+            title: Some("\x1b[1mrun\x1b[0m"),
+            width: Some(10),
+            ..BoxSpec::default()
+        };
+        let top = &render_box(&plain(&["hi"]), &spec, ColorProfile::Ascii)[0];
+        assert_eq!(crate::core::measure::display_width(top), 12);
+        assert!(top.contains("\x1b[1mrun\x1b[0m"), "got {top:?}");
     }
 }
