@@ -70,12 +70,16 @@ pub struct Palette {
     // threshold convention; not addressable by name.
     pub log_warn: Color,
     pub log_error: Color,
+    // UI tier: the interactive surface. Relative order mirrors TOKEN_NAMES;
+    // physically appended after the internal log fields.
+    pub selection: Color,
+    pub r#match: Color,
 }
 
 /// Every public token name, in declaration order. Pinned against `token()`
 /// by a unit test.
 #[allow(dead_code)] // Read by tests and documentation, not by commands.
-pub const TOKEN_NAMES: [&str; 10] = [
+pub const TOKEN_NAMES: [&str; 12] = [
     "accent",
     "on-accent",
     "muted",
@@ -86,6 +90,8 @@ pub const TOKEN_NAMES: [&str; 10] = [
     "debug",
     "info",
     "fatal",
+    "selection",
+    "match",
 ];
 
 /// Reference tier: the raw values one appearance is built from — hue roles,
@@ -196,6 +202,8 @@ impl Palette {
             muted: refs.neutral_2,
             border: refs.neutral_1,
             on_accent: on_accent_for(appearance),
+            selection: refs.pink,
+            r#match: refs.pink,
         }
     }
 
@@ -211,6 +219,8 @@ impl Palette {
             "debug" => self.debug,
             "info" => self.info,
             "fatal" => self.fatal,
+            "selection" => self.selection,
+            "match" => self.r#match,
             _ => return None,
         })
     }
@@ -515,6 +525,8 @@ mod tests {
             let p = Palette::builtin(appearance, AppearanceSource::Default);
             assert_eq!(p.muted, refs.neutral_2, "muted in {appearance:?}");
             assert_eq!(p.border, refs.neutral_1, "border in {appearance:?}");
+            assert_eq!(p.selection, refs.pink, "selection in {appearance:?}");
+            assert_eq!(p.r#match, refs.pink, "match in {appearance:?}");
             // Deliberately not ref-derived: a legibility pin against `accent`.
             assert_eq!(p.on_accent, on_accent_for(appearance));
         }
@@ -547,6 +559,40 @@ mod tests {
     }
 
     #[test]
+    fn the_first_ten_token_names_are_the_v0_5_0_set() {
+        assert_eq!(
+            &TOKEN_NAMES[..10],
+            &[
+                "accent",
+                "on-accent",
+                "muted",
+                "border",
+                "ok",
+                "warn",
+                "error",
+                "debug",
+                "info",
+                "fatal"
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_and_match_derive_from_the_accent_slot() {
+        for (appearance, refs) in [
+            (Appearance::Dark, DARK_REFS),
+            (Appearance::Light, LIGHT_REFS),
+        ] {
+            let p = Palette::builtin(appearance, AppearanceSource::Default);
+            assert_eq!(p.selection, refs.pink, "selection in {appearance:?}");
+            assert_eq!(p.r#match, refs.pink, "match in {appearance:?}");
+            assert_eq!(p.selection, p.accent);
+            assert_eq!(p.resolve("selection").unwrap(), p.accent);
+            assert_eq!(p.resolve("match").unwrap(), p.accent);
+        }
+    }
+
+    #[test]
     fn every_palette_color_is_a_ref_slot_or_a_declared_pin() {
         for (appearance, refs) in [
             (Appearance::Dark, DARK_REFS),
@@ -568,7 +614,7 @@ mod tests {
             ];
             let pinned: [(&str, Color); 1] = [("on-accent", on_accent_for(appearance))];
             // Over FIELDS, not TOKEN_NAMES: log_warn/log_error are included.
-            let fields: [(&str, Color); 12] = [
+            let fields: [(&str, Color); 14] = [
                 ("accent", p.accent),
                 ("on-accent", p.on_accent),
                 ("muted", p.muted),
@@ -581,6 +627,8 @@ mod tests {
                 ("fatal", p.fatal),
                 ("log_warn", p.log_warn),
                 ("log_error", p.log_error),
+                ("selection", p.selection),
+                ("match", p.r#match),
             ];
             for (name, value) in fields {
                 let is_ref = ref_values.contains(&value);
