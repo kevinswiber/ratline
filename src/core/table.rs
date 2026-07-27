@@ -1,7 +1,9 @@
 // Consumed by the table command, which lands with its wiring.
 #![allow(dead_code)]
 
-use crate::core::measure::{Align, ELLIPSIS, display_width, pad_display, truncate_display};
+use crate::core::measure::{
+    Align, ELLIPSIS, display_width, pad_display, truncate_display, wrap_display,
+};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
 pub enum Overflow {
@@ -153,24 +155,46 @@ pub fn resolve_widths(rows: &[Row], columns: &[ColumnSpec]) -> Vec<usize> {
 }
 
 /// Render rows into aligned lines. Widths resolve once for the whole table;
-/// the final non-empty column is never right-padded and trailing empty
-/// columns drop their separators.
+/// a wrapping cell turns its row into several physical lines; the final
+/// non-empty column is never right-padded and trailing empty columns drop
+/// their separators.
 pub fn render_table(rows: &[Row], spec: &TableSpec) -> Vec<String> {
     let widths = resolve_widths(rows, &spec.columns);
     rows.iter()
-        .map(|row| match row {
-            Row::Blank => String::new(),
+        .flat_map(|row| match row {
+            Row::Blank => vec![String::new()],
             Row::Cells(cells) => render_row(cells, &widths, spec),
         })
         .collect()
 }
 
-fn render_row(cells: &[String], widths: &[usize], spec: &TableSpec) -> String {
-    let rendered: Vec<String> = cells
+fn render_row(cells: &[String], widths: &[usize], spec: &TableSpec) -> Vec<String> {
+    let cell_lines: Vec<Vec<String>> = cells
         .iter()
         .zip(widths)
-        .map(|(cell, &width)| truncate_display(cell, width, &spec.ellipsis))
+        .enumerate()
+        .map(|(i, (cell, &width))| {
+            let overflow = spec.columns.get(i).map(|c| c.overflow).unwrap_or_default();
+            match overflow {
+                Overflow::Wrap => wrap_display(cell, width),
+                Overflow::Truncate => vec![truncate_display(cell, width, &spec.ellipsis)],
+            }
+        })
         .collect();
+    let height = cell_lines.iter().map(Vec::len).max().unwrap_or(0);
+    (0..height)
+        .map(|k| {
+            let physical: Vec<&str> = cell_lines
+                .iter()
+                .map(|lines| lines.get(k).map(String::as_str).unwrap_or(""))
+                .collect();
+            render_physical(&physical, widths, spec)
+        })
+        .collect()
+}
+
+/// One physical output line from per-column cell text.
+fn render_physical(rendered: &[&str], widths: &[usize], spec: &TableSpec) -> String {
     let Some(last) = rendered.iter().rposition(|cell| !cell.is_empty()) else {
         return String::new();
     };
@@ -397,6 +421,67 @@ mod tests {
         assert_eq!(
             render_table(&parse_table("ab\tx\n", '\t'), &s),
             vec!["ab x"]
+        );
+    }
+
+    #[test]
+    fn wrapped_cells_add_continuation_lines_in_their_column() {
+        let columns = vec![
+            ColumnSpec::default(),
+            ColumnSpec {
+                width: Some(9),
+                overflow: Overflow::Wrap,
+                ..ColumnSpec::default()
+            },
+        ];
+        assert_eq!(
+            render_table(
+                &parse_table("id\tthe quick brown fox\n", '\t'),
+                &spec(columns)
+            ),
+            vec!["id  the quick", "    brown fox"]
+        );
+    }
+
+    #[test]
+    fn wrapped_rows_keep_later_columns_aligned() {
+        let columns = vec![
+            ColumnSpec {
+                width: Some(3),
+                overflow: Overflow::Wrap,
+                ..ColumnSpec::default()
+            },
+            ColumnSpec::default(),
+        ];
+        assert_eq!(
+            render_table(&parse_table("a b c d\tx\n", '\t'), &spec(columns)),
+            vec!["a b  x", "c d"]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_styled_cell_reopens_its_style_per_line() {
+        let columns = vec![ColumnSpec {
+            width: Some(3),
+            overflow: Overflow::Wrap,
+            ..ColumnSpec::default()
+        }];
+        let out = render_table(
+            &parse_table("\x1b[31ma b c d\x1b[0m\n", '\t'),
+            &spec(columns),
+        );
+        assert_eq!(out, vec!["\x1b[31ma b\x1b[0m", "\x1b[31mc d\x1b[0m"]);
+    }
+
+    #[test]
+    fn auto_width_columns_never_wrap() {
+        let columns = vec![ColumnSpec {
+            overflow: Overflow::Wrap,
+            ..ColumnSpec::default()
+        }];
+        assert_eq!(
+            render_table(&parse_table("a b c d\n", '\t'), &spec(columns)),
+            vec!["a b c d"]
         );
     }
 }
