@@ -32,7 +32,10 @@ impl UiApp for FilterApp {
     }
 
     fn render(&self, _area: Rect, buf: &mut Buffer) {
+        // The prompt is a prompt (accent); the marker and cursor row are a
+        // selection. Same values by construction, distinct tokens by role.
         let accent = Style::default().fg(self.palette.accent);
+        let selection = Style::default().fg(self.palette.selection);
         let mut y = 0;
         if let Some(header) = &self.header {
             buf.set_string(0, y, header, Style::default().add_modifier(Modifier::BOLD));
@@ -42,7 +45,9 @@ impl UiApp for FilterApp {
         let qx = self.prompt.chars().count() as u16;
         let qtext = self.state.query.display(&self.placeholder);
         let qstyle = if self.state.query.value.is_empty() {
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default()
+                .add_modifier(Modifier::DIM)
+                .fg(self.palette.placeholder)
         } else {
             Style::default()
         };
@@ -61,7 +66,7 @@ impl UiApp for FilterApp {
             let at_cursor = match_idx == self.state.cursor;
             let mut x = 0u16;
             let marker = if at_cursor { &self.indicator } else { "  " };
-            buf.set_string(x, y, marker, accent);
+            buf.set_string(x, y, marker, selection);
             x += marker.chars().count() as u16;
             if self.multi {
                 let prefix = if self.state.selected[m.index] {
@@ -73,7 +78,11 @@ impl UiApp for FilterApp {
                 x += prefix.chars().count() as u16;
             }
             let item = &self.state.items[m.index];
-            let base = if at_cursor { accent } else { Style::default() };
+            let base = if at_cursor {
+                selection
+            } else {
+                Style::default()
+            };
             buf.set_string(x, y, item, base);
             // Highlight the matched characters.
             for &pos in &m.positions {
@@ -82,7 +91,7 @@ impl UiApp for FilterApp {
                         x + pos as u16,
                         y,
                         c.to_string(),
-                        base.add_modifier(Modifier::BOLD).fg(self.palette.accent),
+                        base.add_modifier(Modifier::BOLD).fg(self.palette.r#match),
                     );
                 }
             }
@@ -247,15 +256,88 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_and_match_highlight_take_the_palette_accent() {
+    fn the_marker_and_cursor_row_read_the_selection_token() {
+        // Sentinel: selection/accent share a value by construction, so only
+        // a diverging palette proves the render reads `selection`.
+        let palette = Palette {
+            selection: Color::Indexed(99),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let app = app(palette);
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        assert_eq!(buf.cell((0, 1)).unwrap().fg, Color::Indexed(99), "marker");
+        assert_eq!(
+            buf.cell((3, 1)).unwrap().fg,
+            Color::Indexed(99),
+            "cursor-row item base"
+        );
+        // The prompt is a prompt, not a selection: it stays on accent.
+        assert_eq!(buf.cell((0, 0)).unwrap().fg, Color::Indexed(212), "prompt");
+    }
+
+    #[test]
+    fn the_match_highlight_reads_the_match_token() {
+        let palette = Palette {
+            r#match: Color::Indexed(98),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let app = app(palette);
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let cell = buf.cell((2, 1)).unwrap();
+        assert_eq!(cell.fg, Color::Indexed(98));
+        // The BOLD attribute is part of the highlight contract.
+        assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_empty_query_reads_the_placeholder_token() {
+        let palette = Palette {
+            placeholder: Color::Indexed(97),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let app = FilterApp {
+            state: FilterState::new(
+                vec!["alpha".into(), "beta".into()],
+                Some(1),
+                5,
+                true,
+                true,
+                String::new(),
+            ),
+            prompt: "> ".into(),
+            placeholder: "filter".into(),
+            indicator: "> ".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi: false,
+            header: None,
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let cell = buf.cell((2, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Indexed(97));
+        // DIM is what keeps the default byte-identical (Reset emits nothing).
+        assert!(cell.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn the_prompt_and_match_highlight_take_their_palette_tokens() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         let (dark_prompt, dark_highlight) = prompt_and_highlight_fg(dark);
         assert_eq!(dark_prompt, dark.accent);
+        // The literal is the byte-identity pin; the field name is routing.
         assert_eq!(dark_prompt, Color::Indexed(212));
-        assert_eq!(dark_highlight, dark.accent);
+        assert_eq!(dark_highlight, dark.r#match);
+        assert_eq!(dark_highlight, Color::Indexed(212));
         let (light_prompt, light_highlight) = prompt_and_highlight_fg(light);
         assert_eq!(light_prompt, light.accent);
-        assert_eq!(light_highlight, light.accent);
+        assert_eq!(light_highlight, light.r#match);
     }
 }
