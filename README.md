@@ -90,6 +90,9 @@ printf 'build\t8\t10\ttests\ndeploy\t2\t10\twaiting\n' | rat bar --width 20
 # deploy ████░░░░░░░░░░░░░░░░   2/10  20.0%  waiting
 ```
 
+An explicit `--label-width` pins the label column instead, so bars from
+separate `rat bar` invocations line up too.
+
 Color by completion band instead of picking colors in the caller, or animate
 an unknown total:
 

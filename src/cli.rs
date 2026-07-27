@@ -113,9 +113,9 @@ pub struct BarArgs {
     pub width: u16,
     #[arg(long)]
     pub label: Option<String>,
-    /// Label column width (display cells)
-    #[arg(long, default_value_t = 34)]
-    pub label_width: u16,
+    /// Label column width in display cells [default: 34, or the widest batch label]
+    #[arg(long)]
+    pub label_width: Option<u16>,
     #[arg(long, value_enum, default_value_t = crate::core::bar::BarPreset::Blocks)]
     pub preset: crate::core::bar::BarPreset,
     /// Override the fill character

@@ -13,6 +13,7 @@ use crate::exit::AppResult;
 use crate::style_spec::{StyleSpec, parse_color};
 
 const DEFAULT_FILL_COLOR: Color = Color::Indexed(212);
+const DEFAULT_LABEL_WIDTH: u16 = 34;
 
 fn fg(color: Color) -> StyleSpec {
     StyleSpec {
@@ -54,7 +55,7 @@ pub fn run(args: BarArgs, profile: ColorProfile) -> AppResult {
         fill_style: StyleSpec::default(),
         empty_style: fg(parse_color(&args.empty_color)?),
         label: args.label.as_deref(),
-        label_width: args.label_width,
+        label_width: args.label_width.unwrap_or(DEFAULT_LABEL_WIDTH),
         annotation: args.annotation,
         state: args.state.as_deref(),
     };
@@ -87,10 +88,16 @@ pub fn run(args: BarArgs, profile: ColorProfile) -> AppResult {
     if rows.is_empty() {
         return Err(anyhow!("--value is required when stdin has no rows").into());
     }
+    // An explicit width is the column, in batch mode too, so bars from
+    // separate invocations can agree on it; only auto-size when unset.
+    let label_width = args
+        .label_width
+        .unwrap_or_else(|| auto_label_width(&rows, DEFAULT_LABEL_WIDTH));
     if thresholds.is_empty() {
         // One shared fill style: render as an aligned block.
         let spec = BarSpec {
             fill_style: fg(explicit_fill.unwrap_or(DEFAULT_FILL_COLOR)),
+            label_width,
             ..base
         };
         for line in render_rows(&rows, &spec, profile) {
@@ -98,7 +105,6 @@ pub fn run(args: BarArgs, profile: ColorProfile) -> AppResult {
         }
     } else {
         // Threshold colors vary per row; keep the shared label column.
-        let label_width = auto_label_width(&rows, args.label_width);
         for row in &rows {
             let spec = BarSpec {
                 value: row.value,

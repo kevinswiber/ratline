@@ -43,6 +43,70 @@ fn bar_reproduces_fish_progress_line() {
 }
 
 #[test]
+fn explicit_label_width_pads_batch_rows() {
+    // An explicit --label-width is the label column in batch mode too, so
+    // bars from separate invocations align.
+    let expected = format!(
+        "ab{} {}{}  1/4  25.0%\n",
+        " ".repeat(10),
+        "█",
+        "░".repeat(3)
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["bar", "--label-width", "12", "--width", "4"])
+        .write_stdin("ab\t1\t4\n")
+        .assert()
+        .success()
+        .stdout(expected);
+}
+
+#[test]
+fn explicit_label_width_pads_thresholded_batch_rows() {
+    let expected = format!(
+        "ab{} {}{}  1/4  25.0%\n",
+        " ".repeat(10),
+        "█",
+        "░".repeat(3)
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args([
+            "bar",
+            "--label-width",
+            "12",
+            "--width",
+            "4",
+            "--thresholds",
+            "50:214,100:42",
+        ])
+        .write_stdin("ab\t1\t4\n")
+        .assert()
+        .success()
+        .stdout(expected);
+}
+
+#[test]
+fn omitted_label_width_still_autosizes_batch_rows() {
+    // Without the flag, the batch label column stays the widest label.
+    let expected = format!(
+        "a{} {}{}  1/4  25.0%\nlonger {}{}  3/4  75.0%\n",
+        " ".repeat(5),
+        "█",
+        "░".repeat(3),
+        "█".repeat(3),
+        "░",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["bar", "--width", "4"])
+        .write_stdin("a\t1\t4\nlonger\t3\t4\n")
+        .assert()
+        .success()
+        .stdout(expected);
+}
+
+#[test]
 fn bar_colors_under_always() {
     rat()
         .env("TERM", "xterm-256color")

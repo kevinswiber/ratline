@@ -151,9 +151,10 @@ pub fn auto_label_width(rows: &[BarRow], max: u16) -> u16 {
         .min(max)
 }
 
-/// Render every row with one shared label column.
+/// Render every row padded to the spec's shared label column (callers
+/// resolve it, via [`auto_label_width`] or an explicit setting).
 pub fn render_rows(rows: &[BarRow], spec: &BarSpec<'_>, profile: ColorProfile) -> Vec<String> {
-    let label_width = auto_label_width(rows, spec.label_width);
+    let label_width = spec.label_width;
     rows.iter()
         .map(|row| {
             let row_spec = BarSpec {
@@ -438,6 +439,27 @@ mod batch_tests {
         assert_eq!(lines.len(), 2);
         let bar_at = |s: &str| s.find(['#', '-']).unwrap();
         assert_eq!(bar_at(&lines[0]), bar_at(&lines[1]));
+    }
+
+    #[test]
+    fn render_rows_trusts_the_spec_label_column() {
+        let rows = parse_rows("a\t1\t4\n", '\t').unwrap();
+        let spec = BarSpec {
+            value: 0.0,
+            total: 0.0,
+            width: 4,
+            fill: '#',
+            empty: '-',
+            fill_style: StyleSpec::default(),
+            empty_style: StyleSpec::default(),
+            label: None,
+            label_width: 10,
+            annotation: Annotation::Ratio,
+            state: None,
+        };
+        let lines = render_rows(&rows, &spec, ColorProfile::Ascii);
+        // Label column of 10, then the separator space.
+        assert_eq!(lines[0].find(['#', '-']).unwrap(), 11);
     }
 
     #[test]
