@@ -7,8 +7,71 @@
 //! input stream in raw mode — the same component that would otherwise
 //! receive the reply as a keystroke.
 
+use std::io::Write;
+
 use crate::color::ColorProfile;
 use crate::theme::{Appearance, AppearanceSource};
+
+const SUBSCRIBE: &[u8] = b"\x1b[?2031h"; // DECSET 2031
+const UNSUBSCRIBE: &[u8] = b"\x1b[?2031l"; // DECRST 2031
+// OSC 10 (foreground) then OSC 11 (background), each `?`-queried and
+// ST-terminated, in one write so they land as one burst, never
+// interleaved with a frame.
+const REQUEST_COLORS: &[u8] = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+
+/// Owns the DEC 2031 subscription and the mid-session OSC 10/11 verify
+/// query — the only component that puts either on the wire. Subscribes on
+/// construction; unsubscribes on drop, best-effort — a dead terminal at
+/// that point is not worth surfacing as an error. `suspend`/`resume`
+/// bracket a foreign reader of the same input stream (the pager) and are
+/// idempotent so the caller never has to track state itself.
+pub struct ThemeNotifyGuard<W: Write> {
+    out: W,
+    active: bool,
+}
+
+impl<W: Write> ThemeNotifyGuard<W> {
+    pub fn subscribe(mut out: W) -> std::io::Result<Self> {
+        out.write_all(SUBSCRIBE)?;
+        out.flush()?;
+        Ok(ThemeNotifyGuard { out, active: true })
+    }
+
+    /// Idempotent: suspending an already-suspended guard writes nothing.
+    pub fn suspend(&mut self) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.out.write_all(UNSUBSCRIBE)?;
+        self.out.flush()?;
+        self.active = false;
+        Ok(())
+    }
+
+    /// Idempotent: resuming an already-active guard writes nothing.
+    pub fn resume(&mut self) -> std::io::Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        self.out.write_all(SUBSCRIBE)?;
+        self.out.flush()?;
+        self.active = true;
+        Ok(())
+    }
+
+    /// Ask for the current foreground and background in one burst; the
+    /// replies land on the input stream the caller already owns.
+    pub fn request_colors(&mut self) -> std::io::Result<()> {
+        self.out.write_all(REQUEST_COLORS)?;
+        self.out.flush()
+    }
+}
+
+impl<W: Write> Drop for ThemeNotifyGuard<W> {
+    fn drop(&mut self) {
+        let _ = self.suspend();
+    }
+}
 
 /// True when this process may subscribe to theme-change notifications.
 /// Mirrors `may_detect` (`src/theme.rs`), but keys on the resolved
@@ -226,5 +289,106 @@ mod tests {
         let white = xterm_color::Color::rgb(u16::MAX, u16::MAX, u16::MAX);
         assert_eq!(classify_colors(None, &white), Appearance::Light);
         assert_eq!(classify_colors(None, &black), Appearance::Dark);
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn bytes(&self) -> Vec<u8> {
+            self.0.lock().expect("lock poisoned").clone()
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn subscribe_writes_the_dec_2031_set_sequence() {
+        let out = SharedBuf::default();
+        let _guard = ThemeNotifyGuard::subscribe(out.clone()).expect("subscribe writes cleanly");
+        assert_eq!(out.bytes(), b"\x1b[?2031h".to_vec());
+    }
+
+    #[test]
+    fn drop_writes_the_dec_2031_reset_sequence() {
+        let out = SharedBuf::default();
+        let guard = ThemeNotifyGuard::subscribe(out.clone()).expect("subscribe writes cleanly");
+        drop(guard);
+        assert_eq!(out.bytes(), b"\x1b[?2031h\x1b[?2031l".to_vec());
+    }
+
+    #[test]
+    fn suspend_then_resume_writes_reset_then_set() {
+        let out = SharedBuf::default();
+        let mut guard = ThemeNotifyGuard::subscribe(out.clone()).expect("subscribe writes cleanly");
+        guard.suspend().expect("suspend writes cleanly");
+        guard.resume().expect("resume writes cleanly");
+        assert_eq!(out.bytes(), b"\x1b[?2031h\x1b[?2031l\x1b[?2031h".to_vec());
+    }
+
+    #[test]
+    fn a_second_suspend_while_already_suspended_writes_nothing_more() {
+        let out = SharedBuf::default();
+        let mut guard = ThemeNotifyGuard::subscribe(out.clone()).expect("subscribe writes cleanly");
+        guard.suspend().expect("first suspend writes cleanly");
+        guard
+            .suspend()
+            .expect("second suspend is a no-op, not an error");
+        assert_eq!(out.bytes(), b"\x1b[?2031h\x1b[?2031l".to_vec());
+    }
+
+    #[test]
+    fn a_resume_while_already_active_writes_nothing_more() {
+        let out = SharedBuf::default();
+        let mut guard = ThemeNotifyGuard::subscribe(out.clone()).expect("subscribe writes cleanly");
+        guard
+            .resume()
+            .expect("resume on an already-active guard is a no-op");
+        assert_eq!(out.bytes(), b"\x1b[?2031h".to_vec());
+    }
+
+    #[test]
+    fn request_colors_writes_both_queries_in_one_shot() {
+        let out = SharedBuf::default();
+        let mut guard = ThemeNotifyGuard::subscribe(out.clone()).expect("subscribe writes cleanly");
+        guard
+            .request_colors()
+            .expect("request_colors writes cleanly");
+        assert_eq!(
+            out.bytes(),
+            b"\x1b[?2031h\x1b]10;?\x1b\\\x1b]11;?\x1b\\".to_vec()
+        );
+    }
+
+    #[test]
+    fn drop_never_panics_even_when_the_underlying_write_fails() {
+        struct FailsAfterFirstWrite {
+            calls: u32,
+        }
+        impl std::io::Write for FailsAfterFirstWrite {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    Ok(buf.len())
+                } else {
+                    Err(std::io::Error::other("terminal gone"))
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let guard = ThemeNotifyGuard::subscribe(FailsAfterFirstWrite { calls: 0 })
+            .expect("the first write (subscribe) succeeds");
+        drop(guard); // must not panic even though the reset write errors
     }
 }
