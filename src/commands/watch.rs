@@ -492,6 +492,7 @@ impl VerifyState {
 /// Adopt an appearance the terminal reported. Returns true when the verdict
 /// actually changed; a repeat is a no-op, so a terminal that re-announces an
 /// unchanged theme costs nothing.
+#[cfg_attr(windows, allow(dead_code))] // Called from the unix input path.
 fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     if palette.appearance == reported {
         return false;

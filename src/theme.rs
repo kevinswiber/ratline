@@ -45,7 +45,9 @@ pub enum AppearanceSource {
     Osc,
     ColorFgBg,
     Default,
-    // A palette re-resolved from a terminal-pushed theme report.
+    // A palette re-resolved from a terminal-pushed theme report;
+    // constructed on the unix input path only.
+    #[cfg_attr(windows, allow(dead_code))]
     Notification,
 }
 

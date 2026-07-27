@@ -38,6 +38,10 @@ impl PtySession {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+        // A raw pointer rather than `&mut`: the winp parameter is
+        // `*mut winsize` on macOS but `*const winsize` on Linux, and a
+        // `*mut` coerces to both.
+        let winp: *mut libc::winsize = &mut winsize;
         // SAFETY: out-params are stack locals; a null termp means "use the
         // platform's default modes," which every unix `openpty` accepts.
         let rc = unsafe {
@@ -46,7 +50,7 @@ impl PtySession {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut winsize,
+                winp,
             )
         };
         if rc != 0 {
