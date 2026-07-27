@@ -3,7 +3,7 @@ use std::io::Read;
 use anyhow::Context;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::cli::FilterArgs;
 use crate::color::ColorProfile;
@@ -23,6 +23,7 @@ struct FilterApp {
     unselected_prefix: String,
     multi: bool,
     header: Option<String>,
+    palette: Palette,
 }
 
 impl UiApp for FilterApp {
@@ -31,7 +32,7 @@ impl UiApp for FilterApp {
     }
 
     fn render(&self, _area: Rect, buf: &mut Buffer) {
-        let accent = Style::default().fg(Color::Indexed(212));
+        let accent = Style::default().fg(self.palette.accent);
         let mut y = 0;
         if let Some(header) = &self.header {
             buf.set_string(0, y, header, Style::default().add_modifier(Modifier::BOLD));
@@ -81,7 +82,7 @@ impl UiApp for FilterApp {
                         x + pos as u16,
                         y,
                         c.to_string(),
-                        base.add_modifier(Modifier::BOLD).fg(Color::Indexed(212)),
+                        base.add_modifier(Modifier::BOLD).fg(self.palette.accent),
                     );
                 }
             }
@@ -95,7 +96,7 @@ impl UiApp for FilterApp {
     }
 }
 
-pub fn run(args: FilterArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let mut stdin = String::new();
     std::io::stdin()
         .read_to_string(&mut stdin)
@@ -140,6 +141,7 @@ pub fn run(args: FilterArgs, profile: ColorProfile, _palette: Palette) -> AppRes
         unselected_prefix: args.unselected_prefix.clone(),
         multi: limit != Some(1),
         header: args.header.clone(),
+        palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui(&mut app, profile, timeout)?;
@@ -155,4 +157,60 @@ pub fn run(args: FilterArgs, profile: ColorProfile, _palette: Palette) -> AppRes
     }
     println!("{}", results.join(out_delim));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+    use crate::theme::{Appearance, AppearanceSource};
+
+    fn app(palette: Palette) -> FilterApp {
+        FilterApp {
+            state: FilterState::new(
+                vec!["alpha".into(), "beta".into()],
+                Some(1),
+                5,
+                true,
+                true,
+                "a".into(),
+            ),
+            prompt: "> ".into(),
+            placeholder: "filter".into(),
+            indicator: "> ".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi: false,
+            header: None,
+            palette,
+        }
+    }
+
+    fn prompt_and_highlight_fg(palette: Palette) -> (Color, Color) {
+        let app = app(palette);
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let prompt = buf.cell((0, 0)).expect("prompt is painted").fg;
+        let highlight = (0u16..40)
+            .filter_map(|x| buf.cell((x, 1)))
+            .find(|cell| cell.modifier.contains(Modifier::BOLD))
+            .expect("a match highlight is painted")
+            .fg;
+        (prompt, highlight)
+    }
+
+    #[test]
+    fn the_prompt_and_match_highlight_take_the_palette_accent() {
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        let (dark_prompt, dark_highlight) = prompt_and_highlight_fg(dark);
+        assert_eq!(dark_prompt, dark.accent);
+        assert_eq!(dark_prompt, Color::Indexed(212));
+        assert_eq!(dark_highlight, dark.accent);
+        let (light_prompt, light_highlight) = prompt_and_highlight_fg(light);
+        assert_eq!(light_prompt, light.accent);
+        assert_eq!(light_highlight, light.accent);
+    }
 }

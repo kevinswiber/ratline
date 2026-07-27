@@ -3,7 +3,7 @@ use std::io::Read;
 use anyhow::Context;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::cli::ChooseArgs;
 use crate::color::ColorProfile;
@@ -22,6 +22,7 @@ struct ChooseApp {
     unselected_prefix: String,
     multi: bool,
     show_help: bool,
+    palette: Palette,
 }
 
 impl UiApp for ChooseApp {
@@ -30,7 +31,7 @@ impl UiApp for ChooseApp {
     }
 
     fn render(&self, _area: Rect, buf: &mut Buffer) {
-        let accent = Style::default().fg(Color::Indexed(212));
+        let accent = Style::default().fg(self.palette.accent);
         buf.set_string(
             0,
             0,
@@ -76,7 +77,7 @@ impl UiApp for ChooseApp {
     }
 }
 
-pub fn run(args: ChooseArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: ChooseArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let options = if args.options.is_empty() {
         let mut buf = String::new();
         std::io::stdin()
@@ -123,6 +124,7 @@ pub fn run(args: ChooseArgs, profile: ColorProfile, _palette: Palette) -> AppRes
         unselected_prefix: args.unselected_prefix.clone(),
         multi,
         show_help: !args.no_show_help,
+        palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui(&mut app, profile, timeout)?;
@@ -132,4 +134,40 @@ pub fn run(args: ChooseArgs, profile: ColorProfile, _palette: Palette) -> AppRes
         println!("{}", results.join(out_delim));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+    use crate::theme::{Appearance, AppearanceSource};
+
+    fn cursor_row_fg(palette: Palette) -> Color {
+        let mut app = ChooseApp {
+            state: ChooseState::new(vec!["one".into(), "two".into()], Some(1), 5),
+            header: "pick".into(),
+            cursor: "> ".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi: false,
+            show_help: false,
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.state.cursor = 0;
+        app.render(area, &mut buf);
+        buf.cell((0, 1)).expect("first row is painted").fg
+    }
+
+    #[test]
+    fn the_cursor_row_takes_its_accent_from_the_palette() {
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        assert_eq!(cursor_row_fg(dark), dark.accent);
+        assert_eq!(cursor_row_fg(dark), Color::Indexed(212));
+        assert_eq!(cursor_row_fg(light), light.accent);
+        assert_ne!(cursor_row_fg(dark), cursor_row_fg(light));
+    }
 }

@@ -1,6 +1,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::cli::ConfirmArgs;
 use crate::color::ColorProfile;
@@ -16,6 +16,7 @@ struct ConfirmApp {
     prompt: String,
     affirmative: String,
     negative: String,
+    palette: Palette,
 }
 
 impl UiApp for ConfirmApp {
@@ -31,8 +32,8 @@ impl UiApp for ConfirmApp {
             Style::default().add_modifier(Modifier::BOLD),
         );
         let active = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Indexed(212))
+            .fg(self.palette.on_accent)
+            .bg(self.palette.accent)
             .add_modifier(Modifier::BOLD);
         let inactive = Style::default().add_modifier(Modifier::DIM);
         let yes = format!(" {} ", self.affirmative);
@@ -52,7 +53,7 @@ impl UiApp for ConfirmApp {
     }
 }
 
-pub fn run(args: ConfirmArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: ConfirmArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let mut app = ConfirmApp {
         state: ConfirmState {
             affirmative: args.default_yes,
@@ -60,6 +61,7 @@ pub fn run(args: ConfirmArgs, profile: ColorProfile, _palette: Palette) -> AppRe
         prompt: args.prompt.clone(),
         affirmative: args.affirmative.clone(),
         negative: args.negative.clone(),
+        palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui(&mut app, profile, timeout)?;
@@ -76,5 +78,36 @@ pub fn run(args: ConfirmArgs, profile: ColorProfile, _palette: Palette) -> AppRe
         Ok(())
     } else {
         Err(AppError::NoSelection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+    use crate::theme::{Appearance, AppearanceSource};
+
+    fn active_button(palette: Palette) -> (Color, Color) {
+        let app = ConfirmApp {
+            state: ConfirmState { affirmative: true },
+            prompt: "Ship it?".into(),
+            affirmative: "Yes".into(),
+            negative: "No".into(),
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let cell = buf.cell((2, 1)).expect("the active button is painted");
+        (cell.fg, cell.bg)
+    }
+
+    #[test]
+    fn the_active_button_pairs_on_accent_over_accent() {
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        assert_eq!(active_button(dark), (Color::Black, Color::Indexed(212)));
+        assert_eq!(active_button(light), (light.on_accent, light.accent));
     }
 }

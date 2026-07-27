@@ -1,6 +1,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::cli::InputArgs;
 use crate::color::ColorProfile;
@@ -16,6 +16,7 @@ struct InputApp {
     prompt: String,
     placeholder: String,
     header: Option<String>,
+    palette: Palette,
 }
 
 impl UiApp for InputApp {
@@ -29,7 +30,7 @@ impl UiApp for InputApp {
             buf.set_string(0, y, header, Style::default().add_modifier(Modifier::BOLD));
             y += 1;
         }
-        let accent = Style::default().fg(Color::Indexed(212));
+        let accent = Style::default().fg(self.palette.accent);
         buf.set_string(0, y, &self.prompt, accent);
         let x = self.prompt.chars().count() as u16;
         let text = self.state.display(&self.placeholder);
@@ -57,15 +58,47 @@ impl UiApp for InputApp {
     }
 }
 
-pub fn run(args: InputArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: InputArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let mut app = InputApp {
         state: InputState::new(args.value.clone(), args.password, args.char_limit),
         prompt: args.prompt.clone(),
         placeholder: args.placeholder.clone(),
         header: args.header.clone(),
+        palette,
     };
     let timeout = args.timeout.as_deref().map(parse_interval).transpose()?;
     run_ui(&mut app, profile, timeout)?;
     println!("{}", app.state.value);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::*;
+    use crate::theme::{Appearance, AppearanceSource};
+
+    fn prompt_fg(palette: Palette) -> Color {
+        let app = InputApp {
+            state: InputState::new(String::new(), false, 1000),
+            prompt: "> ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        buf.cell((0, 0)).expect("prompt is painted").fg
+    }
+
+    #[test]
+    fn the_prompt_takes_its_accent_from_the_palette() {
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        assert_eq!(prompt_fg(dark), Color::Indexed(212));
+        assert_eq!(prompt_fg(light), light.accent);
+        assert_ne!(prompt_fg(dark), prompt_fg(light));
+    }
 }
