@@ -1,6 +1,5 @@
 //! Semantic color tokens resolved for the terminal's light or dark
 //! appearance. Pure: no io, no environment, no filesystem.
-#![allow(dead_code)] // Tokens land ahead of the commands that read them.
 
 use anyhow::anyhow;
 use ratatui::style::Color;
@@ -70,6 +69,7 @@ pub struct Palette {
 
 /// Every public token name, in declaration order. Pinned against `token()`
 /// by a unit test.
+#[allow(dead_code)] // Read by tests and documentation, not by commands.
 pub const TOKEN_NAMES: [&str; 10] = [
     "accent",
     "on-accent",

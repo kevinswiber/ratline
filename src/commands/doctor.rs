@@ -10,7 +10,7 @@ use crate::cli::DoctorArgs;
 use crate::color::{ColorProfile, SystemEnv, detect_profile};
 use crate::exit::AppResult;
 use crate::term::tty::UiStream;
-use crate::theme::Palette;
+use crate::theme::{AppearanceSource, Palette};
 
 /// Terminal support for synchronized output (mode 2026), per DECRPM.
 // Only the unix probe constructs the positive variants.
@@ -128,13 +128,15 @@ fn probe_sync_support(ui: &mut UiStream) -> SyncSupport {
     result.unwrap_or(SyncSupport::NoReply)
 }
 
-pub fn run(args: DoctorArgs, profile: ColorProfile, _palette: Palette) -> AppResult {
+pub fn run(args: DoctorArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let mut ui = UiStream::open();
     let is_tty = ui.is_tty();
     let is_dev_tty = ui.is_dev_tty();
     let (cols, rows) = ui.size();
     let detected = detect_profile(&SystemEnv, is_tty);
     let reason = profile_reason(is_tty);
+    let appearance = palette.appearance.as_str();
+    let appearance_source = appearance_reason(palette.source);
     let sync = probe_sync_support(&mut ui);
 
     #[cfg(unix)]
@@ -151,8 +153,9 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, _palette: Palette) -> AppRes
             concat!(
                 "{{\"ui_stream\":\"{}\",\"is_tty\":{},\"cols\":{},\"rows\":{},",
                 "\"detected_profile\":\"{:?}\",\"active_profile\":\"{:?}\",",
-                "\"profile_reason\":\"{}\",\"sync_output\":\"{:?}\",",
-                "\"sync_supported\":{}}}"
+                "\"profile_reason\":\"{}\",",
+                "\"appearance\":\"{}\",\"appearance_source\":\"{}\",",
+                "\"sync_output\":\"{:?}\",\"sync_supported\":{}}}"
             ),
             stream,
             is_tty,
@@ -161,6 +164,8 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, _palette: Palette) -> AppRes
             detected,
             profile,
             reason,
+            appearance,
+            appearance_source,
             sync,
             sync.supported(),
         );
@@ -171,9 +176,23 @@ pub fn run(args: DoctorArgs, profile: ColorProfile, _palette: Palette) -> AppRes
         writeln!(out, "Size:             {cols}x{rows}").context("writing")?;
         writeln!(out, "Detected profile: {detected:?} ({reason})").context("writing")?;
         writeln!(out, "Active profile:   {profile:?}").context("writing")?;
+        writeln!(out, "Appearance:       {appearance} ({appearance_source})").context("writing")?;
         writeln!(out, "Synchronized out: {}", sync.describe()).context("writing")?;
     }
     Ok(())
+}
+
+/// A short account of what decided the appearance, in the same spirit as
+/// `profile_reason`.
+fn appearance_reason(source: AppearanceSource) -> &'static str {
+    match source {
+        // One argument backs both the flag and its environment variable, so
+        // a request that arrives either way reports the same way.
+        AppearanceSource::Explicit => "explicit",
+        AppearanceSource::Osc => "osc",
+        AppearanceSource::ColorFgBg => "colorfgbg",
+        AppearanceSource::Default => "default",
+    }
 }
 
 /// A short human account of what decided the profile.
