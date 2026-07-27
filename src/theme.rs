@@ -100,16 +100,18 @@ const DARK: Palette = Palette {
     log_error: Color::Indexed(204),
 };
 
-// Light-background partners for the values above.
+// Light-background partners for the values above. White-on-accent: the
+// light accent is darker than the dark palette's, so white text carries
+// better contrast on it than black does.
 const LIGHT: Palette = Palette {
     appearance: Appearance::Light,
     source: AppearanceSource::Default,
     accent: Color::Indexed(129),
-    on_accent: Color::Black,
+    on_accent: Color::White,
     muted: Color::Indexed(242),
     border: Color::Indexed(249),
     ok: Color::Indexed(28),
-    warn: Color::Indexed(130),
+    warn: Color::Indexed(172),
     error: Color::Indexed(160),
     debug: Color::Indexed(25),
     info: Color::Indexed(30),
@@ -407,11 +409,6 @@ mod tests {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         for name in TOKEN_NAMES {
-            if name == "on-accent" {
-                // Deliberately shared: black reads on both accents.
-                assert_eq!(dark.token(name), light.token(name));
-                continue;
-            }
             assert_ne!(dark.token(name), light.token(name), "{name} is unpaired");
         }
     }

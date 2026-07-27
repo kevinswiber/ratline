@@ -255,7 +255,7 @@ Every flag that takes a color (`--foreground`, `--background`,
 `--border-color`, `--fill-color`, `--empty-color`, `--spark-color`, and
 each half of `--thresholds`) accepts these token names in addition to
 literal colors; each name resolves through the selected palette
-(`on-accent` intentionally stays black in both palettes):
+(`on-accent` is black on the dark accent and white on the light one):
 
 | Token | Meaning |
 | --- | --- |

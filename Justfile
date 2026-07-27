@@ -30,8 +30,8 @@ release *args:
 run *args:
     cargo +stable run --bin rat -- {{ args }}
 
-# Type-check all targets without the full clippy/fmt gate (used by the
-# Windows CI leg, which runs no tests yet).
+# Type-check all targets without the fmt gate (the Windows CI leg runs
+# this and then the full test suite).
 [group('core')]
 check-types:
     cargo +stable clippy --all-targets --all-features -- -D warnings
