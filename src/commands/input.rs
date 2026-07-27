@@ -93,6 +93,48 @@ mod tests {
         buf.cell((0, 0)).expect("prompt is painted").fg
     }
 
+    fn rendered(palette: Palette, value: &str, cursor: usize) -> Vec<String> {
+        let mut state = InputState::new(value.to_string(), false, 1000);
+        state.cursor = cursor;
+        let app = InputApp {
+            state,
+            prompt: "> ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        crate::term::buffer_ansi::buffer_to_lines(&buf, ColorProfile::Ansi256)
+    }
+
+    #[test]
+    fn the_rendered_input_frame_is_pinned() {
+        // Byte-identity goldens: captured on v0.5.0 render code, before the
+        // placeholder/cursor rewire. The mid-string frames show finding F-0:
+        // the REVERSED caret emits no SGR at all (no \x1b[7m anywhere), so
+        // "abc" reaches the terminal completely plain.
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
+        assert_eq!(
+            rendered(dark, "", 0),
+            ["\u{1b}[38;5;212m> \u{1b}[0m\u{1b}[2mtype\u{1b}[0m", ""]
+        );
+        assert_eq!(
+            rendered(light, "", 0),
+            ["\u{1b}[38;5;129m> \u{1b}[0m\u{1b}[2mtype\u{1b}[0m", ""]
+        );
+        assert_eq!(
+            rendered(dark, "abc", 1),
+            ["\u{1b}[38;5;212m> \u{1b}[0mabc", ""]
+        );
+        assert_eq!(
+            rendered(light, "abc", 1),
+            ["\u{1b}[38;5;129m> \u{1b}[0mabc", ""]
+        );
+    }
+
     #[test]
     fn the_prompt_takes_its_accent_from_the_palette() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);

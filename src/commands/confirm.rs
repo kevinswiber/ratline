@@ -103,6 +103,50 @@ mod tests {
         (cell.fg, cell.bg)
     }
 
+    fn rendered(palette: Palette) -> Vec<String> {
+        let app = ConfirmApp {
+            state: ConfirmState { affirmative: true },
+            prompt: "Ship it?".into(),
+            affirmative: "Yes".into(),
+            negative: "No".into(),
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        crate::term::buffer_ansi::buffer_to_lines(&buf, ColorProfile::Ansi256)
+    }
+
+    #[test]
+    fn the_rendered_confirm_frame_is_pinned() {
+        // Byte-identity golden: captured on v0.5.0 render code. The active
+        // button's foreground is the NAMED on-accent (SGR 30 dark / 97
+        // light), not an indexed sequence; the background is the indexed
+        // accent.
+        let dark = rendered(Palette::builtin(
+            Appearance::Dark,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(
+            dark,
+            [
+                "\u{1b}[1mShip it?\u{1b}[0m",
+                "  \u{1b}[1;30;48;5;212m Yes \u{1b}[0m   \u{1b}[2m No \u{1b}[0m"
+            ]
+        );
+        let light = rendered(Palette::builtin(
+            Appearance::Light,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(
+            light,
+            [
+                "\u{1b}[1mShip it?\u{1b}[0m",
+                "  \u{1b}[1;97;48;5;129m Yes \u{1b}[0m   \u{1b}[2m No \u{1b}[0m"
+            ]
+        );
+    }
+
     #[test]
     fn the_active_button_pairs_on_accent_over_accent() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);

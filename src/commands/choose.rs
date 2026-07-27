@@ -161,6 +161,60 @@ mod tests {
         buf.cell((0, 1)).expect("first row is painted").fg
     }
 
+    fn rendered(palette: Palette) -> Vec<String> {
+        let mut app = ChooseApp {
+            state: ChooseState::new(vec!["one".into(), "two".into()], Some(1), 5),
+            header: "pick".into(),
+            cursor: "> ".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi: false,
+            show_help: false,
+            palette,
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.state.cursor = 0;
+        app.render(area, &mut buf);
+        crate::term::buffer_ansi::buffer_to_lines(&buf, ColorProfile::Ansi256)
+    }
+
+    #[test]
+    fn the_rendered_choose_frame_is_pinned() {
+        // Byte-identity golden: captured on v0.5.0 render code, before the
+        // selection-token rewire. If this changes, emitted bytes changed.
+        let dark = rendered(Palette::builtin(
+            Appearance::Dark,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(
+            dark,
+            [
+                "\u{1b}[1mpick\u{1b}[0m",
+                "\u{1b}[38;5;212m> one\u{1b}[0m",
+                "  two",
+                "",
+                "",
+                ""
+            ]
+        );
+        let light = rendered(Palette::builtin(
+            Appearance::Light,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(
+            light,
+            [
+                "\u{1b}[1mpick\u{1b}[0m",
+                "\u{1b}[38;5;129m> one\u{1b}[0m",
+                "  two",
+                "",
+                "",
+                ""
+            ]
+        );
+    }
+
     #[test]
     fn the_cursor_row_takes_its_accent_from_the_palette() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);

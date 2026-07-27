@@ -201,6 +201,51 @@ mod tests {
         (prompt, highlight)
     }
 
+    fn rendered(palette: Palette) -> Vec<String> {
+        let app = app(palette);
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        crate::term::buffer_ansi::buffer_to_lines(&buf, ColorProfile::Ansi256)
+    }
+
+    #[test]
+    fn the_rendered_filter_frame_is_pinned() {
+        // Byte-identity golden: captured on v0.5.0 render code, before the
+        // selection/match/placeholder rewire. Note the marker, cursor-row
+        // base, and match highlight all read accent-valued styles here.
+        let dark = rendered(Palette::builtin(
+            Appearance::Dark,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(
+            dark,
+            [
+                "\u{1b}[38;5;212m> \u{1b}[0ma",
+                "\u{1b}[38;5;212m> \u{1b}[0m\u{1b}[1;38;5;212ma\u{1b}[0m\u{1b}[38;5;212mlpha\u{1b}[0m",
+                "\u{1b}[38;5;212m  \u{1b}[0mbet\u{1b}[1;38;5;212ma\u{1b}[0m",
+                "",
+                "",
+                ""
+            ]
+        );
+        let light = rendered(Palette::builtin(
+            Appearance::Light,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(
+            light,
+            [
+                "\u{1b}[38;5;129m> \u{1b}[0ma",
+                "\u{1b}[38;5;129m> \u{1b}[0m\u{1b}[1;38;5;129ma\u{1b}[0m\u{1b}[38;5;129mlpha\u{1b}[0m",
+                "\u{1b}[38;5;129m  \u{1b}[0mbet\u{1b}[1;38;5;129ma\u{1b}[0m",
+                "",
+                "",
+                ""
+            ]
+        );
+    }
+
     #[test]
     fn the_prompt_and_match_highlight_take_the_palette_accent() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
