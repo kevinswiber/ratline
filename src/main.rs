@@ -5,6 +5,7 @@ mod core;
 mod exit;
 mod style_spec;
 mod term;
+mod theme;
 
 mod ui;
 
