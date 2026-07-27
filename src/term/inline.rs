@@ -147,15 +147,16 @@ impl<W: Write> InlineRenderer<W> {
         Ok(())
     }
 
-    /// Forget everything painted: the next draw repaints from scratch,
-    /// re-wiping in clear-screen mode and re-hiding the cursor. Used after
-    /// another program (a pager) has owned the screen.
-    pub fn reset(&mut self) {
-        self.prev_rows = 0;
+    /// The pager returned and its alternate screen restored this
+    /// renderer's own last frame, cursor below it. Keep the frame
+    /// geometry so the next draw climbs over and replaces the restored
+    /// copy inside one synchronized frame — forgetting it would paint a
+    /// duplicate underneath — but re-arm the cursor and wipe state the
+    /// foreign program disturbed.
+    pub fn resume_over_own_frame(&mut self) {
         self.screen_cleared = false;
         self.cursor_hidden = false;
         self.finished = false;
-        self.last_width = None;
     }
 
     /// Restore the cursor. Idempotent; also runs on drop.
@@ -247,6 +248,32 @@ mod tests {
             "\x1b[?2026h\r\x1b[0Ja\r\nb\r\nc\r\n\x1b[?2026l",
             "\x1b[?2026h\x1b[3A\r\x1b[0Jonly\r\n\x1b[?2026l",
             "\x1b[?25h",
+        );
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn resuming_over_the_restored_frame_replaces_it_in_place() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(true);
+            r.draw(&lines(&["a", "b"]), 80).unwrap();
+            r.finish().unwrap(); // the pager is about to own the screen
+            r.resume_over_own_frame(); // its alternate screen restored our frame
+            r.draw(&lines(&["c"]), 80).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        // The post-pager frame re-hides the cursor and climbs over the
+        // restored two-row copy instead of painting below it.
+        let expected = concat!(
+            "\x1b[?25l",
+            "\x1b[?2026h\r\x1b[0Ja\r\nb\r\n\x1b[?2026l",
+            "\x1b[?25h",
+            "\x1b[?25l",
+            "\x1b[?2026h\x1b[2A\r\x1b[0Jc\r\n\x1b[?2026l",
+            "\x1b[?25h", // drop restores the cursor
         );
         assert_eq!(s, expected);
     }

@@ -331,7 +331,7 @@ fn page_frame(
     })();
 
     let _ = crossterm::terminal::enable_raw_mode();
-    renderer.reset();
+    renderer.resume_over_own_frame();
     match result {
         Ok(()) => None,
         Err(err) => Some(format!(

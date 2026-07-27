@@ -216,3 +216,42 @@ fn a_terminal_theme_flip_repaints_children_in_the_new_palette() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
+    // The pager's alternate screen restores the pre-pager frame with the
+    // cursor below it; the next frame must climb over and replace that
+    // copy, not paint a duplicate underneath it.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(wait_for(
+        &session,
+        &mut terminal,
+        b"hi",
+        Duration::from_secs(2)
+    ));
+    session.write_bytes(b"v");
+    // The one-row frame means the post-pager repaint must move up exactly
+    // one row before its erase; without that the frame lands below the
+    // restored copy.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[1A\r\x1b[0J",
+            Duration::from_secs(2)
+        ),
+        "expected the post-pager repaint to climb over the restored frame"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
