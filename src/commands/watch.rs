@@ -13,6 +13,9 @@ use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
+use crate::term::tap::TapEvent;
+#[cfg(unix)]
+use crate::term::tap::{TapScanner, TtyTap};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
 use crate::theme::{Appearance, AppearanceSource, Palette};
 use crate::ui::key::{Key, from_crossterm};
@@ -38,6 +41,22 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
     } else {
         None
     };
+    // Watch owns the terminal's input while it loops. On unix it reads the
+    // device itself: the terminal can send escape sequences unprompted, and
+    // those have to be parsed by whoever owns the input stream. Exactly one
+    // reader is attached at a time — see the pager arm below.
+    #[cfg(unix)]
+    let tap = if interactive {
+        // When the device cannot be opened, this run keeps the event
+        // library's pump instead.
+        TtyTap::spawn().ok()
+    } else {
+        None
+    };
+    // Declared outside the tick loop so a report split across a tick
+    // boundary still reassembles.
+    #[cfg(unix)]
+    let mut scanner = TapScanner::new();
 
     let title_line = args.title.as_ref().map(|title| {
         StyleSpec {
@@ -119,7 +138,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         // Wait for the next tick in slices, watching signals and (on a tty)
         // the keyboard.
         let deadline = Instant::now() + interval;
-        loop {
+        'wait: loop {
             if interrupted.load(Ordering::Relaxed) {
                 renderer.finish().context("restoring terminal")?;
                 return Err(AppError::Aborted);
@@ -137,29 +156,60 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
                 std::thread::sleep(nap);
                 continue;
             }
-            if !crossterm::event::poll(nap).context("polling events")? {
-                continue;
-            }
-            let event = crossterm::event::read().context("reading event")?;
-            let crossterm::event::Event::Key(key_event) = event else {
-                continue;
+            #[cfg(unix)]
+            let events = match tap.as_ref() {
+                Some(tap) => match tap.recv_timeout(nap) {
+                    Some(chunk) => scanner.feed(&chunk),
+                    None => Vec::new(),
+                },
+                None => crossterm_slice(nap)?,
             };
-            match from_crossterm(key_event) {
-                Some(Key::CtrlC) => {
-                    renderer.finish().context("restoring terminal")?;
-                    return Err(AppError::Aborted);
+            #[cfg(windows)]
+            let events = crossterm_slice(nap)?;
+            for event in events {
+                match event {
+                    TapEvent::Key(Key::CtrlC) => {
+                        renderer.finish().context("restoring terminal")?;
+                        return Err(AppError::Aborted);
+                    }
+                    TapEvent::Key(Key::Char('q')) => {
+                        renderer.finish().context("restoring terminal")?;
+                        return Ok(());
+                    }
+                    TapEvent::Key(Key::Char('v')) | TapEvent::Key(Key::Enter) => {
+                        // The pager reads the same terminal: park our
+                        // reader and require its confirmation before
+                        // handing the input stream over. Unconfirmed means
+                        // a reader may still be attached — never spawn a
+                        // second one against it.
+                        #[cfg(unix)]
+                        let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
+                        #[cfg(windows)]
+                        let handed_off = true;
+                        notice = if handed_off {
+                            page_frame(&full_lines, &mut renderer)
+                        } else {
+                            Some(
+                                "pager unavailable: the input reader did not yield; try again"
+                                    .to_string(),
+                            )
+                        };
+                        #[cfg(unix)]
+                        if let Some(tap) = tap.as_ref() {
+                            tap.resume();
+                        }
+                        // Repaint immediately with fresh data.
+                        previous_key = None;
+                        break 'wait;
+                    }
+                    // The terminal's own reports are parsed but not acted
+                    // on yet; matched explicitly so the keys above keep
+                    // their meaning.
+                    TapEvent::ThemeNotification(_) => {}
+                    TapEvent::OscColor(..) => {}
+                    // Every other key, as before.
+                    _ => {}
                 }
-                Some(Key::Char('q')) => {
-                    renderer.finish().context("restoring terminal")?;
-                    return Ok(());
-                }
-                Some(Key::Char('v')) | Some(Key::Enter) => {
-                    notice = page_frame(&full_lines, &mut renderer);
-                    // Repaint immediately with fresh data.
-                    previous_key = None;
-                    break;
-                }
-                _ => {}
             }
         }
     }
@@ -315,6 +365,24 @@ fn register_signals() -> Result<(Arc<AtomicBool>, Arc<AtomicBool>), AppError> {
         Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
     ))
+}
+
+/// One wait slice through the event library's pump: the Windows input path,
+/// and the unix fallback when the terminal device cannot be opened. Non-key
+/// events are discarded exactly as they were before the split.
+fn crossterm_slice(nap: Duration) -> anyhow::Result<Vec<TapEvent>> {
+    if !crossterm::event::poll(nap).context("polling events")? {
+        return Ok(Vec::new());
+    }
+    let crossterm::event::Event::Key(key_event) =
+        crossterm::event::read().context("reading event")?
+    else {
+        return Ok(Vec::new());
+    };
+    match from_crossterm(key_event) {
+        Some(key) => Ok(vec![TapEvent::Key(key)]),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Adopt an appearance the terminal reported. Returns true when the verdict

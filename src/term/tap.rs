@@ -109,6 +109,188 @@ pub fn decode_key(byte: u8) -> Option<Key> {
     }
 }
 
+/// How long the reader waits for input before re-checking its control
+/// flags. Short enough that a pause or a shutdown is observed promptly,
+/// long enough that an idle terminal costs nothing.
+#[cfg(unix)]
+const READ_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Bounded wait for the reader to confirm it has parked: two slices plus
+/// slack. Past that the reader is unresponsive and the caller must not
+/// hand the terminal to a foreign reader.
+#[cfg(unix)]
+const PARK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
+#[cfg(unix)]
+#[derive(Default)]
+struct TapControl {
+    pause: std::sync::atomic::AtomicBool,
+    parked: std::sync::atomic::AtomicBool,
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+/// A private reader for the terminal's input. Long-running commands use it
+/// instead of an event library's pump so that escape sequences the terminal
+/// sends on its own initiative are parsed by the component that owns the
+/// input stream — and so that exactly one reader is attached to the
+/// terminal at any instant.
+#[cfg(unix)]
+pub struct TtyTap {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    control: std::sync::Arc<TapControl>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl TtyTap {
+    /// Open the terminal device and start reading. Fails when there is no
+    /// controlling terminal; the caller keeps whatever input path it had.
+    pub fn spawn() -> std::io::Result<TtyTap> {
+        let tty = std::fs::File::open("/dev/tty")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let control = std::sync::Arc::new(TapControl::default());
+        let reader_control = std::sync::Arc::clone(&control);
+        let reader = std::thread::Builder::new()
+            .name("rat-tty-tap".to_string())
+            .spawn(move || read_loop(&tty, &tx, &reader_control))?;
+        Ok(TtyTap {
+            rx,
+            control,
+            reader: Some(reader),
+        })
+    }
+
+    /// The next chunk of input, or `None` when the slice expired.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<Vec<u8>> {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.rx.recv_timeout(timeout) {
+            Ok(chunk) => Some(chunk),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                // A reader that has exited must not turn the caller's wait
+                // into a spin: sleep out the slice it asked for.
+                std::thread::sleep(timeout);
+                None
+            }
+        }
+    }
+
+    /// Stop consuming input before handing the terminal to a foreign
+    /// reader. True when the handoff is established: the reader confirmed
+    /// it parked, or it has already exited — either way nothing of ours is
+    /// competing for the terminal. False when neither was established in
+    /// time: a live-but-slow reader may still be attached, and the caller
+    /// must NOT spawn a foreign reader — clear the request with `resume`
+    /// and let the user retry.
+    pub fn pause(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.control.pause.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + PARK_ACK_TIMEOUT;
+        loop {
+            if self.control.parked.load(Ordering::SeqCst) {
+                return true;
+            }
+            if self
+                .reader
+                .as_ref()
+                .is_none_or(|reader| reader.is_finished())
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Read again. Bytes typed while parked are still queued in the
+    /// terminal and arrive normally.
+    pub fn resume(&self) {
+        use std::sync::atomic::Ordering;
+        self.control.parked.store(false, Ordering::SeqCst);
+        self.control.pause.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TtyTap {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.control.shutdown.store(true, Ordering::SeqCst);
+        self.control.pause.store(false, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            // Bounded by one slice: the reader never blocks on a read it
+            // has not polled for first.
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_loop(tty: &std::fs::File, tx: &std::sync::mpsc::Sender<Vec<u8>>, control: &TapControl) {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::Ordering;
+
+    let fd = tty.as_raw_fd();
+    let mut buf = [0u8; 256];
+    loop {
+        if control.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        if control.pause.load(Ordering::SeqCst) {
+            // Parked: the terminal belongs to someone else until resume,
+            // and what they type stays queued for them.
+            control.parked.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
+        }
+        // select(2), not poll(2): on macOS, poll against /dev/tty reports
+        // POLLNVAL without ever signaling readiness — the same quirk the
+        // event library's dev-tty path works around via select.
+        let mut read_set: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_ZERO(&mut read_set);
+            libc::FD_SET(fd, &mut read_set);
+        }
+        let mut timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: READ_SLICE.subsec_micros() as libc::suseconds_t,
+        };
+        let ready = unsafe {
+            libc::select(
+                fd + 1,
+                &mut read_set,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            )
+        };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+        if ready == 0 {
+            continue;
+        }
+        // Between "readable" and "read": a pause claimed in this window
+        // wins, so the byte is left for whoever comes next.
+        if control.pause.load(Ordering::SeqCst) {
+            continue;
+        }
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if read <= 0 {
+            return; // End of input, or the device went away.
+        }
+        if tx.send(buf[..read as usize].to_vec()).is_err() {
+            return; // Nobody is listening any more.
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
