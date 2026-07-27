@@ -148,6 +148,20 @@ mod tests {
     }
 
     #[test]
+    fn the_active_button_stays_on_the_brand_accent() {
+        // Deliberately NOT the selection token: the button is a
+        // brand-accented control, not a list selection, and on-accent is
+        // documented as the text drawn on `accent`. A sentinel selection
+        // must leave the button untouched.
+        let palette = Palette {
+            selection: Color::Indexed(99),
+            ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
+        };
+        let (_, bg) = active_button(palette);
+        assert_eq!(bg, Color::Indexed(212));
+    }
+
+    #[test]
     fn the_active_button_pairs_on_accent_over_accent() {
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
