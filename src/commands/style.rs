@@ -4,6 +4,7 @@ use anyhow::{Context, anyhow};
 
 use crate::cli::StyleArgs;
 use crate::color::ColorProfile;
+use crate::core::box_model::{BoxSpec, parse_sides, render_box};
 use crate::exit::AppResult;
 use crate::style_spec::{StyleSpec, parse_color};
 
@@ -38,10 +39,43 @@ pub fn run(args: StyleArgs, profile: ColorProfile) -> AppResult {
         strip_ansi_escapes::strip_str(&text)
     };
 
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let line = if args.trim { line.trim() } else { line };
+            line.to_string()
+        })
+        .collect();
+
+    let boxspec = BoxSpec {
+        content_style: spec,
+        width: args.width.map(usize::from),
+        align: args.align,
+        padding: args
+            .padding
+            .as_deref()
+            .map(parse_sides)
+            .transpose()
+            .context("padding")?
+            .unwrap_or_default(),
+        border: args.border,
+        border_style: StyleSpec {
+            foreground: args.border_color.as_deref().map(parse_color).transpose()?,
+            ..StyleSpec::default()
+        },
+        title: args.title.as_deref(),
+        margin: args
+            .margin
+            .as_deref()
+            .map(parse_sides)
+            .transpose()
+            .context("margin")?
+            .unwrap_or_default(),
+        ellipsis: &args.ellipsis,
+    };
     let mut out = String::new();
-    for line in text.split('\n') {
-        let line = if args.trim { line.trim() } else { line };
-        out.push_str(&spec.render(line, profile));
+    for line in render_box(&lines, &boxspec, profile) {
+        out.push_str(&line);
         out.push('\n');
     }
     print!("{out}");

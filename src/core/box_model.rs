@@ -1,6 +1,3 @@
-// Consumed by the style box model, which lands with its wiring.
-#![allow(dead_code)]
-
 use ratatui::symbols::border::Set;
 
 use crate::color::ColorProfile;

@@ -101,6 +101,30 @@ pub struct StyleArgs {
     /// Keep ANSI escapes present in the input
     #[arg(long)]
     pub no_strip_ansi: bool,
+    /// Draw a border around the text
+    #[arg(long, value_enum, default_value_t = crate::core::box_model::BorderPreset::None)]
+    pub border: crate::core::box_model::BorderPreset,
+    /// Border color: name, 256 index, or #rrggbb
+    #[arg(long, env = "BORDER_FOREGROUND")]
+    pub border_color: Option<String>,
+    /// Title inserted into the top border (may be pre-styled)
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Padding inside the border: "1" | "1 2" | "1 2 3" | "1 2 3 4"
+    #[arg(long)]
+    pub padding: Option<String>,
+    /// Margin outside the border, same shorthand as --padding
+    #[arg(long)]
+    pub margin: Option<String>,
+    /// Content column width in display cells; longer lines truncate
+    #[arg(long)]
+    pub width: Option<u16>,
+    /// Content alignment inside the column
+    #[arg(long, value_enum, default_value_t = crate::core::measure::Align::Left)]
+    pub align: crate::core::measure::Align,
+    /// Marker appended to a truncated line
+    #[arg(long, default_value = "…")]
+    pub ellipsis: String,
 }
 
 #[derive(clap::Args)]
