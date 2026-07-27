@@ -16,6 +16,8 @@ use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
 use crate::term::tap::{TapScanner, TtyTap};
+#[cfg(unix)]
+use crate::term::theme_notify::{ThemeNotifyGuard, may_subscribe};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
 use crate::theme::{Appearance, AppearanceSource, Palette};
 use crate::ui::key::{Key, from_crossterm};
@@ -57,6 +59,15 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
     // boundary still reassembles.
     #[cfg(unix)]
     let mut scanner = TapScanner::new();
+    // Declared after the raw-mode guard so it drops first: the unsubscribe
+    // is written while echo is still suppressed. The terminal only pushes
+    // theme changes while this is live, and only the reader above ever
+    // sees them.
+    #[cfg(unix)]
+    let mut theme_sub = may_subscribe(palette.source, profile, interactive && tap.is_some())
+        .then(|| ThemeNotifyGuard::subscribe(std::io::stdout()))
+        .transpose()
+        .context("subscribing to theme notifications")?;
 
     let title_line = args.title.as_ref().map(|title| {
         StyleSpec {
@@ -177,11 +188,17 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
                         return Ok(());
                     }
                     TapEvent::Key(Key::Char('v')) | TapEvent::Key(Key::Enter) => {
-                        // The pager reads the same terminal: park our
-                        // reader and require its confirmation before
-                        // handing the input stream over. Unconfirmed means
-                        // a reader may still be attached — never spawn a
-                        // second one against it.
+                        // The pager reads the same terminal. Stop the
+                        // pushes first, then park our reader, so a report
+                        // can never land in a foreign reader's input.
+                        #[cfg(unix)]
+                        if let Some(sub) = theme_sub.as_mut() {
+                            let _ = sub.suspend();
+                        }
+                        // Park our reader and require its confirmation
+                        // before handing the input stream over.
+                        // Unconfirmed means a reader may still be attached
+                        // — never spawn a second one against it.
                         #[cfg(unix)]
                         let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
                         #[cfg(windows)]
@@ -194,9 +211,16 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
                                     .to_string(),
                             )
                         };
+                        // Reader first, then pushes: a report always has
+                        // someone to read it.
                         #[cfg(unix)]
-                        if let Some(tap) = tap.as_ref() {
-                            tap.resume();
+                        {
+                            if let Some(tap) = tap.as_ref() {
+                                tap.resume();
+                            }
+                            if let Some(sub) = theme_sub.as_mut() {
+                                let _ = sub.resume();
+                            }
                         }
                         // Repaint immediately with fresh data.
                         previous_key = None;

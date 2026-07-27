@@ -31,7 +31,7 @@ fn piped_output_has_no_movement_or_cursor_escapes() {
         .assert()
         .success();
     let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
-    for escape in ["\x1b[?25l", "\x1b[?2026", "\x1b[0J"] {
+    for escape in ["\x1b[?25l", "\x1b[?2026", "\x1b[0J", "\x1b[?2031h"] {
         assert!(!stdout.contains(escape), "found {escape:?} in {stdout:?}");
     }
 }

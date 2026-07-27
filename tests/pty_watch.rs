@@ -123,3 +123,39 @@ fn an_unrecognized_private_csi_does_not_stop_watch_from_quitting() {
         "watch stopped responding to keys after an unrecognized escape"
     );
 }
+
+#[test]
+fn an_interactive_watch_subscribes_and_unsubscribes() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[?2031h",
+            Duration::from_secs(2)
+        ),
+        "expected watch to subscribe to theme notifications"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[?2031l",
+            Duration::from_secs(2)
+        ),
+        "expected watch to unsubscribe before exiting"
+    );
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
