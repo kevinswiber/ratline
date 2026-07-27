@@ -24,7 +24,15 @@ impl UiStream {
         #[cfg(windows)]
         const CONSOLE: &str = "CONOUT$";
         let inner = match OpenOptions::new().read(true).write(true).open(CONSOLE) {
-            Ok(file) => Inner::Tty(file),
+            Ok(file) => {
+                // Output modes are per screen buffer, which stdout shares,
+                // so this also covers frames written there. Left enabled on
+                // exit: a restore would race children inheriting the
+                // buffer, and modern shells set the bit for themselves.
+                #[cfg(windows)]
+                let _ = enable_vt(&file);
+                Inner::Tty(file)
+            }
             Err(_) => Inner::Stderr(std::io::stderr()),
         };
         UiStream { inner }
@@ -79,6 +87,29 @@ impl Write for UiStream {
 
 /// Write UTF-8 bytes to a console handle as UTF-16. Returns None when the
 /// handle rejects console writes (then the caller falls back to raw bytes).
+/// Ask the console to process VT sequences instead of printing them.
+/// Windows Terminal always does; legacy conhost only with this bit set.
+#[cfg(windows)]
+fn enable_vt(file: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, SetConsoleMode,
+    };
+
+    let handle = file.as_raw_handle();
+    let mut mode: CONSOLE_MODE = 0;
+    unsafe {
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
 #[cfg(windows)]
 fn write_console_utf16(file: &File, buf: &[u8]) -> Option<usize> {
     use std::os::windows::io::AsRawHandle;
@@ -183,6 +214,15 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn vt_enable_declines_a_non_console_handle() {
+        // A plain file is not a console; the helper must say no without
+        // panicking (this is the CI path, where no console exists at all).
+        let file = tempfile::tempfile().expect("temp file opens");
+        assert!(!enable_vt(&file));
+    }
 
     #[test]
     fn open_never_panics_and_size_is_positive() {
