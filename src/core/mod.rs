@@ -3,6 +3,7 @@ pub mod box_model;
 pub mod datetime;
 pub mod duration;
 pub mod fuzzy;
+pub mod join;
 pub mod measure;
 pub mod pager;
 pub mod spark;
