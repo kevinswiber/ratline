@@ -177,13 +177,16 @@ mod tests {
     }
 
     /// The long-running fixture whose spawned process IS the one that
-    /// must die: sh execs a sole simple command; on Windows, ping is
-    /// run directly rather than through cmd (killing cmd.exe would
-    /// orphan ping, which would hold the stdout pipe open).
+    /// must die — spawned DIRECTLY, never through a shell: a shell
+    /// that forks instead of execing (dash does) would absorb the
+    /// kill while its child kept the pipes open. The same rule puts
+    /// ping, not cmd.exe, in the slot on Windows.
     fn sleeper() -> std::process::Command {
         #[cfg(unix)]
         {
-            script("sleep 30")
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            cmd
         }
         #[cfg(windows)]
         {
