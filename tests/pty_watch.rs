@@ -1431,6 +1431,154 @@ fn a_pager_return_does_not_rerun_the_child() {
     );
 }
 
+#[test]
+fn keys_answer_while_a_slow_child_runs() {
+    // The finding's headline: a slow child must not deafen the loop.
+    // The count file is child-side evidence a SECOND child has started
+    // (and has ~3 s left) before q is pressed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!(
+        "echo x >> {count_path}; /bin/sleep 3; n=$(wc -l < {count_path}); printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v000001", Duration::from_secs(6)),
+        "expected the first frame"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let runs = std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if runs >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a second child never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    session.write_bytes(b"q");
+    // 2x headroom against the ~3 s the child still has to run: the
+    // loop answered while the child was mid-flight.
+    assert!(
+        !session.kill_if_alive(Duration::from_millis(1500)),
+        "q must exit while the child is still running"
+    );
+}
+
+#[test]
+fn a_key_repaints_while_a_slow_child_runs() {
+    // Not just input: a real dispatch AND paint must land inside the
+    // child's runtime.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!(
+        "echo x >> {count_path}; /bin/sleep 3; i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"l1", Duration::from_secs(6)),
+        "expected the first frame"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let runs = std::fs::read_to_string(&count)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if runs >= 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a second child never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· live · g follows".as_bytes(),
+            Duration::from_millis(1500)
+        ),
+        "expected a live-scroll repaint inside the child's runtime"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn quitting_kills_the_child_it_started() {
+    // The child dies with the watch: today's blocking loop cannot
+    // orphan one, and the async loop must not start. The interpreter
+    // writing {finished} as its last act is the child-side evidence —
+    // a killed script never gets there.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = dir.path().join("started");
+    let finished = dir.path().join("finished");
+    let script = format!(
+        ": > {}; /bin/sleep 1; : > {}",
+        started.display(),
+        finished.display()
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "10s", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !started.exists() {
+        // Keep answering the startup appearance probe while polling —
+        // the first tick waits behind it.
+        let chunk = session.read_available(Duration::from_millis(20));
+        terminal.respond(&session, &chunk);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never started"
+        );
+    }
+    // Before the first frame exists: quit must answer anyway (nothing
+    // is painted yet; the frame-dependent keys are gated, q is not).
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_millis(1500)),
+        "q must exit during the first child run"
+    );
+    // A bounded poll of child-side evidence, not a drain: the killed
+    // interpreter can never write its last act.
+    let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+    while std::time::Instant::now() < deadline {
+        assert!(!finished.exists(), "the child survived the watch's exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The last complete \r\n-delimited row containing `needle`.
 fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
     bytes

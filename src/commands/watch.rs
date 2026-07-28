@@ -8,7 +8,7 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
-use crate::core::child::{TickOutcome, run_tick};
+use crate::core::child::{ChildSlot, TickOutcome, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
@@ -112,6 +112,11 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     };
 
     let mut schedule = TickSchedule::new(interval);
+    let slot = ChildSlot::default();
+    // Every exit from run() — return, `?`, panic — kills the in-flight
+    // child through this guard's Drop. A NAMED binding: `let _ =`
+    // would drop it here and now.
+    let _shutdown = slot.guard();
     let (tx, rx) = std::sync::mpsc::channel::<TickOutcome>();
     let mut previous_key: Option<PaintKey> = None;
     let mut live: Option<Live> = None;
@@ -140,8 +145,20 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         // instant, on this thread.
         if schedule.poll(Instant::now()) == Due::Spawn {
             let size = crossterm::terminal::size().unwrap_or((80, 24));
-            let command = build_command(&args, interactive, palette.appearance, size);
-            let _ = tx.send(run_tick(command));
+            // Once mode has no loop to keep responsive: it runs the
+            // tick on this thread and posts it to the channel a worker
+            // would have used, so both modes share one completion
+            // handler. The same detour catches an OS that refuses a
+            // thread — that costs a stall, never a tick.
+            let mut inline = args.once;
+            if !inline {
+                let command = build_command(&args, interactive, palette.appearance, size);
+                inline = spawn_tick(command, slot.clone(), tx.clone()).is_err();
+            }
+            if inline {
+                let command = build_command(&args, interactive, palette.appearance, size);
+                let _ = tx.send(run_tick(command));
+            }
         }
         // 3. Collect a finished tick — at most one can be queued.
         if let Ok(outcome) = rx.try_recv() {
