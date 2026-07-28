@@ -12,6 +12,57 @@ fn rat_bin() -> String {
     assert_cmd::cargo::cargo_bin("rat").display().to_string()
 }
 
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Accumulate everything the session writes within `total` — unlike
+/// `read_available`, which returns at the first chunk.
+fn drain_for(session: &PtySession, total: std::time::Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + total;
+    let mut out = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return out;
+        }
+        out.extend(session.read_available(deadline - now));
+    }
+}
+
+/// `wait_for`, but panicking the moment `forbidden` shows up in the
+/// accumulated output.
+fn wait_for_without(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needle: &[u8],
+    forbidden: &[u8],
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let chunk = session.read_available((deadline - now).min(Duration::from_millis(50)));
+        if chunk.is_empty() {
+            continue;
+        }
+        terminal.respond(session, &chunk);
+        seen.extend_from_slice(&chunk);
+        assert!(
+            !contains(&seen, forbidden),
+            "forbidden needle {:?} appeared",
+            String::from_utf8_lossy(forbidden)
+        );
+        if contains(&seen, needle) {
+            return true;
+        }
+    }
+}
+
 #[test]
 fn a_watch_session_under_a_pty_prints_child_output_and_quits_on_q() {
     let session = PtySession::spawn(
@@ -339,6 +390,85 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
         ),
         "expected the live truncation notice back after Esc"
     );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn w_and_l_change_the_view_without_pausing() {
+    // One line deterministically wider than the 80-column pty: the marker
+    // starts at display column 101, provably beyond the screen edge when
+    // chopped, and beyond one horizontal step when shifted.
+    let long_line = "x".repeat(100) + "TAILMARK";
+    assert!(
+        long_line.len() > 80,
+        "premise: the line must overflow the pty"
+    );
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "50ms", "--", &rat, "style", &long_line],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let paused_needle = "paused ·".as_bytes();
+
+    // Wrapped by default: the marker appears on a wrapped row.
+    assert!(
+        wait_for(&session, &mut terminal, b"TAILMARK", Duration::from_secs(2)),
+        "expected the wrapped tail of the long line"
+    );
+    // Flush the rest of the initial frame before watching for the chop.
+    let _ = drain_for(&session, Duration::from_millis(200));
+
+    // `w` chops: a repaint arrives without the marker and without a pause.
+    session.write_bytes(b"w");
+    let chopped = drain_for(&session, Duration::from_millis(500));
+    assert!(
+        contains(&chopped, b"\x1b[?2026h"),
+        "expected a repaint after w"
+    );
+    assert!(
+        !contains(&chopped, b"TAILMARK"),
+        "the marker should be chopped off screen"
+    );
+    assert!(
+        !contains(&chopped, paused_needle),
+        "a view key must never freeze the frame"
+    );
+
+    // Four steps right (8 columns each) bring the marker into view.
+    session.write_bytes(b"llll");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            b"TAILMARK",
+            paused_needle,
+            Duration::from_secs(2)
+        ),
+        "expected the marker after shifting right"
+    );
+
+    // Back left, and `w` restores the wrapped view.
+    session.write_bytes(b"hhhh");
+    let _ = drain_for(&session, Duration::from_millis(300));
+    session.write_bytes(b"w");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            b"TAILMARK",
+            paused_needle,
+            Duration::from_secs(2)
+        ),
+        "expected the wrapped tail back after w"
+    );
+
     session.write_bytes(b"q");
     assert!(
         !session.kill_if_alive(Duration::from_secs(2)),

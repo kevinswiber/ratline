@@ -9,11 +9,12 @@ use crossterm::tty::IsTty;
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
 use crate::core::duration::parse_interval;
+use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
-use crate::term::scroll::{ScrollState, ScrollStep, paused_notice};
+use crate::term::scroll::{HSHIFT_STEP, ScrollState, ScrollStep, paused_notice};
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
 use crate::term::tap::{TapScanner, TtyTap};
@@ -90,6 +91,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     let mut previous_key: Option<PaintKey> = None;
     let mut full_lines: Vec<String> = Vec::new();
     let mut pause: Option<PauseState> = None;
+    let mut view = ViewState {
+        wrap: true,
+        hshift: 0,
+    };
     let mut notice: Option<String> = None;
     loop {
         let output = run_child(&args, interactive, palette.appearance)?;
@@ -123,8 +128,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                 appearance: p.appearance,
                 offset: p.scroll.offset(),
                 paused: true,
-                wrap: true,
-                hshift: 0,
+                wrap: view.wrap,
+                hshift: view.hshift,
             },
             None => PaintKey {
                 content: hash,
@@ -133,8 +138,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                 appearance: palette.appearance,
                 offset: 0,
                 paused: false,
-                wrap: true,
-                hshift: 0,
+                wrap: view.wrap,
+                hshift: view.hshift,
             },
         };
         if previous_key != Some(key) || notice.is_some() {
@@ -149,10 +154,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     source,
                     offset,
                     paused,
-                    ViewState {
-                        wrap: true,
-                        hshift: 0,
-                    },
+                    view,
                     notice.take(),
                     size,
                     args.max_height,
@@ -307,18 +309,15 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 appearance: p.appearance,
                                 offset: p.scroll.offset(),
                                 paused: true,
-                                wrap: true,
-                                hshift: 0,
+                                wrap: view.wrap,
+                                hshift: view.hshift,
                             });
                             paint_frame(
                                 &mut renderer,
                                 &p.frozen,
                                 p.scroll.offset(),
                                 true,
-                                ViewState {
-                                    wrap: true,
-                                    hshift: 0,
-                                },
+                                view,
                                 None,
                                 size,
                                 args.max_height,
@@ -333,11 +332,52 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             previous_key = None;
                             break 'wait;
                         }
-                        // Not yet wired: snapshots and view toggles.
-                        WatchAction::Snapshot
-                        | WatchAction::ToggleWrap
+                        action @ (WatchAction::ToggleWrap
                         | WatchAction::ShiftLeft
-                        | WatchAction::ShiftRight => {}
+                        | WatchAction::ShiftRight) => {
+                            // View state, not scrollback state: applies to
+                            // live and frozen frames alike, never freezes
+                            // the tail, repaints in place. Right shift is
+                            // unclamped, like less; left clamps at zero.
+                            match action {
+                                WatchAction::ToggleWrap => view.wrap = !view.wrap,
+                                WatchAction::ShiftLeft => {
+                                    view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
+                                }
+                                _ => view.hshift += HSHIFT_STEP,
+                            }
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            let (source, offset, paused) = match pause.as_ref() {
+                                Some(p) => (&p.frozen, p.scroll.offset(), true),
+                                None => (&full_lines, 0, false),
+                            };
+                            previous_key = Some(PaintKey {
+                                content: pause.as_ref().map_or(hash, |p| p.content),
+                                cols: size.0,
+                                rows: size.1,
+                                appearance: pause
+                                    .as_ref()
+                                    .map_or(palette.appearance, |p| p.appearance),
+                                offset,
+                                paused,
+                                wrap: view.wrap,
+                                hshift: view.hshift,
+                            });
+                            paint_frame(
+                                &mut renderer,
+                                source,
+                                offset,
+                                paused,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                            )?;
+                        }
+                        // Not yet wired: snapshots.
+                        WatchAction::Snapshot => {}
                         WatchAction::Ignore => {}
                     },
                     // The reported value is ignored on purpose: it can
@@ -484,7 +524,6 @@ fn compose_frame(title: Option<&String>, output: &ChildOutput, join_stderr: bool
 /// slice, append the paused row or the truncation notice, then the
 /// one-shot notice row, draw.
 #[allow(clippy::too_many_arguments)]
-#[allow(unused_variables)] // view: the chopped paint branch is not yet wired.
 fn paint_frame(
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
     lines: &[String],
@@ -499,23 +538,27 @@ fn paint_frame(
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
-    let mut kept = if paused {
-        let start = offset.min(lines.len());
-        let (kept, _) = truncate_to_rows(lines[start..].to_vec(), max_rows, cols);
-        let shown = kept.len();
-        let mut kept = kept;
-        kept.push(faint.render(&paused_notice(offset, shown, lines.len()), profile));
-        kept
+    let start = if paused { offset.min(lines.len()) } else { 0 };
+    // A nonzero shift implies chopped lines, less's own rule. Chopped
+    // rendering is 1:1 line-to-row; wrapped rendering is today's path.
+    let (mut kept, hidden) = if !view.wrap || view.hshift > 0 {
+        let end = (start + usize::from(max_rows)).min(lines.len());
+        let kept: Vec<String> = lines[start..end]
+            .iter()
+            .map(|line| shift_chop(line, view.hshift, usize::from(cols)))
+            .collect();
+        (kept, lines.len() - end)
     } else {
-        let (mut kept, hidden) = truncate_to_rows(lines.to_vec(), max_rows, cols);
-        if hidden > 0 {
-            kept.push(faint.render(
-                &format!("… {hidden} more lines · v views all · q quits"),
-                profile,
-            ));
-        }
-        kept
+        truncate_to_rows(lines[start..].to_vec(), max_rows, cols)
     };
+    if paused {
+        kept.push(faint.render(&paused_notice(offset, kept.len(), lines.len()), profile));
+    } else if hidden > 0 {
+        kept.push(faint.render(
+            &format!("… {hidden} more lines · v views all · q quits"),
+            profile,
+        ));
+    }
     if let Some(text) = notice {
         kept.push(faint.render(&text, profile));
     }

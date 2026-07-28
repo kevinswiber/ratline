@@ -1,5 +1,4 @@
 /// Columns per horizontal shift step (less's default shift).
-#[allow(dead_code)] // Not yet wired into watch's horizontal-shift keys.
 pub const HSHIFT_STEP: usize = 8;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

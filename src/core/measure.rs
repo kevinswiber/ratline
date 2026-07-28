@@ -255,7 +255,6 @@ pub fn wrap_display(s: &str, width: usize) -> Vec<String> {
 /// reset iff the kept segment leaves state open. Never splits an escape. No
 /// visible text remaining => the empty string (never an orphan SGR prefix).
 /// A double-width rune straddling either cut edge is dropped whole.
-#[allow(dead_code)] // Not yet wired into watch's chopped paint branch.
 pub fn shift_chop(line: &str, hshift: usize, cols: usize) -> String {
     // Walk off the dropped prefix: every printable starting before column
     // `hshift` goes (straddlers whole), escapes feed the state tracker.
