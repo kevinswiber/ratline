@@ -44,9 +44,11 @@ rat watch --shell -- 'date; df -h | head -3'  # through sh -c
 ```
 
 Cursor hiding, synchronized frames, redraw-only-on-change, height capping,
-and terminal restore on exit/ctrl-c are all built in. ANSI colors from the
-child pass through untouched. Piped output degrades to plain text, so
-`rat watch ... | tee log` stays readable.
+and terminal restore on exit/ctrl-c are all built in. Repaints rewrite
+only the rows that actually changed, so steady dashboards stay calm —
+and cheap over SSH. ANSI colors from the child pass through untouched.
+Piped output degrades to plain text, so `rat watch ... | tee log` stays
+readable.
 
 Every tick, the child runs with `RAT_WIDTH` and `RAT_HEIGHT` set to the
 current terminal size, so scripts can adapt their layout (branch on width,
@@ -59,19 +61,40 @@ While watching: `q` quits, and `v` (or Enter) opens the full untruncated
 frame in your pager — resolved bat-style from `RAT_PAGER`, then `PAGER`,
 then `less` (with `-R` ensured so colors survive; quit the pager and the
 watch resumes). On Windows, when `less` isn't installed the stock
-`more.com` steps in. When output is taller than the screen, the truncation
-line says so: `… 12 more lines · v views all · q quits`.
+`more.com` steps in.
 
-Scroll back with less-style keys: `j`/`k` (or the arrows) move one line,
+Every live frame's bottom row names the last time the output actually
+changed: `since 14:03:52`. When output is taller than the screen it
+merges into the truncation line:
+`… 12 more lines · since 14:03:52 · v views all · q quits`.
+
+Scroll with less-style keys: `j`/`k` (or the arrows) move one line,
 `d`/`u` half a window, `f`/`b` (or PgDn/PgUp) a full window, and `g`/`G`
-(or Home/End) jump to the ends. The first navigation key freezes the
-current frame — the command keeps running behind it, but nothing repaints
-over what you're reading — and the bottom row names the visible range:
-`paused · lines 2-23 of 30 · Esc resumes`. `Esc` returns to the live
-tail. `q` quits and `S` snapshots from either mode, and while paused `v`
-pages the frozen frame — which is also where search lives: page into
-`less` and search there. One deliberate divergence from `less`: Enter
-pages rather than scrolling one line.
+(or Home/End) jump to the ends. On a steady dashboard — output whose
+height isn't changing — the window moves over the live frame: nothing
+pauses, new output keeps arriving under you, `G` sticks to the end, and
+`g` (or scrolling back to the top) returns to the live view. The bottom
+row names the range: `lines 9-30 of 46 · live · g follows`. Scrolled
+lines render chopped, like a horizontally shifted view.
+
+On output whose height is still settling, a scroll key freezes the frame
+instead — the command keeps running behind it, but nothing repaints over
+what you're reading — and a frame that changes shape mid-scroll pauses
+itself and says `frame changed shape`. `p` pauses deliberately from any
+view; `Esc` or `F` return to the live tail. The paused row counts how
+long the view has been parked:
+`paused · 14s ago · lines 2-23 of 30 · Esc resumes`. `q` quits and `S`
+snapshots from either mode, and while paused `v` pages the frozen frame —
+which is also where search lives: page into `less` and search there. One
+deliberate divergence from `less`: Enter pages rather than scrolling one
+line.
+
+Step back in time with `<` (or `,`): each press parks on the previous
+distinct frame, and `>` (or `.`) steps forward again. The paused row's
+age says how old the frame on screen is, and `S` and `v` act on the
+frame being viewed — step back to when it broke, press `S`. History
+lives in memory only while the session runs, bounded to a few MiB of
+distinct frames.
 
 Two view toggles work live or frozen, without pausing anything: `w`
 switches long lines between wrapped and chopped, and `h`/`l` (or
@@ -79,7 +102,7 @@ Left/Right) scroll the view horizontally in 8-column steps. As in `less`,
 a horizontally shifted view shows chopped lines until you shift back to
 the left edge. Start chopped with `--no-wrap`.
 
-`S` writes the current frame to `rat-watch-YYYYMMDD-HHMMSS.txt` in
+`S` writes the frame being viewed to `rat-watch-YYYYMMDD-HHMMSS.txt` in
 `--snapshot-dir` (or `RAT_SNAPSHOT_DIR`, or the directory the watch was
 launched from) and shows the path in the notice row. Snapshots are plain
 text — ready for `grep` — unless `--snapshot-ansi` keeps the colors, and
