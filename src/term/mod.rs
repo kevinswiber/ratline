@@ -1,7 +1,6 @@
 pub mod appearance;
 pub mod buffer_ansi;
 pub mod frame_state;
-#[allow(dead_code)] // Not yet wired into watch's scrub keys.
 pub mod history;
 pub mod inline;
 pub mod scroll;

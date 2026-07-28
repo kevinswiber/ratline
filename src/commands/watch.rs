@@ -14,6 +14,7 @@ use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
+use crate::term::history::History;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::scroll::{
     HSHIFT_STEP, HeightTracker, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
@@ -103,6 +104,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     let mut live_scroll: Option<LiveScroll> = None;
     let mut heights = HeightTracker::new();
     let mut prev_height: Option<usize> = None;
+    let mut history = History::new();
     let mut view = ViewState {
         wrap: !args.no_wrap,
         hshift: 0,
@@ -127,6 +129,9 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         let lines = compose_frame(title_line.as_ref(), &output, is_tty);
         if is_tty {
             full_lines.clone_from(&lines);
+            // Every distinct frame is retained (byte-capped, deduped) so
+            // the scrub keys can walk back through it.
+            history.record(hash, &lines, jiff::Timestamp::now());
         }
         let height_changed = prev_height.is_some_and(|h| h != lines.len());
         prev_height = Some(lines.len());
@@ -148,6 +153,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     content: hash,
                     appearance: palette.appearance,
                     viewed_at: jiff::Timestamp::now(),
+                    history_seq: history.newest_seq(),
                 });
                 live_scroll = None;
                 notice = Some("frame changed shape".to_string());
@@ -372,6 +378,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                         content: hash,
                                         appearance: palette.appearance,
                                         viewed_at: jiff::Timestamp::now(),
+                                        history_seq: history.newest_seq(),
                                     });
                                 }
                                 previous_key = Some(repaint(
@@ -411,6 +418,65 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     content: hash,
                                     appearance: palette.appearance,
                                     viewed_at: jiff::Timestamp::now(),
+                                    history_seq: history.newest_seq(),
+                                });
+                                live_scroll = None;
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    &full_lines,
+                                    hash,
+                                    palette.appearance,
+                                    view,
+                                    None,
+                                    size,
+                                    args.max_height,
+                                    &faint,
+                                    profile,
+                                    &since,
+                                )?);
+                            }
+                            action @ (WatchAction::ScrubBack | WatchAction::ScrubForward) => {
+                                // A scrub is a pause with a cursor: park on
+                                // a neighboring DISTINCT frame. The anchor
+                                // is what the eye is on — the pause's entry
+                                // (re-resolved through `nearest` if
+                                // evicted), else the newest — so `<` always
+                                // means "older than what I am looking at".
+                                let anchor = pause
+                                    .as_ref()
+                                    .and_then(|p| p.history_seq)
+                                    .and_then(|seq| history.nearest(seq).map(|e| e.seq))
+                                    .or_else(|| history.newest_seq());
+                                let Some(anchor) = anchor else { continue };
+                                let entry = if action == WatchAction::ScrubBack {
+                                    history.prev(anchor)
+                                } else {
+                                    // At the newest entry this is a no-op,
+                                    // not a resume: > is a step, not a
+                                    // homing key.
+                                    history.next(anchor)
+                                };
+                                let Some(entry) = entry else { continue };
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                let window = usize::from(window_rows(args.max_height, size.1));
+                                // The scroll position is held across steps
+                                // — a watched line stays under the eye.
+                                let scroll = pause
+                                    .as_ref()
+                                    .map(|p| p.scroll)
+                                    .or_else(|| live_scroll.map(|ls| ScrollState::at(ls.offset())))
+                                    .unwrap_or_default();
+                                pause = Some(PauseState {
+                                    frozen: entry.frame.clone(),
+                                    scroll: scroll.clamp(entry.frame.len(), window),
+                                    content: entry.sig,
+                                    appearance: pause
+                                        .as_ref()
+                                        .map_or(palette.appearance, |p| p.appearance),
+                                    viewed_at: entry.at,
+                                    history_seq: Some(entry.seq),
                                 });
                                 live_scroll = None;
                                 previous_key = Some(repaint(
@@ -552,6 +618,8 @@ enum WatchAction {
     Snapshot,
     Resume,
     Freeze,
+    ScrubBack,
+    ScrubForward,
     Scroll(ScrollStep),
     ToggleWrap,
     ShiftLeft,
@@ -582,6 +650,8 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('l') | Key::Right => WatchAction::ShiftRight,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
+        Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
+        Key::Char('>') | Key::Char('.') if mode == FrameMode::Paused => WatchAction::ScrubForward,
         _ => WatchAction::Ignore,
     }
 }
@@ -595,9 +665,14 @@ struct PauseState {
     scroll: ScrollState,
     content: u64,
     appearance: Appearance,
-    /// When the viewed frame was current: freeze time for a plain pause.
-    /// The counting age on the paused row measures from here.
+    /// When the viewed frame was current: freeze time for a plain pause,
+    /// the entry's capture time for a scrub. The counting age on the
+    /// paused row measures from here.
     viewed_at: jiff::Timestamp,
+    /// The history entry this pause is anchored on. The tail keeps
+    /// recording behind a freeze, so without this anchor a scrub-back
+    /// would jump FORWARD to unseen frames.
+    history_seq: Option<u64>,
 }
 
 /// How long lines are shown: wrapped (today's path) or chopped, shifted
@@ -1170,9 +1245,30 @@ mod tests {
     fn unbound_keys_are_ignored() {
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::Char('x'), mode), WatchAction::Ignore);
-            assert_eq!(action_for(Key::Char('>'), mode), WatchAction::Ignore);
             assert_eq!(action_for(Key::Tab, mode), WatchAction::Ignore);
             assert_eq!(action_for(Key::Backspace, mode), WatchAction::Ignore);
+        }
+    }
+
+    #[test]
+    fn scrub_keys_walk_history() {
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('<'), mode), WatchAction::ScrubBack);
+            assert_eq!(action_for(Key::Char(','), mode), WatchAction::ScrubBack);
+        }
+        // Forward only means something while parked on a past frame; from
+        // a live surface there is nothing newer to step to.
+        assert_eq!(
+            action_for(Key::Char('>'), FrameMode::Paused),
+            WatchAction::ScrubForward
+        );
+        assert_eq!(
+            action_for(Key::Char('.'), FrameMode::Paused),
+            WatchAction::ScrubForward
+        );
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(action_for(Key::Char('>'), mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Char('.'), mode), WatchAction::Ignore);
         }
     }
 
@@ -1222,6 +1318,7 @@ mod tests {
             content: 7,
             appearance: Appearance::Light,
             viewed_at: jiff::Timestamp::now(),
+            history_seq: None,
         };
         // A live-scrolled key carries the LIVE hash and the window offset:
         // the tail keeps repainting under the offset.

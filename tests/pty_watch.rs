@@ -851,6 +851,205 @@ fn a_shape_change_while_scrolled_freezes() {
     );
 }
 
+/// Every `v`-prefixed six-digit counter value in the byte stream — the
+/// scrub fixtures print `v%06d`, monotonic and fixed-width, so ordering
+/// assertions are exact.
+fn counter_values(bytes: &[u8]) -> Vec<u64> {
+    let mut vals = Vec::new();
+    let mut i = 0;
+    while i + 7 <= bytes.len() {
+        if bytes[i] == b'v' && bytes[i + 1..i + 7].iter().all(u8::is_ascii_digit) {
+            let s = std::str::from_utf8(&bytes[i + 1..i + 7]).expect("digits");
+            vals.push(s.parse().expect("six digits"));
+            i += 7;
+        } else {
+            i += 1;
+        }
+    }
+    vals
+}
+
+#[test]
+fn scrubbing_shows_an_older_frame_and_s_snapshots_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let snaps = tempfile::tempdir().expect("snapshot dir");
+    let snaps_path = snaps.path().display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[("RAT_SNAPSHOT_DIR", &snaps_path)],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    // Let history accrue distinct frames.
+    let _ = drain_for(&session, Duration::from_millis(400));
+
+    session.write_bytes(b"<");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "paused ·".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected < to scrub into a pause");
+    let shown = *counter_values(&seen)
+        .last()
+        .expect("a value on the scrubbed frame");
+
+    session.write_bytes(b"S");
+    assert!(
+        wait_for(&session, &mut terminal, b"snapshot", Duration::from_secs(2)),
+        "expected the snapshot notice"
+    );
+    let entries: Vec<_> = std::fs::read_dir(snaps.path())
+        .expect("read snapshot dir")
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    assert_eq!(entries.len(), 1, "expected one snapshot: {entries:?}");
+    let contents = std::fs::read_to_string(&entries[0]).expect("read snapshot");
+    let filed = *counter_values(contents.as_bytes())
+        .first()
+        .expect("a value in the snapshot");
+    assert_eq!(filed, shown, "S must write the frame being viewed");
+
+    session.write_bytes(b"\x1b");
+    let live = wait_for_bytes(&session, &mut terminal, b"since ", Duration::from_secs(2))
+        .expect("expected Esc to resume the live tail");
+    let now_val = *counter_values(&live).last().expect("a live value");
+    assert!(
+        filed < now_val,
+        "the snapshot must hold an OLDER value ({filed} vs {now_val})"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn scrub_forward_at_the_newest_is_a_no_op() {
+    // The counter caps at 3: after three distinct frames the child goes
+    // static, so history settles at exactly three entries.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!(
+        "echo x >> {count}; n=$(wc -l < {count}); \
+         if [ $n -gt 3 ]; then n=3; fi; printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v000003", Duration::from_secs(2)),
+        "expected the counter to reach its cap"
+    );
+    let _ = drain_for(&session, Duration::from_millis(300));
+
+    session.write_bytes(b"<");
+    assert!(
+        wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(2)),
+        "expected < to show the previous frame"
+    );
+    session.write_bytes(b">");
+    assert!(
+        wait_for(&session, &mut terminal, b"v000003", Duration::from_secs(2)),
+        "expected > to step back to the newest entry"
+    );
+    let _ = drain_for(&session, Duration::from_millis(200));
+    session.write_bytes(b">");
+    let leaked = session.read_available(Duration::from_millis(400));
+    assert!(
+        leaked.is_empty(),
+        "> at the newest entry must be a no-op: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn scrubbing_from_an_old_freeze_steps_backward_not_forward() {
+    // The anchor contract: the tail keeps recording behind a freeze, so
+    // < from an OLD freeze must step older than what is on screen —
+    // an anchor-less scrub would jump forward to unseen frames.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    // Wait past the first few frames so the frozen value has a
+    // predecessor to step back to.
+    assert!(
+        wait_for(&session, &mut terminal, b"v000003", Duration::from_secs(3)),
+        "expected the counter to reach three"
+    );
+    // The frozen copy is always the last value PAINTED: keep everything
+    // seen up to the freeze row, since a freeze whose copy matches the
+    // screen rewrites only the status row.
+    let mut all = drain_for(&session, Duration::from_millis(300));
+    session.write_bytes(b"p");
+    all.extend(
+        wait_for_bytes(
+            &session,
+            &mut terminal,
+            "paused ·".as_bytes(),
+            Duration::from_secs(2),
+        )
+        .expect("expected p to freeze"),
+    );
+    let frozen = *counter_values(&all).last().expect("the frozen value");
+
+    // The tail records newer frames behind the freeze.
+    let _ = drain_for(&session, Duration::from_millis(500));
+
+    session.write_bytes(b"<");
+    let needle = format!("v{:06}", frozen - 1);
+    let stepped = wait_for_bytes(
+        &session,
+        &mut terminal,
+        needle.as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected < to step OLDER than the frozen frame");
+    assert!(
+        counter_values(&stepped).iter().all(|&v| v <= frozen),
+        "a scrub-back from an old freeze must never show a newer frame"
+    );
+
+    session.write_bytes(b"\x1b");
+    assert!(
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
+        "expected Esc to resume the live tail"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
 #[test]
 fn p_freezes_and_f_resumes() {
     // A deliberate freeze needs no scroll: p parks the frame in place.

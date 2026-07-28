@@ -93,6 +93,8 @@ impl History {
         self.entries.iter().find(|e| e.seq > seq)
     }
 
+    // Cap enforcement is internal; the accounting is observed by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bytes(&self) -> usize {
         self.total_bytes
     }
