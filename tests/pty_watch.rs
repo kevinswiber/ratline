@@ -218,6 +218,135 @@ fn a_terminal_theme_flip_repaints_children_in_the_new_palette() {
 }
 
 #[test]
+fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
+    // A child whose output changes every tick: any repaint after the
+    // freeze would be new bytes on the pty.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "50ms",
+            "--",
+            &rat_bin(),
+            "date",
+            "--format",
+            "%H%M%S%f",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    // A first frame has painted (the synchronized-output opener).
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[?2026h",
+            Duration::from_secs(2)
+        ),
+        "expected a first frame"
+    );
+
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"paused \xc2\xb7",
+            Duration::from_secs(2)
+        ),
+        "expected the paused row after a navigation key"
+    );
+    // Drain the paint that carried the paused row, then require silence:
+    // eight ticks of changing child output and not one byte painted.
+    let _ = session.read_available(Duration::from_millis(150));
+    let leaked = session.read_available(Duration::from_millis(400));
+    assert!(
+        leaked.is_empty(),
+        "the tail kept painting while frozen: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
+
+    // Esc resumes: a fresh repaint arrives (the opener again).
+    session.write_bytes(b"\x1b");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[?2026h",
+            Duration::from_secs(2)
+        ),
+        "expected the live tail to repaint after Esc"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q after resuming"
+    );
+}
+
+#[test]
+fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
+    // 30 static lines on a 24-row pty: a 22-row window, 8 hidden.
+    let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
+    let rat = rat_bin();
+    let mut args: Vec<&str> = vec!["watch", "-n", "50ms", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat_bin(), &args, &[]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "… 8 more lines · v views all · q quits".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the live truncation notice"
+    );
+
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused · lines 2-23 of 30 · Esc resumes".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the paused row one line down"
+    );
+
+    session.write_bytes(b"G");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 9-30 of 30",
+            Duration::from_secs(2)
+        ),
+        "expected the bottom of the frame after G"
+    );
+
+    session.write_bytes(b"\x1b");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "… 8 more lines · v views all · q quits".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the live truncation notice back after Esc"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
 fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
     // The pager's alternate screen restores the pre-pager frame with the
     // cursor below it; the next frame must climb over and replace that

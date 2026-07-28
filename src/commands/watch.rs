@@ -13,7 +13,7 @@ use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
-use crate::term::scroll::ScrollStep;
+use crate::term::scroll::{ScrollState, ScrollStep, paused_notice};
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
 use crate::term::tap::{TapScanner, TtyTap};
@@ -89,6 +89,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
 
     let mut previous_key: Option<PaintKey> = None;
     let mut full_lines: Vec<String> = Vec::new();
+    let mut pause: Option<PauseState> = None;
     let mut notice: Option<String> = None;
     loop {
         let output = run_child(&args, interactive, palette.appearance)?;
@@ -106,24 +107,48 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         if is_tty {
             full_lines.clone_from(&lines);
         }
-        let key = PaintKey {
-            content: hash,
-            cols: size.0,
-            rows: size.1,
-            appearance: palette.appearance,
-            offset: 0,
-            paused: false,
-            wrap: true,
-            hshift: 0,
+        // A resize while frozen must not leave the window past the frame.
+        if let Some(p) = pause.as_mut() {
+            let window = usize::from(window_rows(args.max_height, size.1));
+            p.scroll = p.scroll.clamp(p.frozen.len(), window);
+        }
+        // While frozen the key holds the freeze-time content/appearance:
+        // new child output and adopted palettes do not repaint, but
+        // scroll, resize, and the one-shot notice still do.
+        let key = match pause.as_ref() {
+            Some(p) => PaintKey {
+                content: p.content,
+                cols: size.0,
+                rows: size.1,
+                appearance: p.appearance,
+                offset: p.scroll.offset(),
+                paused: true,
+                wrap: true,
+                hshift: 0,
+            },
+            None => PaintKey {
+                content: hash,
+                cols: size.0,
+                rows: size.1,
+                appearance: palette.appearance,
+                offset: 0,
+                paused: false,
+                wrap: true,
+                hshift: 0,
+            },
         };
         if previous_key != Some(key) || notice.is_some() {
             previous_key = Some(key);
             if is_tty {
+                let (source, offset, paused) = match pause.as_ref() {
+                    Some(p) => (&p.frozen, p.scroll.offset(), true),
+                    None => (&full_lines, 0, false),
+                };
                 paint_frame(
                     &mut renderer,
-                    &full_lines,
-                    0,
-                    false,
+                    source,
+                    offset,
+                    paused,
                     ViewState {
                         wrap: true,
                         hshift: 0,
@@ -206,7 +231,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             let events = crossterm_slice(nap)?;
             for event in events {
                 match event {
-                    TapEvent::Key(key) => match action_for(key, false) {
+                    TapEvent::Key(key) => match action_for(key, pause.is_some()) {
                         WatchAction::Abort => {
                             renderer.finish().context("restoring terminal")?;
                             return Err(AppError::Aborted);
@@ -232,7 +257,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             #[cfg(windows)]
                             let handed_off = true;
                             notice = if handed_off {
-                                page_frame(&full_lines, &mut renderer)
+                                page_frame(
+                                    pause.as_ref().map_or(&full_lines, |p| &p.frozen),
+                                    &mut renderer,
+                                )
                             } else {
                                 Some(
                                     "pager unavailable: the input reader did not yield; try again"
@@ -257,11 +285,56 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             previous_key = None;
                             break 'wait;
                         }
-                        // Not yet wired: scrollback, snapshots, and view
-                        // toggles land behind these.
-                        WatchAction::Scroll(_)
-                        | WatchAction::Snapshot
-                        | WatchAction::Resume
+                        WatchAction::Scroll(step) => {
+                            // A scroll while live freezes the frame first;
+                            // the copy never changes until resume, while
+                            // children keep ticking behind it. The repaint
+                            // happens here, in place — re-entering the tick
+                            // loop would re-run the child per keypress.
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            let window = usize::from(window_rows(args.max_height, size.1));
+                            let p = pause.get_or_insert_with(|| PauseState {
+                                frozen: full_lines.clone(),
+                                scroll: ScrollState::new(),
+                                content: hash,
+                                appearance: palette.appearance,
+                            });
+                            p.scroll = p.scroll.step(step, p.frozen.len(), window);
+                            previous_key = Some(PaintKey {
+                                content: p.content,
+                                cols: size.0,
+                                rows: size.1,
+                                appearance: p.appearance,
+                                offset: p.scroll.offset(),
+                                paused: true,
+                                wrap: true,
+                                hshift: 0,
+                            });
+                            paint_frame(
+                                &mut renderer,
+                                &p.frozen,
+                                p.scroll.offset(),
+                                true,
+                                ViewState {
+                                    wrap: true,
+                                    hshift: 0,
+                                },
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                            )?;
+                        }
+                        WatchAction::Resume => {
+                            // Fresh content wants a fresh tick: the same
+                            // self-heal the pager return uses.
+                            pause = None;
+                            previous_key = None;
+                            break 'wait;
+                        }
+                        // Not yet wired: snapshots and view toggles.
+                        WatchAction::Snapshot
                         | WatchAction::ToggleWrap
                         | WatchAction::ShiftLeft
                         | WatchAction::ShiftRight => {}
@@ -342,6 +415,17 @@ fn action_for(key: Key, paused: bool) -> WatchAction {
     }
 }
 
+/// A frozen frame and the window's place in it. The copy never changes
+/// while paused; children keep ticking into `full_lines` behind it, so
+/// resume repaints the newest content immediately. `content`/`appearance`
+/// hold the freeze-time values the repaint gate compares.
+struct PauseState {
+    frozen: Vec<String>,
+    scroll: ScrollState,
+    content: u64,
+    appearance: Appearance,
+}
+
 /// How long lines are shown: wrapped (today's path) or chopped, shifted
 /// `hshift` columns right. View state, not scrollback state: it survives
 /// freeze/resume and pager round-trips.
@@ -396,10 +480,11 @@ fn compose_frame(title: Option<&String>, output: &ChildOutput, join_stderr: bool
     lines
 }
 
-/// The single place a tty frame body is painted: truncate to the window,
-/// append the truncation notice and the one-shot notice row, draw.
+/// The single place a tty frame body is painted: truncate the window's
+/// slice, append the paused row or the truncation notice, then the
+/// one-shot notice row, draw.
 #[allow(clippy::too_many_arguments)]
-#[allow(unused_variables)] // offset/paused/view: the paused and chopped paint branches are not yet wired.
+#[allow(unused_variables)] // view: the chopped paint branch is not yet wired.
 fn paint_frame(
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
     lines: &[String],
@@ -414,13 +499,23 @@ fn paint_frame(
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
-    let (mut kept, hidden) = truncate_to_rows(lines.to_vec(), max_rows, cols);
-    if hidden > 0 {
-        kept.push(faint.render(
-            &format!("… {hidden} more lines · v views all · q quits"),
-            profile,
-        ));
-    }
+    let mut kept = if paused {
+        let start = offset.min(lines.len());
+        let (kept, _) = truncate_to_rows(lines[start..].to_vec(), max_rows, cols);
+        let shown = kept.len();
+        let mut kept = kept;
+        kept.push(faint.render(&paused_notice(offset, shown, lines.len()), profile));
+        kept
+    } else {
+        let (mut kept, hidden) = truncate_to_rows(lines.to_vec(), max_rows, cols);
+        if hidden > 0 {
+            kept.push(faint.render(
+                &format!("… {hidden} more lines · v views all · q quits"),
+                profile,
+            ));
+        }
+        kept
+    };
     if let Some(text) = notice {
         kept.push(faint.render(&text, profile));
     }
