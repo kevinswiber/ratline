@@ -125,6 +125,60 @@ pub fn prefix_rows(
         .collect()
 }
 
+/// Splice reverse video onto the changed character runs of one
+/// pre-rendered line: open `\x1b[7m`, close `\x1b[0m` plus a replay of
+/// the child's open SGR state, and re-assert the mark after any child
+/// escape inside a run — the mark PATCHES an attribute over the
+/// child's own styling, never replaces its colors. `cells` are char
+/// indices into the STRIPPED line, sorted and non-overlapping
+/// (`changed_marks` guarantees both). Empty `cells` returns the line
+/// unchanged.
+// Wired into the watch loop by the highlight toggle; the pure splice
+// and its tests land first.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn mark_cells(line: &str, cells: &[std::ops::Range<usize>]) -> String {
+    if cells.is_empty() {
+        return line.to_string();
+    }
+    let mut out = String::new();
+    let mut state = crate::core::measure::SgrState::default();
+    let mut inside = false;
+    let mut idx = 0usize; // char index in the stripped line
+    let mut next = 0usize; // cursor into cells
+    for chunk in crate::core::measure::chunks(line) {
+        match chunk {
+            crate::core::measure::Chunk::Escape(e) => {
+                state.apply(e);
+                out.push_str(e);
+                if inside {
+                    out.push_str("\x1b[7m");
+                }
+            }
+            crate::core::measure::Chunk::Text(t, _) => {
+                while next < cells.len() && cells[next].end <= idx {
+                    next += 1;
+                }
+                let marked = next < cells.len() && cells[next].contains(&idx);
+                if marked && !inside {
+                    out.push_str("\x1b[7m");
+                    inside = true;
+                } else if !marked && inside {
+                    out.push_str("\x1b[0m");
+                    out.push_str(&state.prefix());
+                    inside = false;
+                }
+                out.push_str(t);
+                idx += 1;
+            }
+        }
+    }
+    if inside {
+        out.push_str("\x1b[0m");
+        out.push_str(&state.prefix());
+    }
+    out
+}
+
 fn joined_stripped(lines: &[String]) -> String {
     lines
         .iter()
@@ -134,6 +188,9 @@ fn joined_stripped(lines: &[String]) -> String {
 }
 
 #[cfg(test)]
+// A one-range slice like `&[2..4]` is exactly what a single marked run
+// looks like — not a mistyped `(2..4).collect()`.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 
@@ -207,6 +264,82 @@ mod tests {
         assert_eq!(
             prefix_rows(rows, &line_marks(&[true]), 0, "M "),
             frame(&["M \x1b[31mred\x1b[0m"])
+        );
+    }
+
+    #[test]
+    fn empty_cells_return_the_line_unchanged() {
+        assert_eq!(mark_cells("abc", &[]), "abc");
+        assert_eq!(mark_cells("\x1b[31mabc\x1b[0m", &[]), "\x1b[31mabc\x1b[0m");
+    }
+
+    #[test]
+    fn a_run_is_wrapped_in_reverse_video() {
+        assert_eq!(mark_cells("abcdef", &[2..4]), "ab\x1b[7mcd\x1b[0mef");
+    }
+
+    #[test]
+    fn closing_a_run_replays_the_childs_open_state() {
+        // The child's red must survive past the mark (patch, don't
+        // replace): the close is reset + replay, so `ef` is red again,
+        // exactly as the child painted it.
+        assert_eq!(
+            mark_cells("\x1b[31mabcdef\x1b[0m", &[2..4]),
+            "\x1b[31mab\x1b[7mcd\x1b[0m\x1b[31mef\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn a_child_reset_inside_a_run_cannot_strip_the_mark() {
+        assert_eq!(
+            mark_cells("ab\x1b[0mcd", &[1..3]),
+            "a\x1b[7mb\x1b[0m\x1b[7mc\x1b[0md"
+        );
+    }
+
+    #[test]
+    fn a_run_reaching_the_line_end_reopens_the_childs_state() {
+        // The child left red open at line end; after the mark closes,
+        // the line must end in the same open state the raw line did.
+        assert_eq!(
+            mark_cells("\x1b[31mabc", &[2..3]),
+            "\x1b[31mab\x1b[7mc\x1b[0m\x1b[31m"
+        );
+    }
+
+    #[test]
+    fn cell_indices_are_chars_not_bytes_or_columns() {
+        // '日' is char index 1 — the same coordinate system
+        // changed_marks produces.
+        assert_eq!(mark_cells("a日b", &[1..2]), "a\x1b[7m日\x1b[0mb");
+    }
+
+    #[test]
+    fn a_shift_cut_through_a_marked_run_keeps_the_mark() {
+        // Composition with the chopped renderer (splice BEFORE chop):
+        // shift_chop's replay reopens the mark when the cut lands
+        // inside a run.
+        use crate::core::measure::shift_chop;
+        let spliced = mark_cells("abcdef", &[3..5]);
+        assert_eq!(spliced, "abc\x1b[7mde\x1b[0mf");
+        assert_eq!(shift_chop(&spliced, 4, 10), "\x1b[7me\x1b[0mf");
+    }
+
+    #[test]
+    fn splices_never_change_the_row_math() {
+        // Zero-width escapes leave rendered_rows untouched, so
+        // wrapped-mode highlights cannot shift row accounting.
+        use crate::term::inline::rendered_rows;
+        let long = "word ".repeat(40); // wraps at 80 cols
+        let spliced = mark_cells(&long, &[6..10, 96..104]);
+        assert_eq!(rendered_rows(&[spliced], 80), rendered_rows(&[long], 80));
+    }
+
+    #[test]
+    fn two_runs_are_marked_independently() {
+        assert_eq!(
+            mark_cells("abcd", &[1..2, 3..4]),
+            "a\x1b[7mb\x1b[0mc\x1b[7md\x1b[0m"
         );
     }
 
