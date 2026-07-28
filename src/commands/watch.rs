@@ -130,8 +130,16 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         }
         // While frozen the key holds the freeze-time content/appearance:
         // new child output and adopted palettes do not repaint, but
-        // scroll, resize, and the one-shot notice still do.
-        let key = paint_key(pause.as_ref(), hash, palette.appearance, size, view);
+        // scroll, resize, the aging paused row, and the one-shot notice
+        // still do.
+        let key = paint_key(
+            pause.as_ref(),
+            hash,
+            palette.appearance,
+            size,
+            view,
+            pause.as_ref().map_or(0, |p| age_seconds(p.viewed_at)),
+        );
         if previous_key != Some(key) || notice.is_some() {
             previous_key = Some(key);
             if is_tty {
@@ -187,6 +195,30 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             if !interactive {
                 std::thread::sleep(nap);
                 continue;
+            }
+            // While parked, the counting age advances once per second,
+            // riding this nap cycle — a long-interval dashboard must not
+            // wait a whole tick to admit how stale it is. The only
+            // visible delta is the status row, so the repaint is bounded
+            // to status-row bytes (and to none at all while the text
+            // holds).
+            if let Some(p) = pause.as_ref()
+                && previous_key.is_some_and(|k| k.age_secs != age_seconds(p.viewed_at))
+            {
+                previous_key = Some(repaint(
+                    &mut renderer,
+                    pause.as_ref(),
+                    &full_lines,
+                    hash,
+                    palette.appearance,
+                    view,
+                    None,
+                    crossterm::terminal::size().unwrap_or((80, 24)),
+                    args.max_height,
+                    &faint,
+                    profile,
+                    &since,
+                )?);
             }
             #[cfg(unix)]
             if let Some(sub) = theme_sub.as_mut() {
@@ -288,6 +320,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 scroll: ScrollState::new(),
                                 content: hash,
                                 appearance: palette.appearance,
+                                viewed_at: jiff::Timestamp::now(),
                             });
                             p.scroll = p.scroll.step(step, p.frozen.len(), window);
                             previous_key = Some(repaint(
@@ -452,6 +485,9 @@ struct PauseState {
     scroll: ScrollState,
     content: u64,
     appearance: Appearance,
+    /// When the viewed frame was current: freeze time for a plain pause.
+    /// The counting age on the paused row measures from here.
+    viewed_at: jiff::Timestamp,
 }
 
 /// How long lines are shown: wrapped (today's path) or chopped, shifted
@@ -477,6 +513,9 @@ struct PaintKey {
     paused: bool,
     wrap: bool,
     hshift: usize,
+    /// Whole seconds since the viewed frame was current; 0 while live.
+    /// Advancing once per second is what lets the paused age repaint.
+    age_secs: u64,
 }
 
 /// The one construction of the repaint gate's key: while paused it holds
@@ -488,10 +527,11 @@ fn paint_key(
     live_appearance: Appearance,
     size: (u16, u16),
     view: ViewState,
+    age_secs: u64,
 ) -> PaintKey {
-    let (content, appearance, offset, paused) = match pause {
-        Some(p) => (p.content, p.appearance, p.scroll.offset(), true),
-        None => (live_content, live_appearance, 0, false),
+    let (content, appearance, offset, paused, age_secs) = match pause {
+        Some(p) => (p.content, p.appearance, p.scroll.offset(), true, age_secs),
+        None => (live_content, live_appearance, 0, false, 0),
     };
     PaintKey {
         content,
@@ -502,6 +542,26 @@ fn paint_key(
         paused,
         wrap: view.wrap,
         hshift: view.hshift,
+        age_secs,
+    }
+}
+
+/// Whole seconds since `t`, clamped at zero.
+fn age_seconds(t: jiff::Timestamp) -> u64 {
+    (jiff::Timestamp::now().as_second() - t.as_second()).max(0) as u64
+}
+
+/// The paused row's counting age, pre-formatted: a short grace reads
+/// "just now" (which also keeps early repaints byte-identical), then the
+/// exact age counts second by second.
+fn age_text(age_secs: u64) -> String {
+    if age_secs < 10 {
+        "just now".to_string()
+    } else {
+        format!(
+            "{} ago",
+            crate::core::duration::format_long(age_secs as i64)
+        )
     }
 }
 
@@ -533,13 +593,16 @@ fn repaint(
     profile: ColorProfile,
     since: &str,
 ) -> anyhow::Result<PaintKey> {
-    let key = paint_key(pause, live_content, live_appearance, size, view);
+    let age_secs = pause.map_or(0, |p| age_seconds(p.viewed_at));
+    let key = paint_key(pause, live_content, live_appearance, size, view, age_secs);
     let (source, offset, paused) = match pause {
         Some(p) => (p.frozen.as_slice(), p.scroll.offset(), true),
         None => (full_lines, 0, false),
     };
+    let age = age_text(age_secs);
     paint_frame(
         renderer, source, offset, paused, view, notice, size, max_height, faint, profile, since,
+        &age,
     )?;
     Ok(key)
 }
@@ -589,6 +652,7 @@ fn paint_frame(
     faint: &StyleSpec,
     profile: ColorProfile,
     since: &str,
+    age: &str,
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
@@ -606,7 +670,10 @@ fn paint_frame(
         truncate_to_rows(lines[start..].to_vec(), max_rows, cols)
     };
     if paused {
-        kept.push(faint.render(&paused_notice(offset, kept.len(), lines.len()), profile));
+        kept.push(faint.render(
+            &paused_notice(age, offset, kept.len(), lines.len()),
+            profile,
+        ));
     } else {
         kept.push(faint.render(&live_notice(hidden, since), profile));
     }
@@ -966,7 +1033,8 @@ mod tests {
             wrap: true,
             hshift: 4,
         };
-        let live = paint_key(None, 42, Appearance::Dark, (80, 24), view);
+        // A live key never ages, whatever the caller computed.
+        let live = paint_key(None, 42, Appearance::Dark, (80, 24), view, 14);
         assert_eq!(
             live,
             PaintKey {
@@ -978,6 +1046,7 @@ mod tests {
                 paused: false,
                 wrap: true,
                 hshift: 4,
+                age_secs: 0,
             }
         );
         let scroll = ScrollState::new().step(ScrollStep::LineDown, 50, 10);
@@ -986,8 +1055,9 @@ mod tests {
             scroll,
             content: 7,
             appearance: Appearance::Light,
+            viewed_at: jiff::Timestamp::now(),
         };
-        let paused = paint_key(Some(&p), 42, Appearance::Dark, (80, 24), view);
+        let paused = paint_key(Some(&p), 42, Appearance::Dark, (80, 24), view, 14);
         assert_eq!(
             paused,
             PaintKey {
@@ -999,8 +1069,18 @@ mod tests {
                 paused: true,
                 wrap: true,
                 hshift: 4,
+                age_secs: 14,
             }
         );
+    }
+
+    #[test]
+    fn the_age_reads_just_now_then_counts() {
+        assert_eq!(age_text(0), "just now");
+        assert_eq!(age_text(9), "just now");
+        assert_eq!(age_text(10), "10s ago");
+        assert_eq!(age_text(14), "14s ago");
+        assert_eq!(age_text(75), "1m 15s ago");
     }
 
     #[test]

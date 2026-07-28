@@ -61,16 +61,20 @@ pub fn max_offset(total: usize, window: usize) -> usize {
     total.saturating_sub(window)
 }
 
-/// The row that replaces the truncation notice while frozen. `shown` is how
-/// many lines the paint actually kept.
-pub fn paused_notice(offset: usize, shown: usize, total: usize) -> String {
+/// The row that replaces the truncation notice while frozen. `age` is the
+/// pre-formatted time since the viewed frame was current ("just now",
+/// "14s ago"); `shown` is how many lines the paint actually kept.
+pub fn paused_notice(age: &str, offset: usize, shown: usize, total: usize) -> String {
     if total == 0 {
-        "paused · empty frame · Esc resumes".to_string()
+        format!("paused · {age} · empty frame · Esc resumes")
     } else if shown == 0 {
-        format!("paused · line {} of {total} · Esc resumes", offset + 1)
+        format!(
+            "paused · {age} · line {} of {total} · Esc resumes",
+            offset + 1
+        )
     } else {
         format!(
-            "paused · lines {}-{} of {total} · Esc resumes",
+            "paused · {age} · lines {}-{} of {total} · Esc resumes",
             offset + 1,
             offset + shown
         )
@@ -145,14 +149,22 @@ mod tests {
     #[test]
     fn the_paused_row_names_the_visible_range() {
         assert_eq!(
-            paused_notice(1, 22, 30),
-            "paused · lines 2-23 of 30 · Esc resumes"
+            paused_notice("just now", 1, 22, 30),
+            "paused · just now · lines 2-23 of 30 · Esc resumes"
         );
-        assert!(paused_notice(8, 22, 30).ends_with("lines 9-30 of 30 · Esc resumes"));
-        assert_eq!(paused_notice(0, 0, 0), "paused · empty frame · Esc resumes");
+        let aged = paused_notice("14s ago", 8, 22, 30);
+        assert!(aged.starts_with("paused · 14s ago · "), "got: {aged}");
+        assert!(
+            aged.ends_with("lines 9-30 of 30 · Esc resumes"),
+            "got: {aged}"
+        );
         assert_eq!(
-            paused_notice(5, 0, 30),
-            "paused · line 6 of 30 · Esc resumes"
+            paused_notice("just now", 0, 0, 0),
+            "paused · just now · empty frame · Esc resumes"
+        );
+        assert_eq!(
+            paused_notice("14s ago", 5, 0, 30),
+            "paused · 14s ago · line 6 of 30 · Esc resumes"
         );
     }
 }

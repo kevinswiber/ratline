@@ -332,30 +332,51 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
         wait_for(
             &session,
             &mut terminal,
-            b"paused \xc2\xb7",
+            "paused · just now ·".as_bytes(),
             Duration::from_secs(2)
         ),
         "expected the paused row after a navigation key"
     );
-    // Drain the paint that carried the paused row, then require silence:
-    // eight ticks of changing child output and not one byte painted.
-    let _ = session.read_available(Duration::from_millis(150));
-    let leaked = session.read_available(Duration::from_millis(400));
+    // Drain the freeze paint. While the age still reads "just now" the
+    // per-second status repaint is byte-identical, so the differ writes
+    // nothing: a parked frame is byte-silent through the plateau even
+    // though the child keeps changing behind it.
+    let _ = drain_for(&session, Duration::from_millis(300));
+    let leaked = session.read_available(Duration::from_millis(1500));
     assert!(
         leaked.is_empty(),
         "the tail kept painting while frozen: {:?}",
         String::from_utf8_lossy(&leaked)
     );
 
-    // Esc resumes: a fresh repaint arrives (the opener again).
+    // At ten seconds the age starts counting: a write must arrive from
+    // the wait loop — no tick ever repaints a frozen frame.
+    let mut seen = wait_for_bytes(&session, &mut terminal, b"s ago", Duration::from_secs(12))
+        .expect("expected the counting age to repaint the status row");
+    seen.extend(drain_for(&session, Duration::from_millis(1200)));
+    // Only the status row breathes: the age repaint must never rewrite
+    // frame content, whose timestamp carries a long digit run the status
+    // row cannot produce.
+    let longest_digit_run = seen
+        .iter()
+        .fold((0usize, 0usize), |(best, run), b| {
+            if b.is_ascii_digit() {
+                (best.max(run + 1), run + 1)
+            } else {
+                (best, 0)
+            }
+        })
+        .0;
+    assert!(
+        longest_digit_run < 6,
+        "frame content repainted while parked (digit run of {longest_digit_run})"
+    );
+
+    // Esc resumes: a live frame arrives, recognizable by its since row —
+    // the one needle a parked status repaint can never produce.
     session.write_bytes(b"\x1b");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            b"\x1b[?2026h",
-            Duration::from_secs(2)
-        ),
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
         "expected the live tail to repaint after Esc"
     );
     session.write_bytes(b"q");
@@ -439,7 +460,7 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
         wait_for(
             &session,
             &mut terminal,
-            "paused · lines 2-23 of 30 · Esc resumes".as_bytes(),
+            "paused · just now · lines 2-23 of 30 · Esc resumes".as_bytes(),
             Duration::from_secs(2)
         ),
         "expected the paused row one line down"
