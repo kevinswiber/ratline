@@ -123,6 +123,30 @@ mod tests {
     }
 
     #[test]
+    fn every_watch_binding_survives_the_crossterm_map() {
+        // The Windows input path: watch's navigation and view keys must
+        // arrive as the same Key variants the unix scanner produces.
+        for (code, key) in [
+            (KeyCode::Up, Key::Up),
+            (KeyCode::Down, Key::Down),
+            (KeyCode::Left, Key::Left),
+            (KeyCode::Right, Key::Right),
+            (KeyCode::Home, Key::Home),
+            (KeyCode::End, Key::End),
+            (KeyCode::PageUp, Key::PageUp),
+            (KeyCode::PageDown, Key::PageDown),
+            (KeyCode::Esc, Key::Esc),
+        ] {
+            assert_eq!(from_crossterm(press(code, KeyModifiers::NONE)), Some(key));
+        }
+        // The snapshot key arrives shifted.
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            Some(Key::Char('S'))
+        );
+    }
+
+    #[test]
     fn release_events_are_ignored() {
         let mut ev = press(KeyCode::Char('c'), KeyModifiers::NONE);
         ev.kind = KeyEventKind::Release;
