@@ -125,7 +125,6 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         highlight: false,
         alt_time: false,
     };
-    let mut notice: Option<String> = None;
     loop {
         // 1. Signals — checked every slice, child running or not.
         if interrupted.load(Ordering::Relaxed) {
@@ -228,7 +227,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     current.changed_at,
                 ),
             );
-            if previous_key != Some(key) || notice.is_some() {
+            if previous_key != Some(key) {
                 previous_key = Some(key);
                 if is_tty {
                     repaint(
@@ -238,7 +237,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                         &current,
                         &palette,
                         view,
-                        notice.take(),
+                        None,
                         size,
                         args.max_height,
                         &faint,
@@ -359,7 +358,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
                             #[cfg(windows)]
                             let handed_off = true;
-                            notice = if handed_off {
+                            let pager_notice = if handed_off {
                                 page_frame(
                                     pause.as_ref().map_or(&live.lines, |p| &p.frozen),
                                     &mut renderer,
@@ -384,9 +383,27 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 // state we stopped listening to.
                                 verify = VerifyState::default();
                             }
-                            // Repaint immediately with fresh data.
-                            previous_key = None;
-                            schedule.request_now();
+                            // Repaint immediately from the frame on hand:
+                            // the content is already current, and a forced
+                            // tick would stall the return by a whole child
+                            // runtime on a slow dashboard. The pager left the
+                            // diff invalidated, so this paints the full frame
+                            // over the restored copy.
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                pager_notice,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
                         }
                         WatchAction::Scroll(step) => {
                             let Some(live) = live.as_ref() else { continue };
@@ -431,19 +448,15 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                         }
                         WatchAction::Resume => {
                             let Some(live) = live.as_ref() else { continue };
-                            if pause.is_some() {
-                                // A pause shows genuinely stale content:
-                                // fresh content wants a fresh tick — the
-                                // same self-heal the pager return uses.
-                                pause = None;
-                                live_scroll = None;
-                                previous_key = None;
+                            // A pause shows genuinely stale content: ask for
+                            // a fresh tick — satisfied by an in-flight child
+                            // if one is running. EITHER way the collapse
+                            // paints NOW, from the frame on hand: the key
+                            // must visibly answer even while a slow child is
+                            // still running.
+                            if pause.take().is_some() {
                                 schedule.request_now();
-                                continue;
                             }
-                            // A live window's frame is already current:
-                            // collapse in place. Forcing a tick here
-                            // would only stall on a slow child.
                             live_scroll = None;
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
@@ -634,11 +647,30 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     if let Some(verdict) = verify.reply(kind, color)
                         && adopt(&mut palette, verdict)
                     {
-                        if std::env::var_os("RAT_DEBUG_APPEARANCE").is_some() {
-                            notice = Some(format!("appearance → {}", verdict.as_str()));
-                        }
-                        // Repaint at the fresh tick this requests.
+                        let debug_notice = std::env::var_os("RAT_DEBUG_APPEARANCE")
+                            .is_some()
+                            .then(|| format!("appearance → {}", verdict.as_str()));
+                        // Our own chrome flips at once; the fresh tick this
+                        // requests re-renders the child itself under the new
+                        // environment.
                         schedule.request_now();
+                        if let Some(live) = live.as_ref() {
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                debug_notice,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
                     }
                 }
                 // The theme events exist on Windows too; their unix

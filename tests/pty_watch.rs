@@ -894,10 +894,15 @@ fn resuming_from_a_live_window_does_not_rerun_the_child() {
     // forced fresh tick would block on the child and cost the whole
     // reload — the stall belongs to resume-from-Paused only, where the
     // content is genuinely stale.
-    let script = "/bin/sleep 2; i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!(
+        "echo x >> {count_path}; /bin/sleep 2; i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done"
+    );
     let session = PtySession::spawn(
         &rat_bin(),
-        &["watch", "-n", "10s", "--shell", "--", script],
+        &["watch", "-n", "10s", "--shell", "--", &script],
         &[],
     )
     .expect("spawn under a pty");
@@ -907,6 +912,11 @@ fn resuming_from_a_live_window_does_not_rerun_the_child() {
         wait_for(&session, &mut terminal, b"l1", Duration::from_secs(5)),
         "expected a first frame"
     );
+    let runs = std::fs::read_to_string(&count)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(runs, 1, "one child behind the first frame");
     session.write_bytes(b"j");
     assert!(
         wait_for_without(
@@ -928,6 +938,17 @@ fn resuming_from_a_live_window_does_not_rerun_the_child() {
             Duration::from_millis(1500)
         ),
         "expected Esc to collapse in place, well inside the child's 2s runtime"
+    );
+    // Child-side evidence, stronger than the timing above: a forced
+    // tick would have appended to the count within one loop turn.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    let runs = std::fs::read_to_string(&count)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(
+        runs, 1,
+        "resume from a live window must not re-run the child"
     );
 
     session.write_bytes(b"q");
@@ -1352,6 +1373,57 @@ fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
         ),
         "expected the post-pager repaint to climb over the restored frame"
     );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn a_pager_return_does_not_rerun_the_child() {
+    // Leaving the pager must repaint from the frame on hand, not by
+    // forcing a tick: on a slow dashboard a forced re-run would stall
+    // the return by a whole child runtime. The count file is
+    // child-side evidence — the child appends at the top of its
+    // script, so "a child ran" is observable without any drain.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!("echo x >> {count_path}; n=$(wc -l < {count_path}); printf 'v%06d\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "10s", "--shell", "--", &script],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v000001", Duration::from_secs(5)),
+        "expected the first frame"
+    );
+    let runs = std::fs::read_to_string(&count)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(runs, 1, "one child before paging");
+
+    session.write_bytes(b"v");
+    assert!(
+        wait_for(&session, &mut terminal, b"v000001", Duration::from_secs(3)),
+        "expected the frame back after the pager"
+    );
+    // A settle before reading child-side evidence, not a timing proof:
+    // a forced tick would have spawned within one loop turn of the
+    // pager's return.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    let runs = std::fs::read_to_string(&count)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(runs, 1, "the pager round-trip must not re-run the child");
+
     session.write_bytes(b"q");
     assert!(
         !session.kill_if_alive(Duration::from_secs(2)),
