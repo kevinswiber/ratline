@@ -8,9 +8,11 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
+use crate::core::child::{TickOutcome, run_tick};
 use crate::core::duration::parse_interval;
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
+use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
@@ -28,6 +30,22 @@ use crate::term::theme_notify::{OscColorKind, ThemeNotifyGuard, classify_colors,
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
 use crate::theme::{Appearance, AppearanceSource, Palette};
 use crate::ui::key::{Key, from_crossterm};
+
+/// The longest the loop sleeps before it re-checks signals, the
+/// channel, and the schedule — one wait slice.
+const SLICE: Duration = Duration::from_millis(50);
+
+/// The newest composed frame and everything derived from it. Absent
+/// until the first child completes: the loop is live during that first
+/// run (q quits, keys dispatch), but there is nothing to paint yet.
+struct Live {
+    lines: Vec<String>,
+    hash: u64,
+    /// When the content last CHANGED, not when it was last produced.
+    changed_at: jiff::Timestamp,
+    /// `changed_at` as local HH:MM:SS, formatted once per change.
+    since: String,
+}
 
 // The palette follows the terminal only where the reader can see its
 // reports; elsewhere it stays the startup verdict for the whole run.
@@ -93,15 +111,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         ..StyleSpec::default()
     };
 
+    let mut schedule = TickSchedule::new(interval);
+    let (tx, rx) = std::sync::mpsc::channel::<TickOutcome>();
     let mut previous_key: Option<PaintKey> = None;
-    let mut full_lines: Vec<String> = Vec::new();
-    // The live status row names the ABSOLUTE local time of the last
-    // content change: a counting age would change every tick and defeat
-    // the repaint gate. Tracked against the tick hash, independent of
-    // whether the gate repaints.
-    let mut last_hash: Option<u64> = None;
-    let mut since = String::new();
-    let mut changed_at = jiff::Timestamp::now();
+    let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
     let mut history = History::new();
@@ -114,135 +127,167 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     };
     let mut notice: Option<String> = None;
     loop {
-        let output = run_child(&args, interactive, palette.appearance)?;
-        let mut combined = output.stdout.clone();
-        combined.extend_from_slice(&output.stderr);
-        let hash = signature(&combined);
-        // One clock read per tick: the absolute stamp, the counting
-        // form, and the history entry a scrub later shows all name the
-        // same instant.
-        let now = jiff::Timestamp::now();
-        if last_hash != Some(hash) {
-            last_hash = Some(hash);
-            changed_at = now;
-            since = local_hms(now);
+        // 1. Signals — checked every slice, child running or not.
+        if interrupted.load(Ordering::Relaxed) {
+            renderer.finish().context("restoring terminal")?;
+            return Err(AppError::Aborted);
         }
-        // The terminal size joins the change key: a resize must repaint
-        // even when the content is unchanged. So does the appearance: a
-        // palette swap must repaint even when the child prints the same
-        // bytes.
-        let size = crossterm::terminal::size().unwrap_or((80, 24));
-        // Composed above the repaint gate: `full_lines` tracks the latest
-        // frame every tick, so paging always acts on the newest content.
-        let lines = compose_frame(title_line.as_ref(), &output, is_tty);
-        if is_tty {
-            full_lines.clone_from(&lines);
-            // Every distinct frame is retained (byte-capped, deduped) so
-            // the scrub keys can walk back through it.
-            history.record(hash, &lines, now);
+        if terminated.load(Ordering::Relaxed) {
+            renderer.finish().context("restoring terminal")?;
+            return Ok(());
         }
-        // A resize while frozen must not leave the window past the frame.
-        if let Some(p) = pause.as_mut() {
-            let window = usize::from(window_rows(args.max_height, size.1));
-            p.scroll = p.scroll.clamp(p.frozen.len(), window);
+        // 2. Start a child if one is due. At most one is ever in
+        // flight, and its environment is measured HERE, at the spawn
+        // instant, on this thread.
+        if schedule.poll(Instant::now()) == Due::Spawn {
+            let size = crossterm::terminal::size().unwrap_or((80, 24));
+            let command = build_command(&args, interactive, palette.appearance, size);
+            let _ = tx.send(run_tick(command));
         }
-        // A live window rides the tail whatever shape the frame takes:
-        // a pinned window tracks the end, an unpinned one holds its
-        // offset clamped into the new shape, and reaching the top
-        // collapses to the live view. Freezing is never implicit — the
-        // history ring holds any moment that slides away.
-        if let Some(ls) = live_scroll {
-            let window = usize::from(window_rows(args.max_height, size.1));
-            let re = ls.reanchor(full_lines.len(), window);
-            live_scroll = (!re.at_top()).then_some(re);
-        }
-        // While frozen the key holds the freeze-time content/appearance:
-        // new child output and adopted palettes do not repaint, but
-        // scroll, resize, the aging paused row, and the one-shot notice
-        // still do.
-        let key = paint_key(
-            pause.as_ref(),
-            live_scroll,
-            hash,
-            palette.appearance,
-            size,
-            view,
-            displayed_age(pause.as_ref(), live_scroll, view.alt_time, changed_at),
-        );
-        if previous_key != Some(key) || notice.is_some() {
-            previous_key = Some(key);
+        // 3. Collect a finished tick — at most one can be queued.
+        if let Ok(outcome) = rx.try_recv() {
+            let (stdout, stderr) = match outcome.spawn_error {
+                // Once mode fails loudly, before any paint; loop mode
+                // renders the failure as content so a transient error
+                // does not tear down the dashboard.
+                Some(err) if args.once => {
+                    return Err(anyhow!("running {:?}: {err}", args.command[0]).into());
+                }
+                Some(err) => (
+                    format!("watch: {:?}: {err}", args.command[0]).into_bytes(),
+                    Vec::new(),
+                ),
+                None => (outcome.stdout, outcome.stderr),
+            };
+            let mut combined = stdout.clone();
+            combined.extend_from_slice(&stderr);
+            let hash = signature(&combined);
+            // One clock per tick, stamped at COMPLETION on the worker:
+            // the absolute stamp, the counting form, and the history
+            // entry a scrub later shows all name the instant the
+            // content became current — even when the completion waited
+            // (behind a pager, say) to be collected.
+            let now = outcome.at;
+            // The live status row names the ABSOLUTE local time of the
+            // last content change: a counting age would change every
+            // tick and defeat the repaint gate. Tracked against the
+            // tick hash, independent of whether the gate repaints.
+            let (changed_at, since) = match live.take() {
+                Some(prev) if prev.hash == hash => (prev.changed_at, prev.since),
+                _ => (now, local_hms(now)),
+            };
+            // The terminal size joins the change key: a resize must
+            // repaint even when the content is unchanged. So does the
+            // appearance: a palette swap must repaint even when the
+            // child prints the same bytes.
+            let size = crossterm::terminal::size().unwrap_or((80, 24));
+            // Composed above the repaint gate: the newest frame is
+            // tracked on every completion, so paging always acts on
+            // the newest content.
+            let current = Live {
+                lines: compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty),
+                hash,
+                changed_at,
+                since,
+            };
             if is_tty {
-                repaint(
-                    &mut renderer,
+                // Every distinct frame is retained (byte-capped,
+                // deduped) so the scrub keys can walk back through it.
+                history.record(hash, &current.lines, now);
+            }
+            // A resize while frozen must not leave the window past the frame.
+            if let Some(p) = pause.as_mut() {
+                let window = usize::from(window_rows(args.max_height, size.1));
+                p.scroll = p.scroll.clamp(p.frozen.len(), window);
+            }
+            // A live window rides the tail whatever shape the frame takes:
+            // a pinned window tracks the end, an unpinned one holds its
+            // offset clamped into the new shape, and reaching the top
+            // collapses to the live view. Freezing is never implicit — the
+            // history ring holds any moment that slides away.
+            if let Some(ls) = live_scroll {
+                let window = usize::from(window_rows(args.max_height, size.1));
+                let re = ls.reanchor(current.lines.len(), window);
+                live_scroll = (!re.at_top()).then_some(re);
+            }
+            // While frozen the key holds the freeze-time content/appearance:
+            // new child output and adopted palettes do not repaint, but
+            // scroll, resize, the aging paused row, and the one-shot notice
+            // still do.
+            let key = paint_key(
+                pause.as_ref(),
+                live_scroll,
+                current.hash,
+                palette.appearance,
+                size,
+                view,
+                displayed_age(
                     pause.as_ref(),
                     live_scroll,
-                    &full_lines,
-                    hash,
-                    &palette,
-                    view,
-                    notice.take(),
-                    size,
-                    args.max_height,
-                    &faint,
-                    profile,
-                    &since,
-                    changed_at,
-                    &history,
-                )?;
-            } else {
-                let mut out = std::io::stdout().lock();
-                for line in &lines {
-                    writeln!(out, "{line}").context("writing")?;
+                    view.alt_time,
+                    current.changed_at,
+                ),
+            );
+            if previous_key != Some(key) || notice.is_some() {
+                previous_key = Some(key);
+                if is_tty {
+                    repaint(
+                        &mut renderer,
+                        pause.as_ref(),
+                        live_scroll,
+                        &current,
+                        &palette,
+                        view,
+                        notice.take(),
+                        size,
+                        args.max_height,
+                        &faint,
+                        profile,
+                        &history,
+                    )?;
+                } else {
+                    let mut out = std::io::stdout().lock();
+                    for line in &current.lines {
+                        writeln!(out, "{line}").context("writing")?;
+                    }
+                    out.flush().context("flushing")?;
+                    // Piped mode keeps the streams separate for log readability.
+                    if !stderr.is_empty() {
+                        let mut err = std::io::stderr().lock();
+                        err.write_all(&stderr).context("writing stderr")?;
+                        err.flush().context("flushing stderr")?;
+                    }
                 }
-                out.flush().context("flushing")?;
-                // Piped mode keeps the streams separate for log readability.
-                if !output.stderr.is_empty() {
-                    let mut err = std::io::stderr().lock();
-                    err.write_all(&output.stderr).context("writing stderr")?;
-                    err.flush().context("flushing stderr")?;
-                }
             }
-        }
-
-        if args.once {
-            break;
-        }
-        // Wait for the next tick in slices, watching signals and (on a tty)
-        // the keyboard.
-        let deadline = Instant::now() + interval;
-        'wait: loop {
-            if interrupted.load(Ordering::Relaxed) {
-                renderer.finish().context("restoring terminal")?;
-                return Err(AppError::Aborted);
-            }
-            if terminated.load(Ordering::Relaxed) {
-                renderer.finish().context("restoring terminal")?;
-                return Ok(());
-            }
-            let now = Instant::now();
-            if now >= deadline {
+            live = Some(current);
+            if args.once {
                 break;
             }
-            let nap = (deadline - now).min(Duration::from_millis(50));
-            if !interactive {
-                std::thread::sleep(nap);
-                continue;
-            }
-            // Wherever the displayed row counts — the paused row by
-            // default, the live row when flipped — the age advances once
-            // per second, riding this nap cycle: a long-interval
-            // dashboard must not wait a whole tick to admit how stale it
-            // is. The only visible delta is the status row, so the
-            // repaint is bounded to status-row bytes (and to none at all
-            // while the text holds).
-            let want_age = displayed_age(pause.as_ref(), live_scroll, view.alt_time, changed_at);
-            if previous_key.is_some_and(|k| k.age_secs != want_age) {
+            schedule.completed(Instant::now());
+        }
+        // 4. How long we may sleep: never past the next spawn, never
+        // past one slice, so a signal, a key, and a completing child
+        // are all noticed promptly.
+        let nap = schedule.nap(Instant::now(), SLICE);
+        if !interactive {
+            std::thread::sleep(nap);
+            continue;
+        }
+        // 5. Wherever the displayed row counts — the paused row by
+        // default, the live row when flipped — the age advances once
+        // per second, riding this nap cycle: a long-interval dashboard
+        // must not wait a whole tick to admit how stale it is. The
+        // only visible delta is the status row, so the repaint is
+        // bounded to status-row bytes (and to none at all while the
+        // text holds).
+        if let (Some(prev), Some(l)) = (previous_key, live.as_ref()) {
+            let want_age = displayed_age(pause.as_ref(), live_scroll, view.alt_time, l.changed_at);
+            if prev.age_secs != want_age {
                 previous_key = Some(repaint(
                     &mut renderer,
                     pause.as_ref(),
                     live_scroll,
-                    &full_lines,
-                    hash,
+                    l,
                     &palette,
                     view,
                     None,
@@ -250,369 +295,357 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     args.max_height,
                     &faint,
                     profile,
-                    &since,
-                    changed_at,
                     &history,
                 )?);
             }
-            #[cfg(unix)]
-            if let Some(sub) = theme_sub.as_mut() {
-                if verify.pending && verify.in_flight_until.is_none() {
-                    verify.pending = false;
-                    // Ask once, and only while we own the input: the
-                    // replies land in our own reader and nowhere else.
-                    if sub.request_colors().is_ok() {
-                        verify.fg = None;
-                        verify.in_flight_until = Some(Instant::now() + crate::theme::PROBE_TIMEOUT);
-                    }
-                }
-                if verify
-                    .in_flight_until
-                    .is_some_and(|until| Instant::now() >= until)
-                {
-                    // The terminal did not answer. A later report can arm
-                    // another exchange.
-                    verify.in_flight_until = None;
+        }
+        #[cfg(unix)]
+        if let Some(sub) = theme_sub.as_mut() {
+            if verify.pending && verify.in_flight_until.is_none() {
+                verify.pending = false;
+                // Ask once, and only while we own the input: the
+                // replies land in our own reader and nowhere else.
+                if sub.request_colors().is_ok() {
                     verify.fg = None;
+                    verify.in_flight_until = Some(Instant::now() + crate::theme::PROBE_TIMEOUT);
                 }
             }
-            #[cfg(unix)]
-            let events = match tap.as_ref() {
-                Some(tap) => match tap.recv_timeout(nap) {
-                    Some(chunk) => scanner.feed(&chunk),
-                    None => scanner.idle(nap),
-                },
-                None => crossterm_slice(nap)?,
-            };
-            #[cfg(windows)]
-            let events = crossterm_slice(nap)?;
-            for event in events {
-                match event {
-                    TapEvent::Key(key) => {
-                        match action_for(key, mode_of(pause.as_ref(), live_scroll)) {
-                            WatchAction::Abort => {
-                                renderer.finish().context("restoring terminal")?;
-                                return Err(AppError::Aborted);
+            if verify
+                .in_flight_until
+                .is_some_and(|until| Instant::now() >= until)
+            {
+                // The terminal did not answer. A later report can arm
+                // another exchange.
+                verify.in_flight_until = None;
+                verify.fg = None;
+            }
+        }
+        #[cfg(unix)]
+        let events = match tap.as_ref() {
+            Some(tap) => match tap.recv_timeout(nap) {
+                Some(chunk) => scanner.feed(&chunk),
+                None => scanner.idle(nap),
+            },
+            None => crossterm_slice(nap)?,
+        };
+        #[cfg(windows)]
+        let events = crossterm_slice(nap)?;
+        for event in events {
+            match event {
+                TapEvent::Key(key) => {
+                    match action_for(key, mode_of(pause.as_ref(), live_scroll)) {
+                        WatchAction::Abort => {
+                            renderer.finish().context("restoring terminal")?;
+                            return Err(AppError::Aborted);
+                        }
+                        WatchAction::Quit => {
+                            renderer.finish().context("restoring terminal")?;
+                            return Ok(());
+                        }
+                        WatchAction::Page => {
+                            let Some(live) = live.as_ref() else { continue };
+                            // The pager reads the same terminal. Stop the
+                            // pushes first, then park our reader, so a report
+                            // can never land in a foreign reader's input.
+                            #[cfg(unix)]
+                            if let Some(sub) = theme_sub.as_mut() {
+                                let _ = sub.suspend();
                             }
-                            WatchAction::Quit => {
-                                renderer.finish().context("restoring terminal")?;
-                                return Ok(());
-                            }
-                            WatchAction::Page => {
-                                // The pager reads the same terminal. Stop the
-                                // pushes first, then park our reader, so a report
-                                // can never land in a foreign reader's input.
-                                #[cfg(unix)]
-                                if let Some(sub) = theme_sub.as_mut() {
-                                    let _ = sub.suspend();
-                                }
-                                // Park our reader and require its confirmation
-                                // before handing the input stream over.
-                                // Unconfirmed means a reader may still be attached
-                                // — never spawn a second one against it.
-                                #[cfg(unix)]
-                                let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
-                                #[cfg(windows)]
-                                let handed_off = true;
-                                notice = if handed_off {
-                                    page_frame(
-                                        pause.as_ref().map_or(&full_lines, |p| &p.frozen),
-                                        &mut renderer,
-                                    )
-                                } else {
-                                    Some(
+                            // Park our reader and require its confirmation
+                            // before handing the input stream over.
+                            // Unconfirmed means a reader may still be attached
+                            // — never spawn a second one against it.
+                            #[cfg(unix)]
+                            let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
+                            #[cfg(windows)]
+                            let handed_off = true;
+                            notice = if handed_off {
+                                page_frame(
+                                    pause.as_ref().map_or(&live.lines, |p| &p.frozen),
+                                    &mut renderer,
+                                )
+                            } else {
+                                Some(
                                     "pager unavailable: the input reader did not yield; try again"
                                         .to_string(),
                                 )
-                                };
-                                // Reader first, then pushes: a report always has
-                                // someone to read it.
-                                #[cfg(unix)]
-                                {
-                                    if let Some(tap) = tap.as_ref() {
-                                        tap.resume();
-                                    }
-                                    if let Some(sub) = theme_sub.as_mut() {
-                                        let _ = sub.resume();
-                                    }
-                                    // Whatever was in flight belongs to a terminal
-                                    // state we stopped listening to.
-                                    verify = VerifyState::default();
+                            };
+                            // Reader first, then pushes: a report always has
+                            // someone to read it.
+                            #[cfg(unix)]
+                            {
+                                if let Some(tap) = tap.as_ref() {
+                                    tap.resume();
                                 }
-                                // Repaint immediately with fresh data.
+                                if let Some(sub) = theme_sub.as_mut() {
+                                    let _ = sub.resume();
+                                }
+                                // Whatever was in flight belongs to a terminal
+                                // state we stopped listening to.
+                                verify = VerifyState::default();
+                            }
+                            // Repaint immediately with fresh data.
+                            previous_key = None;
+                            schedule.request_now();
+                        }
+                        WatchAction::Scroll(step) => {
+                            let Some(live) = live.as_ref() else { continue };
+                            // The repaint happens here, in place —
+                            // re-entering the tick loop would re-run the
+                            // child per keypress. A frozen window scrolls
+                            // its copy; otherwise scrolling is always a
+                            // live viewport — freezing is explicit (p or
+                            // <), never a side effect of navigation.
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            let window = usize::from(window_rows(args.max_height, size.1));
+                            if let Some(p) = pause.as_mut() {
+                                p.scroll = p.scroll.step(step, p.frozen.len(), window);
+                            } else if let Some(ls) = live_scroll {
+                                let stepped = ls.step(step, live.lines.len(), window);
+                                live_scroll = (!stepped.at_top()).then_some(stepped);
+                            } else {
+                                let ls = LiveScroll::start(step, live.lines.len(), window);
+                                if ls.at_top() {
+                                    // A top-reaching entry never enters
+                                    // the mode — including any scroll
+                                    // over a frame that fits the window:
+                                    // stay Live, nothing to paint.
+                                    continue;
+                                }
+                                live_scroll = Some(ls);
+                            }
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
+                        WatchAction::Resume => {
+                            let Some(live) = live.as_ref() else { continue };
+                            if pause.is_some() {
+                                // A pause shows genuinely stale content:
+                                // fresh content wants a fresh tick — the
+                                // same self-heal the pager return uses.
+                                pause = None;
+                                live_scroll = None;
                                 previous_key = None;
-                                break 'wait;
+                                schedule.request_now();
+                                continue;
                             }
-                            WatchAction::Scroll(step) => {
-                                // The repaint happens here, in place —
-                                // re-entering the tick loop would re-run the
-                                // child per keypress. A frozen window scrolls
-                                // its copy; otherwise scrolling is always a
-                                // live viewport — freezing is explicit (p or
-                                // <), never a side effect of navigation.
-                                let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                let window = usize::from(window_rows(args.max_height, size.1));
-                                if let Some(p) = pause.as_mut() {
-                                    p.scroll = p.scroll.step(step, p.frozen.len(), window);
-                                } else if let Some(ls) = live_scroll {
-                                    let stepped = ls.step(step, full_lines.len(), window);
-                                    live_scroll = (!stepped.at_top()).then_some(stepped);
-                                } else {
-                                    let ls = LiveScroll::start(step, full_lines.len(), window);
-                                    if ls.at_top() {
-                                        // A top-reaching entry never enters
-                                        // the mode — including any scroll
-                                        // over a frame that fits the window:
-                                        // stay Live, nothing to paint.
-                                        continue;
-                                    }
-                                    live_scroll = Some(ls);
-                                }
-                                previous_key = Some(repaint(
-                                    &mut renderer,
-                                    pause.as_ref(),
-                                    live_scroll,
-                                    &full_lines,
-                                    hash,
-                                    &palette,
-                                    view,
-                                    None,
-                                    size,
-                                    args.max_height,
-                                    &faint,
-                                    profile,
-                                    &since,
-                                    changed_at,
-                                    &history,
-                                )?);
-                            }
-                            WatchAction::Resume => {
-                                if pause.is_some() {
-                                    // A pause shows genuinely stale content:
-                                    // fresh content wants a fresh tick — the
-                                    // same self-heal the pager return uses.
-                                    pause = None;
-                                    live_scroll = None;
-                                    previous_key = None;
-                                    break 'wait;
-                                }
-                                // A live window's frame is already current:
-                                // collapse in place. Forcing a tick here
-                                // would only stall on a slow child.
-                                live_scroll = None;
-                                let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                previous_key = Some(repaint(
-                                    &mut renderer,
-                                    pause.as_ref(),
-                                    live_scroll,
-                                    &full_lines,
-                                    hash,
-                                    &palette,
-                                    view,
-                                    None,
-                                    size,
-                                    args.max_height,
-                                    &faint,
-                                    profile,
-                                    &since,
-                                    changed_at,
-                                    &history,
-                                )?);
-                            }
-                            WatchAction::Freeze => {
-                                // A deliberate park: read a changing value in
-                                // place. From a live window it freezes at the
-                                // current offset; from the live view at zero.
-                                let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                let window = usize::from(window_rows(args.max_height, size.1));
-                                let offset = live_scroll.map_or(0, LiveScroll::offset);
-                                pause.get_or_insert_with(|| PauseState {
-                                    frozen: full_lines.clone(),
-                                    scroll: ScrollState::at(offset).clamp(full_lines.len(), window),
-                                    content: hash,
-                                    appearance: palette.appearance,
-                                    viewed_at: jiff::Timestamp::now(),
-                                    history_seq: history.newest_seq(),
-                                });
-                                live_scroll = None;
-                                previous_key = Some(repaint(
-                                    &mut renderer,
-                                    pause.as_ref(),
-                                    live_scroll,
-                                    &full_lines,
-                                    hash,
-                                    &palette,
-                                    view,
-                                    None,
-                                    size,
-                                    args.max_height,
-                                    &faint,
-                                    profile,
-                                    &since,
-                                    changed_at,
-                                    &history,
-                                )?);
-                            }
-                            action @ (WatchAction::ScrubBack | WatchAction::ScrubForward) => {
-                                // A scrub is a pause with a cursor: park on
-                                // a neighboring DISTINCT frame. The anchor
-                                // is what the eye is on — the pause's entry
-                                // (re-resolved through `nearest` if
-                                // evicted), else the newest — so `<` always
-                                // means "older than what I am looking at".
-                                let anchor = pause
-                                    .as_ref()
-                                    .and_then(|p| p.history_seq)
-                                    .and_then(|seq| history.nearest(seq).map(|e| e.seq))
-                                    .or_else(|| history.newest_seq());
-                                let Some(anchor) = anchor else { continue };
-                                let entry = if action == WatchAction::ScrubBack {
-                                    history.prev(anchor)
-                                } else {
-                                    // At the newest entry this is a no-op,
-                                    // not a resume: > is a step, not a
-                                    // homing key.
-                                    history.next(anchor)
-                                };
-                                let Some(entry) = entry else { continue };
-                                let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                let window = usize::from(window_rows(args.max_height, size.1));
-                                // The scroll position is held across steps
-                                // — a watched line stays under the eye.
-                                let scroll = pause
-                                    .as_ref()
-                                    .map(|p| p.scroll)
-                                    .or_else(|| live_scroll.map(|ls| ScrollState::at(ls.offset())))
-                                    .unwrap_or_default();
-                                pause = Some(PauseState {
-                                    frozen: entry.frame.clone(),
-                                    scroll: scroll.clamp(entry.frame.len(), window),
-                                    content: entry.sig,
-                                    appearance: pause
-                                        .as_ref()
-                                        .map_or(palette.appearance, |p| p.appearance),
-                                    viewed_at: entry.at,
-                                    history_seq: Some(entry.seq),
-                                });
-                                live_scroll = None;
-                                previous_key = Some(repaint(
-                                    &mut renderer,
-                                    pause.as_ref(),
-                                    live_scroll,
-                                    &full_lines,
-                                    hash,
-                                    &palette,
-                                    view,
-                                    None,
-                                    size,
-                                    args.max_height,
-                                    &faint,
-                                    profile,
-                                    &since,
-                                    changed_at,
-                                    &history,
-                                )?);
-                            }
-                            action @ (WatchAction::ToggleWrap
-                            | WatchAction::ShiftLeft
-                            | WatchAction::ShiftRight
-                            | WatchAction::ToggleGutter
-                            | WatchAction::ToggleHighlight
-                            | WatchAction::ToggleTime) => {
-                                // View state, not scrollback state: applies to
-                                // live and frozen frames alike, never freezes
-                                // the tail, repaints in place. Right shift is
-                                // unclamped, like less; left clamps at zero.
-                                match action {
-                                    WatchAction::ToggleWrap => view.wrap = !view.wrap,
-                                    WatchAction::ToggleGutter => view.gutter = !view.gutter,
-                                    WatchAction::ToggleHighlight => {
-                                        view.highlight = !view.highlight;
-                                    }
-                                    WatchAction::ToggleTime => {
-                                        view.alt_time = !view.alt_time;
-                                    }
-                                    WatchAction::ShiftLeft => {
-                                        view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
-                                    }
-                                    _ => view.hshift += HSHIFT_STEP,
-                                }
-                                let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                previous_key = Some(repaint(
-                                    &mut renderer,
-                                    pause.as_ref(),
-                                    live_scroll,
-                                    &full_lines,
-                                    hash,
-                                    &palette,
-                                    view,
-                                    None,
-                                    size,
-                                    args.max_height,
-                                    &faint,
-                                    profile,
-                                    &since,
-                                    changed_at,
-                                    &history,
-                                )?);
-                            }
-                            WatchAction::Snapshot => {
-                                // The frozen frame when paused, the newest one
-                                // when live; the path (or failure) surfaces
-                                // through the notice row of an in-place paint.
-                                let text = snapshot_frame(
-                                    pause.as_ref().map_or(&full_lines, |p| &p.frozen),
-                                    &args,
-                                );
-                                let size = crossterm::terminal::size().unwrap_or((80, 24));
-                                previous_key = Some(repaint(
-                                    &mut renderer,
-                                    pause.as_ref(),
-                                    live_scroll,
-                                    &full_lines,
-                                    hash,
-                                    &palette,
-                                    view,
-                                    Some(text),
-                                    size,
-                                    args.max_height,
-                                    &faint,
-                                    profile,
-                                    &since,
-                                    changed_at,
-                                    &history,
-                                )?);
-                            }
-                            WatchAction::Ignore => {}
+                            // A live window's frame is already current:
+                            // collapse in place. Forcing a tick here
+                            // would only stall on a slow child.
+                            live_scroll = None;
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
                         }
-                    }
-                    // The reported value is ignored on purpose: it can
-                    // disagree with the colors actually on screen. Every
-                    // report re-arms, including one that arrives while an
-                    // exchange is already out — a terminal's first report
-                    // of a change can be measured too early.
-                    #[cfg(unix)]
-                    TapEvent::ThemeNotification(_) => {
-                        verify.pending = true;
-                    }
-                    #[cfg(unix)]
-                    TapEvent::OscColor(kind, color) => {
-                        if let Some(verdict) = verify.reply(kind, color)
-                            && adopt(&mut palette, verdict)
-                        {
-                            if std::env::var_os("RAT_DEBUG_APPEARANCE").is_some() {
-                                notice = Some(format!("appearance → {}", verdict.as_str()));
-                            }
-                            // Repaint now rather than at the next tick.
-                            break 'wait;
+                        WatchAction::Freeze => {
+                            let Some(live) = live.as_ref() else { continue };
+                            // A deliberate park: read a changing value in
+                            // place. From a live window it freezes at the
+                            // current offset; from the live view at zero.
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            let window = usize::from(window_rows(args.max_height, size.1));
+                            let offset = live_scroll.map_or(0, LiveScroll::offset);
+                            pause.get_or_insert_with(|| PauseState {
+                                frozen: live.lines.clone(),
+                                scroll: ScrollState::at(offset).clamp(live.lines.len(), window),
+                                content: live.hash,
+                                appearance: palette.appearance,
+                                viewed_at: jiff::Timestamp::now(),
+                                history_seq: history.newest_seq(),
+                            });
+                            live_scroll = None;
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
                         }
+                        action @ (WatchAction::ScrubBack | WatchAction::ScrubForward) => {
+                            let Some(live) = live.as_ref() else { continue };
+                            // A scrub is a pause with a cursor: park on
+                            // a neighboring DISTINCT frame. The anchor
+                            // is what the eye is on — the pause's entry
+                            // (re-resolved through `nearest` if
+                            // evicted), else the newest — so `<` always
+                            // means "older than what I am looking at".
+                            let anchor = pause
+                                .as_ref()
+                                .and_then(|p| p.history_seq)
+                                .and_then(|seq| history.nearest(seq).map(|e| e.seq))
+                                .or_else(|| history.newest_seq());
+                            let Some(anchor) = anchor else { continue };
+                            let entry = if action == WatchAction::ScrubBack {
+                                history.prev(anchor)
+                            } else {
+                                // At the newest entry this is a no-op,
+                                // not a resume: > is a step, not a
+                                // homing key.
+                                history.next(anchor)
+                            };
+                            let Some(entry) = entry else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            let window = usize::from(window_rows(args.max_height, size.1));
+                            // The scroll position is held across steps
+                            // — a watched line stays under the eye.
+                            let scroll = pause
+                                .as_ref()
+                                .map(|p| p.scroll)
+                                .or_else(|| live_scroll.map(|ls| ScrollState::at(ls.offset())))
+                                .unwrap_or_default();
+                            pause = Some(PauseState {
+                                frozen: entry.frame.clone(),
+                                scroll: scroll.clamp(entry.frame.len(), window),
+                                content: entry.sig,
+                                appearance: pause
+                                    .as_ref()
+                                    .map_or(palette.appearance, |p| p.appearance),
+                                viewed_at: entry.at,
+                                history_seq: Some(entry.seq),
+                            });
+                            live_scroll = None;
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
+                        action @ (WatchAction::ToggleWrap
+                        | WatchAction::ShiftLeft
+                        | WatchAction::ShiftRight
+                        | WatchAction::ToggleGutter
+                        | WatchAction::ToggleHighlight
+                        | WatchAction::ToggleTime) => {
+                            let Some(live) = live.as_ref() else { continue };
+                            // View state, not scrollback state: applies to
+                            // live and frozen frames alike, never freezes
+                            // the tail, repaints in place. Right shift is
+                            // unclamped, like less; left clamps at zero.
+                            match action {
+                                WatchAction::ToggleWrap => view.wrap = !view.wrap,
+                                WatchAction::ToggleGutter => view.gutter = !view.gutter,
+                                WatchAction::ToggleHighlight => {
+                                    view.highlight = !view.highlight;
+                                }
+                                WatchAction::ToggleTime => {
+                                    view.alt_time = !view.alt_time;
+                                }
+                                WatchAction::ShiftLeft => {
+                                    view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
+                                }
+                                _ => view.hshift += HSHIFT_STEP,
+                            }
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
+                        WatchAction::Snapshot => {
+                            let Some(live) = live.as_ref() else { continue };
+                            // The frozen frame when paused, the newest one
+                            // when live; the path (or failure) surfaces
+                            // through the notice row of an in-place paint.
+                            let text = snapshot_frame(
+                                pause.as_ref().map_or(&live.lines, |p| &p.frozen),
+                                &args,
+                            );
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &palette,
+                                view,
+                                Some(text),
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
+                        WatchAction::Ignore => {}
                     }
-                    // The theme events exist on Windows too; their unix
-                    // arms above are compiled out there, and the crossterm
-                    // pump never produces them.
-                    #[cfg(windows)]
-                    TapEvent::ThemeNotification(_) | TapEvent::OscColor(..) => {}
                 }
+                // The reported value is ignored on purpose: it can
+                // disagree with the colors actually on screen. Every
+                // report re-arms, including one that arrives while an
+                // exchange is already out — a terminal's first report
+                // of a change can be measured too early.
+                #[cfg(unix)]
+                TapEvent::ThemeNotification(_) => {
+                    verify.pending = true;
+                }
+                #[cfg(unix)]
+                TapEvent::OscColor(kind, color) => {
+                    if let Some(verdict) = verify.reply(kind, color)
+                        && adopt(&mut palette, verdict)
+                    {
+                        if std::env::var_os("RAT_DEBUG_APPEARANCE").is_some() {
+                            notice = Some(format!("appearance → {}", verdict.as_str()));
+                        }
+                        // Repaint at the fresh tick this requests.
+                        schedule.request_now();
+                    }
+                }
+                // The theme events exist on Windows too; their unix
+                // arms above are compiled out there, and the crossterm
+                // pump never produces them.
+                #[cfg(windows)]
+                TapEvent::ThemeNotification(_) | TapEvent::OscColor(..) => {}
             }
         }
     }
@@ -880,8 +913,7 @@ fn repaint(
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
     pause: Option<&PauseState>,
     live_scroll: Option<LiveScroll>,
-    full_lines: &[String],
-    live_content: u64,
+    live: &Live,
     palette: &Palette,
     view: ViewState,
     notice: Option<String>,
@@ -889,15 +921,13 @@ fn repaint(
     max_height: Option<u16>,
     faint: &StyleSpec,
     profile: ColorProfile,
-    since: &str,
-    changed_at: jiff::Timestamp,
     history: &History,
 ) -> anyhow::Result<PaintKey> {
-    let age_secs = displayed_age(pause, live_scroll, view.alt_time, changed_at);
+    let age_secs = displayed_age(pause, live_scroll, view.alt_time, live.changed_at);
     let key = paint_key(
         pause,
         live_scroll,
-        live_content,
+        live.hash,
         palette.appearance,
         size,
         view,
@@ -905,8 +935,8 @@ fn repaint(
     );
     let (source, offset, mode) = match (pause, live_scroll) {
         (Some(p), _) => (p.frozen.as_slice(), p.scroll.offset(), FrameMode::Paused),
-        (None, Some(ls)) => (full_lines, ls.offset(), FrameMode::LiveScrolled),
-        (None, None) => (full_lines, 0, FrameMode::Live),
+        (None, Some(ls)) => (live.lines.as_slice(), ls.offset(), FrameMode::LiveScrolled),
+        (None, None) => (live.lines.as_slice(), 0, FrameMode::Live),
     };
     // Marks compare the viewed frame against the previous DISTINCT
     // frame — the pause's anchored entry (re-resolved through `nearest`
@@ -932,7 +962,7 @@ fn repaint(
         }
         .render("▌", profile)
     );
-    let time_live = live_time_segment(view.alt_time, since, age_seconds(changed_at));
+    let time_live = live_time_segment(view.alt_time, &live.since, age_seconds(live.changed_at));
     let time_paused = pause.map_or_else(
         || age_text(0),
         |p| paused_time_segment(view.alt_time, p.viewed_at, age_seconds(p.viewed_at)),
@@ -966,15 +996,20 @@ fn window_rows(max_height: Option<u16>, rows: u16) -> u16 {
 /// joins the frame (a raw write to the terminal would shift the cursor and
 /// corrupt the relative repaint). Trailing newlines are trimmed, not the
 /// interior ones.
-fn compose_frame(title: Option<&String>, output: &ChildOutput, join_stderr: bool) -> Vec<String> {
-    let body = String::from_utf8_lossy(&output.stdout);
+fn compose_frame(
+    title: Option<&String>,
+    stdout: &[u8],
+    stderr: &[u8],
+    join_stderr: bool,
+) -> Vec<String> {
+    let body = String::from_utf8_lossy(stdout);
     let mut lines: Vec<String> = Vec::new();
     if let Some(title) = title {
         lines.push(title.clone());
     }
     lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
-    if join_stderr && !output.stderr.is_empty() {
-        let err_body = String::from_utf8_lossy(&output.stderr);
+    if join_stderr && !stderr.is_empty() {
+        let err_body = String::from_utf8_lossy(stderr);
         lines.extend(
             err_body
                 .trim_end_matches('\n')
@@ -1162,11 +1197,6 @@ fn spawn_first(pagers: &[PagerCommand]) -> std::io::Result<(String, std::process
     Err(last_err)
 }
 
-struct ChildOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
 /// The child for one tick, fully configured on the loop thread: the
 /// shell or direct form, a null stdin while we own the keyboard, and
 /// the per-tick environment measured by the CALLER — whoever runs the
@@ -1197,38 +1227,6 @@ fn build_command(
     // Hand it the verdict instead.
     command.env("RAT_APPEARANCE", appearance.as_str());
     command
-}
-
-/// Run one tick of the child, capturing both streams. On a tty the stderr
-/// joins the painted frame (raw terminal writes would corrupt the repaint);
-/// piped mode forwards it to our stderr. Interactive mode nulls the child's
-/// stdin so it cannot eat keystrokes. Loop mode renders spawn failures as
-/// content so a transient failure does not tear down the dashboard; once
-/// mode fails loudly.
-fn run_child(
-    args: &WatchArgs,
-    interactive: bool,
-    appearance: Appearance,
-) -> Result<ChildOutput, AppError> {
-    let size = crossterm::terminal::size().unwrap_or((80, 24));
-    let command = build_command(args, interactive, appearance, size);
-    let outcome = crate::core::child::run_tick(command);
-    match outcome.spawn_error {
-        None => Ok(ChildOutput {
-            stdout: outcome.stdout,
-            stderr: outcome.stderr,
-        }),
-        Some(err) => {
-            if args.once {
-                Err(anyhow!("running {:?}: {err}", args.command[0]).into())
-            } else {
-                Ok(ChildOutput {
-                    stdout: format!("watch: {:?}: {err}", args.command[0]).into_bytes(),
-                    stderr: Vec::new(),
-                })
-            }
-        }
-    }
 }
 
 /// Unix: restore the terminal on INT/TERM/HUP. Windows: the interactive
@@ -1690,17 +1688,13 @@ mod tests {
 
     #[test]
     fn composing_a_frame_puts_the_title_first_and_stderr_last() {
-        let output = ChildOutput {
-            stdout: b"a\nb\n".to_vec(),
-            stderr: b"boom\n".to_vec(),
-        };
         let title = "T".to_string();
         assert_eq!(
-            compose_frame(Some(&title), &output, true),
+            compose_frame(Some(&title), b"a\nb\n", b"boom\n", true),
             vec!["T", "a", "b", "boom"]
         );
         assert_eq!(
-            compose_frame(Some(&title), &output, false),
+            compose_frame(Some(&title), b"a\nb\n", b"boom\n", false),
             vec!["T", "a", "b"]
         );
     }
