@@ -79,6 +79,7 @@ impl TickSchedule {
     /// was started under an environment this request supersedes — so
     /// the request survives that completion and spawns a fresh child
     /// at once. Spent after one spawn.
+    #[cfg_attr(windows, allow(dead_code))] // Called from the unix input path.
     pub fn request_respawn(&mut self) {
         self.due = None;
         self.respawn = self.in_flight;
