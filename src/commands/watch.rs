@@ -197,7 +197,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             let events = match tap.as_ref() {
                 Some(tap) => match tap.recv_timeout(nap) {
                     Some(chunk) => scanner.feed(&chunk),
-                    None => Vec::new(),
+                    None => scanner.idle(nap),
                 },
                 None => crossterm_slice(nap)?,
             };

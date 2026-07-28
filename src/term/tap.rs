@@ -23,20 +23,32 @@ pub enum TapEvent {
 /// rather than retained forever. One shared cap for both CSI and OSC runs.
 const MAX_ESCAPE_LEN: usize = 128;
 
+/// Input silence after a bare ESC before it resolves to `Key::Esc`. Real
+/// terminals write a whole sequence in one write(2), so only a genuine
+/// escape keypress leaves a lone ESC pending this long. The cost: Esc has
+/// a ~50 ms floor, and a sequence split across a longer gap resolves as a
+/// spurious Esc — benign for a resume key.
+pub const ESC_HOLD: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Reassembles `TapEvent`s from arbitrary-boundary byte chunks. A
 /// complete, unrecognized escape-led run is dropped silently and never
 /// retained — this is the property that keeps a long-lived reader from
 /// wedging on an unknown private CSI.
 pub struct TapScanner {
     buf: Vec<u8>,
+    silent: std::time::Duration,
 }
 
 impl TapScanner {
     pub fn new() -> TapScanner {
-        TapScanner { buf: Vec::new() }
+        TapScanner {
+            buf: Vec::new(),
+            silent: std::time::Duration::ZERO,
+        }
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<TapEvent> {
+        self.silent = std::time::Duration::ZERO;
         let mut events = Vec::new();
         for &byte in chunk {
             if self.buf.is_empty() {
@@ -99,6 +111,23 @@ impl TapScanner {
             }
         }
         events
+    }
+
+    /// Account an expired, empty read slice. A bare ESC pending across
+    /// `ESC_HOLD` of accumulated silence resolves to `Key::Esc`; anything
+    /// longer in the buffer is a reassembling sequence and is never
+    /// flushed by silence.
+    pub fn idle(&mut self, silence: std::time::Duration) -> Vec<TapEvent> {
+        if self.buf != [0x1b] {
+            return Vec::new();
+        }
+        self.silent += silence;
+        if self.silent < ESC_HOLD {
+            return Vec::new();
+        }
+        self.buf.clear();
+        self.silent = std::time::Duration::ZERO;
+        vec![TapEvent::Key(Key::Esc)]
     }
 }
 
@@ -447,6 +476,47 @@ mod tests {
         let mut scanner = TapScanner::new();
         assert_eq!(scanner.feed(b"\x1b"), vec![]);
         assert_eq!(scanner.feed(b"q"), vec![TapEvent::Key(Key::Char('q'))]);
+    }
+
+    #[test]
+    fn a_lone_escape_resolves_after_the_hold() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b"), vec![]);
+        assert_eq!(scanner.idle(std::time::Duration::from_millis(20)), vec![]);
+        assert_eq!(
+            scanner.idle(std::time::Duration::from_millis(40)),
+            vec![TapEvent::Key(Key::Esc)]
+        );
+        // Not sticky: the resolved escape is gone.
+        assert_eq!(scanner.idle(std::time::Duration::from_millis(50)), vec![]);
+    }
+
+    #[test]
+    fn bytes_cancel_a_pending_escape() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b"), vec![]);
+        assert_eq!(scanner.idle(std::time::Duration::from_millis(30)), vec![]);
+        assert_eq!(scanner.feed(b"["), vec![]);
+        // A reassembling CSI is never flushed by silence.
+        assert_eq!(scanner.idle(std::time::Duration::from_millis(50)), vec![]);
+        assert_eq!(scanner.feed(b"A"), vec![TapEvent::Key(Key::Up)]);
+    }
+
+    #[test]
+    fn an_escape_followed_by_a_plain_byte_keeps_todays_behavior() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1bq"), vec![TapEvent::Key(Key::Char('q'))]);
+    }
+
+    #[test]
+    fn idle_never_flushes_a_partial_sequence() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b[?997"), vec![]);
+        assert_eq!(scanner.idle(std::time::Duration::from_millis(200)), vec![]);
+        assert_eq!(
+            scanner.feed(b";2n"),
+            vec![TapEvent::ThemeNotification(Appearance::Light)]
+        );
     }
 
     #[test]
