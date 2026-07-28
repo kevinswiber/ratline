@@ -62,6 +62,32 @@ watch resumes). On Windows, when `less` isn't installed the stock
 `more.com` steps in. When output is taller than the screen, the truncation
 line says so: `… 12 more lines · v views all · q quits`.
 
+Scroll back with less-style keys: `j`/`k` (or the arrows) move one line,
+`d`/`u` half a window, `f`/`b` (or PgDn/PgUp) a full window, and `g`/`G`
+(or Home/End) jump to the ends. The first navigation key freezes the
+current frame — the command keeps running behind it, but nothing repaints
+over what you're reading — and the bottom row names the visible range:
+`paused · lines 2-23 of 30 · Esc resumes`. `Esc` returns to the live
+tail. `q` quits and `S` snapshots from either mode, and while paused `v`
+pages the frozen frame — which is also where search lives: page into
+`less` and search there. One deliberate divergence from `less`: Enter
+pages rather than scrolling one line.
+
+Two view toggles work live or frozen, without pausing anything: `w`
+switches long lines between wrapped and chopped, and `h`/`l` (or
+Left/Right) scroll the view horizontally in 8-column steps. As in `less`,
+a horizontally shifted view shows chopped lines until you shift back to
+the left edge. Start chopped with `--no-wrap`.
+
+`S` writes the current frame to `rat-watch-YYYYMMDD-HHMMSS.txt` in
+`--snapshot-dir` (or `RAT_SNAPSHOT_DIR`, or the directory the watch was
+launched from) and shows the path in the notice row. Snapshots are plain
+text — ready for `grep` — unless `--snapshot-ansi` keeps the colors, and
+a second snapshot in the same second gets a numbered name instead of
+overwriting. The snapshot is the data, not the viewport: it always
+contains the full untruncated frame, however the view is scrolled,
+wrapped, or shifted.
+
 ### `rat frame` — flicker-free repaint for script-owned loops
 
 When you want your own loop, pipe each frame's content through `rat frame`:
@@ -298,7 +324,9 @@ to at all under `--color never`, `NO_COLOR`, `CI`, `--once`, or when
 output is piped. Two limits worth knowing: a change that happens while the
 pager (`v`) has the screen is picked up at the *next* change after you
 leave the pager, and on Windows a `watch` session keeps the appearance it
-resolved at startup.
+resolved at startup. A change that lands while the frame is frozen is
+adopted right away — children re-render in the new palette on the next
+tick — but the frozen picture keeps its colors until you resume.
 
 While the dashboard runs, `rat watch` asks the terminal to announce theme
 changes, and tells it to stop before exiting — on `q`, Ctrl-C, or a
