@@ -121,40 +121,16 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         // While frozen the key holds the freeze-time content/appearance:
         // new child output and adopted palettes do not repaint, but
         // scroll, resize, and the one-shot notice still do.
-        let key = match pause.as_ref() {
-            Some(p) => PaintKey {
-                content: p.content,
-                cols: size.0,
-                rows: size.1,
-                appearance: p.appearance,
-                offset: p.scroll.offset(),
-                paused: true,
-                wrap: view.wrap,
-                hshift: view.hshift,
-            },
-            None => PaintKey {
-                content: hash,
-                cols: size.0,
-                rows: size.1,
-                appearance: palette.appearance,
-                offset: 0,
-                paused: false,
-                wrap: view.wrap,
-                hshift: view.hshift,
-            },
-        };
+        let key = paint_key(pause.as_ref(), hash, palette.appearance, size, view);
         if previous_key != Some(key) || notice.is_some() {
             previous_key = Some(key);
             if is_tty {
-                let (source, offset, paused) = match pause.as_ref() {
-                    Some(p) => (&p.frozen, p.scroll.offset(), true),
-                    None => (&full_lines, 0, false),
-                };
-                paint_frame(
+                repaint(
                     &mut renderer,
-                    source,
-                    offset,
-                    paused,
+                    pause.as_ref(),
+                    &full_lines,
+                    hash,
+                    palette.appearance,
                     view,
                     notice.take(),
                     size,
@@ -303,28 +279,19 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 appearance: palette.appearance,
                             });
                             p.scroll = p.scroll.step(step, p.frozen.len(), window);
-                            previous_key = Some(PaintKey {
-                                content: p.content,
-                                cols: size.0,
-                                rows: size.1,
-                                appearance: p.appearance,
-                                offset: p.scroll.offset(),
-                                paused: true,
-                                wrap: view.wrap,
-                                hshift: view.hshift,
-                            });
-                            paint_frame(
+                            previous_key = Some(repaint(
                                 &mut renderer,
-                                &p.frozen,
-                                p.scroll.offset(),
-                                true,
+                                pause.as_ref(),
+                                &full_lines,
+                                hash,
+                                palette.appearance,
                                 view,
                                 None,
                                 size,
                                 args.max_height,
                                 &faint,
                                 profile,
-                            )?;
+                            )?);
                         }
                         WatchAction::Resume => {
                             // Fresh content wants a fresh tick: the same
@@ -348,34 +315,19 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 _ => view.hshift += HSHIFT_STEP,
                             }
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
-                            let (source, offset, paused) = match pause.as_ref() {
-                                Some(p) => (&p.frozen, p.scroll.offset(), true),
-                                None => (&full_lines, 0, false),
-                            };
-                            previous_key = Some(PaintKey {
-                                content: pause.as_ref().map_or(hash, |p| p.content),
-                                cols: size.0,
-                                rows: size.1,
-                                appearance: pause
-                                    .as_ref()
-                                    .map_or(palette.appearance, |p| p.appearance),
-                                offset,
-                                paused,
-                                wrap: view.wrap,
-                                hshift: view.hshift,
-                            });
-                            paint_frame(
+                            previous_key = Some(repaint(
                                 &mut renderer,
-                                source,
-                                offset,
-                                paused,
+                                pause.as_ref(),
+                                &full_lines,
+                                hash,
+                                palette.appearance,
                                 view,
                                 None,
                                 size,
                                 args.max_height,
                                 &faint,
                                 profile,
-                            )?;
+                            )?);
                         }
                         WatchAction::Snapshot => {
                             // The frozen frame when paused, the newest one
@@ -386,34 +338,19 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 &args,
                             );
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
-                            let (source, offset, paused) = match pause.as_ref() {
-                                Some(p) => (&p.frozen, p.scroll.offset(), true),
-                                None => (&full_lines, 0, false),
-                            };
-                            previous_key = Some(PaintKey {
-                                content: pause.as_ref().map_or(hash, |p| p.content),
-                                cols: size.0,
-                                rows: size.1,
-                                appearance: pause
-                                    .as_ref()
-                                    .map_or(palette.appearance, |p| p.appearance),
-                                offset,
-                                paused,
-                                wrap: view.wrap,
-                                hshift: view.hshift,
-                            });
-                            paint_frame(
+                            previous_key = Some(repaint(
                                 &mut renderer,
-                                source,
-                                offset,
-                                paused,
+                                pause.as_ref(),
+                                &full_lines,
+                                hash,
+                                palette.appearance,
                                 view,
                                 Some(text),
                                 size,
                                 args.max_height,
                                 &faint,
                                 profile,
-                            )?;
+                            )?);
                         }
                         WatchAction::Ignore => {}
                     },
@@ -526,6 +463,60 @@ struct PaintKey {
     paused: bool,
     wrap: bool,
     hshift: usize,
+}
+
+/// The one construction of the repaint gate's key: while paused it holds
+/// the freeze-time content/appearance and the window's offset; live it
+/// holds this tick's values.
+fn paint_key(
+    pause: Option<&PauseState>,
+    live_content: u64,
+    live_appearance: Appearance,
+    size: (u16, u16),
+    view: ViewState,
+) -> PaintKey {
+    let (content, appearance, offset, paused) = match pause {
+        Some(p) => (p.content, p.appearance, p.scroll.offset(), true),
+        None => (live_content, live_appearance, 0, false),
+    };
+    PaintKey {
+        content,
+        cols: size.0,
+        rows: size.1,
+        appearance,
+        offset,
+        paused,
+        wrap: view.wrap,
+        hshift: view.hshift,
+    }
+}
+
+/// The consolidated in-place paint: build the key for the current
+/// (pause, view) state, draw the matching source, and return the key that
+/// was painted — so a dispatch arm cannot paint and forget the gate.
+#[allow(clippy::too_many_arguments)]
+fn repaint(
+    renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
+    pause: Option<&PauseState>,
+    full_lines: &[String],
+    live_content: u64,
+    live_appearance: Appearance,
+    view: ViewState,
+    notice: Option<String>,
+    size: (u16, u16),
+    max_height: Option<u16>,
+    faint: &StyleSpec,
+    profile: ColorProfile,
+) -> anyhow::Result<PaintKey> {
+    let key = paint_key(pause, live_content, live_appearance, size, view);
+    let (source, offset, paused) = match pause {
+        Some(p) => (p.frozen.as_slice(), p.scroll.offset(), true),
+        None => (full_lines, 0, false),
+    };
+    paint_frame(
+        renderer, source, offset, paused, view, notice, size, max_height, faint, profile,
+    )?;
+    Ok(key)
 }
 
 /// The painted body: `max_height`, else terminal rows − 2 (one row for the
@@ -935,6 +926,49 @@ mod tests {
             assert_eq!(action_for(Key::Char('S'), paused), WatchAction::Snapshot);
             assert_eq!(action_for(Key::Char('s'), paused), WatchAction::Ignore);
         }
+    }
+
+    #[test]
+    fn paint_key_matches_the_live_and_paused_shapes() {
+        let view = ViewState {
+            wrap: true,
+            hshift: 4,
+        };
+        let live = paint_key(None, 42, Appearance::Dark, (80, 24), view);
+        assert_eq!(
+            live,
+            PaintKey {
+                content: 42,
+                cols: 80,
+                rows: 24,
+                appearance: Appearance::Dark,
+                offset: 0,
+                paused: false,
+                wrap: true,
+                hshift: 4,
+            }
+        );
+        let scroll = ScrollState::new().step(ScrollStep::LineDown, 50, 10);
+        let p = PauseState {
+            frozen: vec!["x".to_string()],
+            scroll,
+            content: 7,
+            appearance: Appearance::Light,
+        };
+        let paused = paint_key(Some(&p), 42, Appearance::Dark, (80, 24), view);
+        assert_eq!(
+            paused,
+            PaintKey {
+                content: 7,
+                cols: 80,
+                rows: 24,
+                appearance: Appearance::Light,
+                offset: scroll.offset(),
+                paused: true,
+                wrap: true,
+                hshift: 4,
+            }
+        );
     }
 
     #[test]
