@@ -11,6 +11,7 @@ use crate::color::{ColorProfile, SystemEnv};
 use crate::core::duration::parse_interval;
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
+use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
@@ -376,8 +377,44 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 profile,
                             )?;
                         }
-                        // Not yet wired: snapshots.
-                        WatchAction::Snapshot => {}
+                        WatchAction::Snapshot => {
+                            // The frozen frame when paused, the newest one
+                            // when live; the path (or failure) surfaces
+                            // through the notice row of an in-place paint.
+                            let text = snapshot_frame(
+                                pause.as_ref().map_or(&full_lines, |p| &p.frozen),
+                                &args,
+                            );
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            let (source, offset, paused) = match pause.as_ref() {
+                                Some(p) => (&p.frozen, p.scroll.offset(), true),
+                                None => (&full_lines, 0, false),
+                            };
+                            previous_key = Some(PaintKey {
+                                content: pause.as_ref().map_or(hash, |p| p.content),
+                                cols: size.0,
+                                rows: size.1,
+                                appearance: pause
+                                    .as_ref()
+                                    .map_or(palette.appearance, |p| p.appearance),
+                                offset,
+                                paused,
+                                wrap: view.wrap,
+                                hshift: view.hshift,
+                            });
+                            paint_frame(
+                                &mut renderer,
+                                source,
+                                offset,
+                                paused,
+                                view,
+                                Some(text),
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                            )?;
+                        }
                         WatchAction::Ignore => {}
                     },
                     // The reported value is ignored on purpose: it can
@@ -564,6 +601,23 @@ fn paint_frame(
     }
     renderer.draw(&kept, cols).context("writing frame")?;
     Ok(())
+}
+
+/// Write `lines` to a timestamped file and describe the outcome for the
+/// notice row. The snapshot is the data, not the viewport: wrap, shift,
+/// and scroll state never change what lands in the file.
+fn snapshot_frame(lines: &[String], args: &WatchArgs) -> String {
+    let dir = args
+        .snapshot_dir
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stamp = snapshot_stamp(&jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system()));
+    let body = snapshot_body(lines, args.snapshot_ansi);
+    match write_snapshot(&dir, &stamp, &body) {
+        Ok(path) => format!("snapshot → {}", path.display()),
+        Err(err) => format!("snapshot failed ({err}) — set --snapshot-dir or RAT_SNAPSHOT_DIR"),
+    }
 }
 
 /// Hand the full untruncated frame to the user's pager (RAT_PAGER, PAGER,

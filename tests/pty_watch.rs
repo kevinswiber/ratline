@@ -477,6 +477,73 @@ fn w_and_l_change_the_view_without_pausing() {
 }
 
 #[test]
+fn s_writes_a_snapshot_of_the_frame() {
+    // The pty harness builds the child's environment from scratch, so the
+    // snapshot directory must be explicit and absolute.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dir_path = dir.path().display().to_string();
+    let rat = rat_bin();
+    // A child with real SGR in its frame, so "stripped by default" is
+    // actually exercised.
+    let session = PtySession::spawn(
+        &rat,
+        &[
+            "watch",
+            "-n",
+            "50ms",
+            "--",
+            &rat,
+            "--color",
+            "always",
+            "style",
+            "--foreground",
+            "212",
+            "hi",
+        ],
+        &[("RAT_SNAPSHOT_DIR", &dir_path)],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    session.write_bytes(b"S");
+    assert!(
+        wait_for(&session, &mut terminal, b"snapshot", Duration::from_secs(2)),
+        "expected the snapshot notice"
+    );
+
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read snapshot dir")
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one snapshot: {entries:?}"
+    );
+    let name = entries[0].file_name().expect("file name").to_string_lossy();
+    assert!(
+        name.starts_with("rat-watch-") && name.ends_with(".txt"),
+        "unexpected snapshot name {name:?}"
+    );
+    let contents = std::fs::read_to_string(&entries[0]).expect("read snapshot");
+    assert_eq!(contents, "hi\n");
+    assert!(
+        !contents.contains('\x1b'),
+        "escapes should be stripped by default"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
 fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
     // The pager's alternate screen restores the pre-pager frame with the
     // cursor below it; the next frame must climb over and replace that
