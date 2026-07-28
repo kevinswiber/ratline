@@ -23,6 +23,12 @@ impl ScrollState {
         ScrollState { offset: 0 }
     }
 
+    /// A state parked at `offset` — how a live-scrolled window freezes in
+    /// place. Clamp separately when the frame may have shrunk.
+    pub fn at(offset: usize) -> ScrollState {
+        ScrollState { offset }
+    }
+
     pub fn offset(self) -> usize {
         self.offset
     }
@@ -72,12 +78,10 @@ pub struct HeightTracker {
 }
 
 impl HeightTracker {
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn new() -> HeightTracker {
         HeightTracker::default()
     }
 
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn observe(&mut self, lines: usize) {
         if self.counts.len() == STABLE_TICKS {
             self.counts.pop_front();
@@ -85,7 +89,6 @@ impl HeightTracker {
         self.counts.push_back(lines);
     }
 
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn stable(&self) -> bool {
         self.counts.len() == STABLE_TICKS && self.counts.iter().all(|&c| c == self.counts[0])
     }
@@ -101,7 +104,6 @@ pub struct LiveScroll {
 
 impl LiveScroll {
     /// Entering live-scroll: one step from offset 0.
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn start(step: ScrollStep, total: usize, window: usize) -> LiveScroll {
         LiveScroll {
             offset: 0,
@@ -111,7 +113,6 @@ impl LiveScroll {
     }
 
     /// pinned = (step == `ScrollStep::Bottom`); any other step unpins.
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn step(self, step: ScrollStep, total: usize, window: usize) -> LiveScroll {
         LiveScroll {
             offset: ScrollState {
@@ -124,7 +125,6 @@ impl LiveScroll {
     }
 
     /// Every tick: pinned tracks the tail; unpinned holds, clamped.
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn reanchor(self, total: usize, window: usize) -> LiveScroll {
         let limit = max_offset(total, window.max(1));
         LiveScroll {
@@ -137,20 +137,17 @@ impl LiveScroll {
         }
     }
 
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn offset(self) -> usize {
         self.offset
     }
 
     /// Offset 0 means the window is the live view: collapse the mode.
-    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
     pub fn at_top(self) -> bool {
         self.offset == 0
     }
 }
 
 /// The live-scrolled status row.
-#[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
 pub fn scrolled_notice(offset: usize, shown: usize, total: usize) -> String {
     format!(
         "lines {}-{} of {total} · live · g follows",
@@ -242,6 +239,7 @@ mod tests {
         let deep = ScrollState { offset: 8 };
         assert_eq!(deep.clamp(30, 40).offset(), 0);
         assert_eq!(deep.clamp(10, 5).offset(), 5);
+        assert_eq!(ScrollState::at(8).offset(), 8);
     }
 
     #[test]

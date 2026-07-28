@@ -327,7 +327,7 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
         "expected a first frame"
     );
 
-    session.write_bytes(b"j");
+    session.write_bytes(b"p");
     assert!(
         wait_for(
             &session,
@@ -335,7 +335,7 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
             "paused · just now ·".as_bytes(),
             Duration::from_secs(2)
         ),
-        "expected the paused row after a navigation key"
+        "expected the paused row after the freeze key"
     );
     // Drain the freeze paint. While the age still reads "just now" the
     // per-second status repaint is byte-identical, so the differ writes
@@ -455,6 +455,18 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
         "expected the hidden-line count in the truncation row"
     );
 
+    // p freezes (a stable frame's scroll keys live-scroll instead), then
+    // j scrolls the frozen window one line down.
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused · just now · lines 1-22 of 30 · Esc resumes".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the frozen window at the top"
+    );
     session.write_bytes(b"j");
     assert!(
         wait_for(
@@ -642,6 +654,203 @@ fn s_writes_a_snapshot_of_the_frame() {
     );
 }
 
+/// First run of `min` or more consecutive ASCII digits — frame content
+/// like a `%H%M%S%f` stamp produces one; status rows cannot.
+fn first_digit_run(bytes: &[u8], min: usize) -> Option<Vec<u8>> {
+    let mut run: Vec<u8> = Vec::new();
+    for &b in bytes {
+        if b.is_ascii_digit() {
+            run.push(b);
+        } else {
+            if run.len() >= min {
+                return Some(run);
+            }
+            run.clear();
+        }
+    }
+    (run.len() >= min).then_some(run)
+}
+
+#[test]
+fn a_stable_frame_scrolls_live() {
+    // 46 fixed lines; line 23 carries a changing stamp that is hidden in
+    // the 22-row window at the top and visible at offset 1 — proof the
+    // tail keeps ticking under a scrolled window.
+    let rat = rat_bin();
+    let script = format!(
+        "i=1; while [ $i -le 46 ]; do \
+           if [ $i -eq 23 ]; then {rat} date --format %H%M%S%f; \
+           else echo l$i; fi; i=$((i+1)); done"
+    );
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    // Let the height ring fill: stability needs eight equal ticks.
+    let _ = drain_for(&session, Duration::from_millis(700));
+
+    // A top-reaching step never enters the mode: g at the top stays Live.
+    session.write_bytes(b"g");
+    let noop = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        !contains(&noop, "· live ·".as_bytes()),
+        "g at the top must not enter live-scroll"
+    );
+    assert!(
+        !contains(&noop, "paused".as_bytes()),
+        "g at the top must not freeze"
+    );
+
+    // j over a stable frame scrolls LIVE: no freeze, the window slides.
+    session.write_bytes(b"j");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            "lines 2-23 of 46 · live · g follows".as_bytes(),
+            b"paused",
+            Duration::from_secs(2)
+        ),
+        "expected the live-scrolled row, never a freeze"
+    );
+
+    // The tail never stopped: the stamp on the now-visible line keeps
+    // changing across drains.
+    let first = drain_for(&session, Duration::from_millis(400));
+    let second = drain_for(&session, Duration::from_millis(400));
+    let a = first_digit_run(&first, 6).expect("a stamp in the first drain");
+    let b = first_digit_run(&second, 6).expect("a stamp in the second drain");
+    assert_ne!(a, b, "the visible stamp must keep ticking while scrolled");
+
+    // g reaches the top: the mode collapses back to Live.
+    session.write_bytes(b"g");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"24 more lines",
+            Duration::from_secs(2)
+        ),
+        "expected the live truncation row back at the top"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn an_unstable_frame_freezes_on_scroll() {
+    // The line count alternates every tick: stability is never satisfied
+    // and a scroll key falls back to the freeze.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let flag = dir.path().join("flag").display().to_string();
+    let script = format!(
+        "if [ -e {flag} ]; then rm -f {flag}; echo one; echo two; else : > {flag}; echo one; fi"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"one", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    let _ = drain_for(&session, Duration::from_millis(700));
+
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused · just now".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected a jittering frame to freeze on scroll"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn a_shape_change_while_scrolled_freezes() {
+    // Stable until the test says otherwise: the frame grows one line the
+    // moment the grow file appears, deterministically mid-scroll.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let grow = dir.path().join("grow");
+    let grow_path = grow.display().to_string();
+    let script = format!(
+        "i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done; \
+         if [ -e {grow_path} ]; then echo extra; fi"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    let _ = drain_for(&session, Duration::from_millis(700));
+
+    session.write_bytes(b"j");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            "lines 2-23 of 30 · live · g follows".as_bytes(),
+            b"paused",
+            Duration::from_secs(2)
+        ),
+        "expected a stable frame to live-scroll"
+    );
+
+    // The frame changes shape under the scrolled window: auto-freeze.
+    std::fs::write(&grow, b"").expect("create the grow file");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"frame changed shape",
+        Duration::from_secs(5),
+    )
+    .expect("expected the one-shot shape notice");
+    assert!(
+        contains(&seen, "paused ·".as_bytes()),
+        "the shape change must land in a freeze"
+    );
+
+    session.write_bytes(b"\x1b");
+    assert!(
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
+        "expected Esc to resume the live tail"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
 #[test]
 fn p_freezes_and_f_resumes() {
     // A deliberate freeze needs no scroll: p parks the frame in place.
@@ -718,7 +927,7 @@ fn q_quits_from_a_frozen_frame() {
         b"hi",
         Duration::from_secs(2)
     ));
-    session.write_bytes(b"j");
+    session.write_bytes(b"p");
     assert!(
         wait_for(&session, &mut terminal, b"paused", Duration::from_secs(2)),
         "expected the frame to freeze"
@@ -756,6 +965,13 @@ fn v_pages_the_frozen_frame() {
         b"l1",
         Duration::from_secs(2)
     ));
+    // p freezes (a stable frame's G would live-scroll), then G scrolls
+    // the frozen window to the bottom.
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(&session, &mut terminal, b"paused", Duration::from_secs(2)),
+        "expected the frame to freeze"
+    );
     session.write_bytes(b"G");
     assert!(
         wait_for(
