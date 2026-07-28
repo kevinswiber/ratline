@@ -16,7 +16,7 @@ use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::history::History;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
-use crate::term::marks::{GUTTER_COLS, LineMark, changed_marks, prefix_rows};
+use crate::term::marks::{GUTTER_COLS, LineMark, changed_marks, mark_cells, prefix_rows};
 use crate::term::scroll::{
     HSHIFT_STEP, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
 };
@@ -108,6 +108,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         wrap: !args.no_wrap,
         hshift: 0,
         gutter: false,
+        highlight: false,
     };
     let mut notice: Option<String> = None;
     loop {
@@ -502,7 +503,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             action @ (WatchAction::ToggleWrap
                             | WatchAction::ShiftLeft
                             | WatchAction::ShiftRight
-                            | WatchAction::ToggleGutter) => {
+                            | WatchAction::ToggleGutter
+                            | WatchAction::ToggleHighlight) => {
                                 // View state, not scrollback state: applies to
                                 // live and frozen frames alike, never freezes
                                 // the tail, repaints in place. Right shift is
@@ -510,6 +512,9 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 match action {
                                     WatchAction::ToggleWrap => view.wrap = !view.wrap,
                                     WatchAction::ToggleGutter => view.gutter = !view.gutter,
+                                    WatchAction::ToggleHighlight => {
+                                        view.highlight = !view.highlight;
+                                    }
                                     WatchAction::ShiftLeft => {
                                         view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
                                     }
@@ -633,6 +638,7 @@ enum WatchAction {
     ShiftLeft,
     ShiftRight,
     ToggleGutter,
+    ToggleHighlight,
     Ignore,
 }
 
@@ -658,6 +664,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('h') | Key::Left => WatchAction::ShiftLeft,
         Key::Char('l') | Key::Right => WatchAction::ShiftRight,
         Key::Char('D') => WatchAction::ToggleGutter,
+        Key::Char('c') => WatchAction::ToggleHighlight,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
@@ -697,6 +704,10 @@ struct ViewState {
     /// previous distinct frame. Implies chopped rendering: mark i
     /// aligning with line i needs 1:1 line-to-row.
     gutter: bool,
+    /// Reverse-video highlights on the changed characters themselves,
+    /// patched over the child's own styling. Wrap-agnostic: the
+    /// splices are zero display cells.
+    highlight: bool,
 }
 
 /// Everything a painted frame depends on; the repaint gate compares two of
@@ -714,6 +725,7 @@ struct PaintKey {
     wrap: bool,
     hshift: usize,
     gutter: bool,
+    highlight: bool,
     /// Whole seconds since the viewed frame was current; 0 while live.
     /// Advancing once per second is what lets the paused age repaint.
     age_secs: u64,
@@ -753,6 +765,7 @@ fn paint_key(
         wrap: view.wrap,
         hshift: view.hshift,
         gutter: view.gutter,
+        highlight: view.highlight,
         age_secs,
     }
 }
@@ -824,7 +837,7 @@ fn repaint(
     // Marks compare the viewed frame against the previous DISTINCT
     // frame — the pause's anchored entry (re-resolved through `nearest`
     // when evicted), else the newest. No predecessor means no marks.
-    let marks: Option<Vec<LineMark>> = view.gutter.then(|| {
+    let marks: Option<Vec<LineMark>> = (view.gutter || view.highlight).then(|| {
         let anchor = match pause {
             Some(p) => p
                 .history_seq
@@ -922,24 +935,50 @@ fn paint_frame(
     };
     // The gutter is its own region: content renders into what is left.
     let content_cols = usize::from(cols).saturating_sub(if view.gutter { GUTTER_COLS } else { 0 });
+    // The character highlights splice attribute-only SGR into the body
+    // rows, so a profile that forbids SGR gets none from them either.
+    let highlight = view.highlight && profile != ColorProfile::Ascii;
+    let spliced = |i: usize, line: &String| -> String {
+        match (highlight, marks) {
+            (true, Some(ms)) => mark_cells(
+                line,
+                ms.get(start + i).map_or(&[][..], |m| m.cells.as_slice()),
+            ),
+            _ => line.clone(),
+        }
+    };
     // A nonzero shift implies chopped lines, less's own rule — and so do
     // live-scrolling and the gutter, where an offset (or a mark) counts
     // lines and only chopping makes a line one row. Chopped rendering is
-    // 1:1 line-to-row; wrapped rendering is today's path.
+    // 1:1 line-to-row; wrapped rendering is today's path. The splice
+    // runs BEFORE the chop, whose state replay carries a mark across
+    // the cut.
     let (mut kept, hidden) =
         if !view.wrap || view.hshift > 0 || mode == FrameMode::LiveScrolled || view.gutter {
             let end = (start + usize::from(max_rows)).min(lines.len());
             let kept: Vec<String> = lines[start..end]
                 .iter()
-                .map(|line| shift_chop(line, view.hshift, content_cols))
+                .enumerate()
+                .map(|(i, line)| shift_chop(&spliced(i, line), view.hshift, content_cols))
                 .collect();
             (kept, lines.len() - end)
         } else {
-            truncate_to_rows(lines[start..].to_vec(), max_rows, cols)
+            truncate_to_rows(
+                lines[start..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| spliced(i, line))
+                    .collect(),
+                max_rows,
+                cols,
+            )
         };
     // Body rows only: the status and notice rows below are chrome and
-    // stay unprefixed at full width.
-    if let Some(marks) = marks {
+    // stay unprefixed at full width. Marks may be present for a
+    // highlight-only paint; the margin column needs the gutter itself.
+    if view.gutter
+        && let Some(marks) = marks
+    {
         kept = prefix_rows(kept, marks, start, mark_cell);
     }
     let status = match mode {
@@ -1310,6 +1349,16 @@ mod tests {
     }
 
     #[test]
+    fn c_toggles_the_highlight_in_every_mode() {
+        for mode in ALL_MODES {
+            assert_eq!(
+                action_for(Key::Char('c'), mode),
+                WatchAction::ToggleHighlight
+            );
+        }
+    }
+
+    #[test]
     fn view_keys_are_view_actions_in_every_mode() {
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::Char('w'), mode), WatchAction::ToggleWrap);
@@ -1374,6 +1423,7 @@ mod tests {
             wrap: true,
             hshift: 4,
             gutter: false,
+            highlight: false,
         };
         // A live key never ages, whatever the caller computed.
         let live = paint_key(None, None, 42, Appearance::Dark, (80, 24), view, 14);
@@ -1389,6 +1439,7 @@ mod tests {
                 wrap: true,
                 hshift: 4,
                 gutter: false,
+                highlight: false,
                 age_secs: 0,
             }
         );
@@ -1417,6 +1468,7 @@ mod tests {
                 wrap: true,
                 hshift: 4,
                 gutter: false,
+                highlight: false,
                 age_secs: 0,
             }
         );
@@ -1433,6 +1485,7 @@ mod tests {
                 wrap: true,
                 hshift: 4,
                 gutter: false,
+                highlight: false,
                 age_secs: 14,
             }
         );

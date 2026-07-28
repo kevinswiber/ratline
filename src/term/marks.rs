@@ -133,9 +133,6 @@ pub fn prefix_rows(
 /// indices into the STRIPPED line, sorted and non-overlapping
 /// (`changed_marks` guarantees both). Empty `cells` returns the line
 /// unchanged.
-// Wired into the watch loop by the highlight toggle; the pure splice
-// and its tests land first.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn mark_cells(line: &str, cells: &[std::ops::Range<usize>]) -> String {
     if cells.is_empty() {
         return line.to_string();

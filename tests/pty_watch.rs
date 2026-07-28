@@ -1518,3 +1518,203 @@ fn toggling_the_gutter_off_restores_the_plain_frame() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn the_highlight_reverses_the_changed_characters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!(
+        "echo steady-anchor-line; echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"c");
+    let bytes = wait_for_bytes(&session, &mut terminal, b"\x1b[7m", Duration::from_secs(2))
+        .expect("expected a reverse-video mark after c");
+    let marked_row = row_containing(&bytes, b"\x1b[7m").expect("a marked row");
+    assert!(
+        contains(marked_row, b"v0"),
+        "the mark must land on the changed row: {:?}",
+        String::from_utf8_lossy(marked_row)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn toggling_the_highlight_off_restores_plain_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"c");
+    assert!(
+        wait_for(&session, &mut terminal, b"\x1b[7m", Duration::from_secs(2)),
+        "expected a reverse-video mark after c"
+    );
+    session.write_bytes(b"c");
+    // Swallow the transition — a spliced frame may still be in flight.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    let bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
+        .expect("expected a plain counter row after toggling off");
+    assert!(
+        !contains(&bytes, b"\x1b[7m"),
+        "no reverse-video mark may survive the toggle: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn both_markers_ride_together() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!(
+        "echo steady-anchor-line; echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"D");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "▌".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected a gutter mark after D"
+    );
+    session.write_bytes(b"c");
+    let bytes = wait_for_bytes(&session, &mut terminal, b"\x1b[7m", Duration::from_secs(2))
+        .expect("expected a reverse-video mark after c");
+    let marked_row = row_containing(&bytes, b"\x1b[7m").expect("a marked row");
+    assert!(
+        contains(marked_row, "▌".as_bytes()) && contains(marked_row, b"v0"),
+        "margin cell and in-content mark must coexist on the changed row: {:?}",
+        String::from_utf8_lossy(marked_row)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn the_highlight_survives_a_shift() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!(
+        "echo 12345678-steady-remainder; echo x >> {count}; n=$(wc -l < {count}); \
+         printf 'counter-mark v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"c");
+    assert!(
+        wait_for(&session, &mut terminal, b"\x1b[7m", Duration::from_secs(2)),
+        "expected a reverse-video mark after c"
+    );
+    session.write_bytes(b"l");
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"-steady-remainder",
+        Duration::from_secs(2),
+    )
+    .expect("expected the shifted frame");
+    let counter_row = row_containing(&bytes, b"v0").expect("a counter row");
+    assert!(
+        contains(counter_row, b"\x1b[7m"),
+        "the splice must ride the chopped branch too: {:?}",
+        String::from_utf8_lossy(counter_row)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn no_color_keeps_the_highlight_out_of_the_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[("NO_COLOR", "1")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"c");
+    // Swallow the transition, then capture fresh frames: a profile that
+    // forbids SGR gets none from the highlighter either.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    let bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
+        .expect("expected counter rows under NO_COLOR");
+    assert!(
+        !contains(&bytes, b"\x1b[7m"),
+        "the highlighter must stay silent under an ascii profile: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
