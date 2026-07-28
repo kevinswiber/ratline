@@ -48,7 +48,9 @@ and terminal restore on exit/ctrl-c are all built in. Repaints rewrite
 only the rows that actually changed, so steady dashboards stay calm —
 and cheap over SSH. ANSI colors from the child pass through untouched.
 Piped output degrades to plain text, so `rat watch ... | tee log` stays
-readable.
+readable. The interval is the quiet time between runs: a command slower
+than its interval never overlaps itself — the next run simply waits its
+turn.
 
 Every tick, the child runs with `RAT_WIDTH` and `RAT_HEIGHT` set to the
 current terminal size, so scripts can adapt their layout (branch on width,
@@ -57,11 +59,14 @@ also gets `RAT_APPEARANCE` set to the parent's light/dark verdict, so it
 inherits the theme instead of asking the terminal itself — which it must
 not do while `watch` owns the keyboard.
 
-While watching: `q` quits, and `v` (or Enter) opens the full untruncated
-frame in your pager — resolved bat-style from `RAT_PAGER`, then `PAGER`,
-then `less` (with `-R` ensured so colors survive; quit the pager and the
-watch resumes). On Windows, when `less` isn't installed the stock
-`more.com` steps in.
+The command runs in the background of the watch's own loop, so every
+key answers immediately — even while a slow command is still mid-run —
+and the frame updates when the run finishes. While watching: `q` quits,
+stopping the command it is running, and `v` (or Enter) opens the full
+untruncated frame in your pager — resolved bat-style from `RAT_PAGER`,
+then `PAGER`, then `less` (with `-R` ensured so colors survive; quit
+the pager and the watch returns to the frame at once). On Windows, when
+`less` isn't installed the stock `more.com` steps in.
 
 Every live frame's bottom row names the last time the output actually
 changed: `since 14:03:52`. When output is taller than the screen it
@@ -370,8 +375,8 @@ output is piped. Two limits worth knowing: a change that happens while the
 pager (`v`) has the screen is picked up at the *next* change after you
 leave the pager, and on Windows a `watch` session keeps the appearance it
 resolved at startup. A change that lands while the frame is frozen is
-adopted right away — children re-render in the new palette on the next
-tick — but the frozen picture keeps its colors until you resume.
+adopted right away — a fresh run re-renders the output in the new
+palette — but the frozen picture keeps its colors until you resume.
 
 While the dashboard runs, `rat watch` asks the terminal to announce theme
 changes, and tells it to stop before exiting — on `q`, Ctrl-C, or a
