@@ -70,19 +70,19 @@ merges into the truncation line:
 
 Scroll with less-style keys: `j`/`k` (or the arrows) move one line,
 `d`/`u` half a window, `f`/`b` (or PgDn/PgUp) a full window, and `g`/`G`
-(or Home/End) jump to the ends. On a steady dashboard — output whose
-height isn't changing — the window moves over the live frame: nothing
-pauses, new output keeps arriving under you, `G` sticks to the end, and
-`g` (or scrolling back to the top) returns to the live view. The bottom
-row names the range: `lines 9-30 of 46 · live · g follows`. Scrolled
-lines render chopped, like a horizontally shifted view.
+(or Home/End) jump to the ends. The window moves over the live frame:
+nothing pauses, new output keeps arriving under you, `G` sticks to the
+end, and `g` (or scrolling back to the top) returns to the live view.
+The bottom row names the range: `lines 9-30 of 46 · live · g follows`.
+Scrolled lines render chopped, like a horizontally shifted view. If the
+output changes shape while you're scrolled, the window rides along —
+the row's total updates, a pinned window keeps tracking the end — and
+if the moment you were reading slides away, step back to it with `<`.
 
-On output whose height is still settling, a scroll key freezes the frame
-instead — the command keeps running behind it, but nothing repaints over
-what you're reading — and a frame that changes shape mid-scroll pauses
-itself and says `frame changed shape`. `p` pauses deliberately from any
-view; `Esc` or `F` return to the live tail. The paused row counts how
-long the view has been parked:
+Nothing ever pauses on its own. `p` parks the frame deliberately — the
+command keeps running behind it, but nothing repaints over what you're
+reading — and `Esc` or `F` return to the live tail. The paused row
+counts how long the view has been parked:
 `paused · 14s ago · lines 2-23 of 30 · Esc resumes`. `q` quits and `S`
 snapshots from either mode, and while paused `v` pages the frozen frame —
 which is also where search lives: page into `less` and search there. One
