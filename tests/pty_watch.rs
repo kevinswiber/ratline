@@ -1579,6 +1579,28 @@ fn quitting_kills_the_child_it_started() {
     }
 }
 
+#[test]
+fn once_paints_one_frame_and_exits() {
+    // No test has ever run --once on a tty; its paint now rides the
+    // same completion handler as the loop, so pin it: one frame, a
+    // clean self-exit, no q needed.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "--once", "--", &rat_bin(), "style", "hi"],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(3)),
+        "expected the one frame"
+    );
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "once mode should exit on its own"
+    );
+}
+
 /// The last complete \r\n-delimited row containing `needle`.
 fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
     bytes

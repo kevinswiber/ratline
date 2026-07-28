@@ -308,3 +308,42 @@ fn no_wrap_is_accepted_and_leaves_piped_output_alone() {
         .success()
         .stdout(predicates::str::contains(long_line.as_str()));
 }
+
+/// The unified loop's piped-mode payoff: a signal lands between naps
+/// instead of waiting out the child. The started file is child-side
+/// evidence the slow tick is in flight before the signal is sent.
+#[cfg(unix)]
+#[test]
+fn a_signal_ends_a_piped_watch_during_a_slow_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = dir.path().join("started");
+    let script = format!(": > {}; /bin/sleep 5", started.display());
+    let mut watch = std::process::Command::new(rat_bin())
+        .args(["watch", "-n", "5s", "--shell", "--", &script])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat watch piped");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    unsafe { libc::kill(watch.id() as i32, libc::SIGTERM) };
+    // Reaped well inside the child's remaining ~5 s: the loop noticed
+    // the flag between naps instead of waiting the child out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = watch.try_wait().expect("try_wait") {
+            assert!(status.success(), "the SIGTERM path returns Ok — exit 0");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGTERM waited out the child"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
