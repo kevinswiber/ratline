@@ -13,6 +13,7 @@ use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
+use crate::term::scroll::ScrollStep;
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
 use crate::term::tap::{TapScanner, TtyTap};
@@ -205,56 +206,67 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             let events = crossterm_slice(nap)?;
             for event in events {
                 match event {
-                    TapEvent::Key(Key::CtrlC) => {
-                        renderer.finish().context("restoring terminal")?;
-                        return Err(AppError::Aborted);
-                    }
-                    TapEvent::Key(Key::Char('q')) => {
-                        renderer.finish().context("restoring terminal")?;
-                        return Ok(());
-                    }
-                    TapEvent::Key(Key::Char('v')) | TapEvent::Key(Key::Enter) => {
-                        // The pager reads the same terminal. Stop the
-                        // pushes first, then park our reader, so a report
-                        // can never land in a foreign reader's input.
-                        #[cfg(unix)]
-                        if let Some(sub) = theme_sub.as_mut() {
-                            let _ = sub.suspend();
+                    TapEvent::Key(key) => match action_for(key, false) {
+                        WatchAction::Abort => {
+                            renderer.finish().context("restoring terminal")?;
+                            return Err(AppError::Aborted);
                         }
-                        // Park our reader and require its confirmation
-                        // before handing the input stream over.
-                        // Unconfirmed means a reader may still be attached
-                        // — never spawn a second one against it.
-                        #[cfg(unix)]
-                        let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
-                        #[cfg(windows)]
-                        let handed_off = true;
-                        notice = if handed_off {
-                            page_frame(&full_lines, &mut renderer)
-                        } else {
-                            Some(
-                                "pager unavailable: the input reader did not yield; try again"
-                                    .to_string(),
-                            )
-                        };
-                        // Reader first, then pushes: a report always has
-                        // someone to read it.
-                        #[cfg(unix)]
-                        {
-                            if let Some(tap) = tap.as_ref() {
-                                tap.resume();
-                            }
+                        WatchAction::Quit => {
+                            renderer.finish().context("restoring terminal")?;
+                            return Ok(());
+                        }
+                        WatchAction::Page => {
+                            // The pager reads the same terminal. Stop the
+                            // pushes first, then park our reader, so a report
+                            // can never land in a foreign reader's input.
+                            #[cfg(unix)]
                             if let Some(sub) = theme_sub.as_mut() {
-                                let _ = sub.resume();
+                                let _ = sub.suspend();
                             }
-                            // Whatever was in flight belongs to a terminal
-                            // state we stopped listening to.
-                            verify = VerifyState::default();
+                            // Park our reader and require its confirmation
+                            // before handing the input stream over.
+                            // Unconfirmed means a reader may still be attached
+                            // — never spawn a second one against it.
+                            #[cfg(unix)]
+                            let handed_off = tap.as_ref().is_none_or(|tap| tap.pause());
+                            #[cfg(windows)]
+                            let handed_off = true;
+                            notice = if handed_off {
+                                page_frame(&full_lines, &mut renderer)
+                            } else {
+                                Some(
+                                    "pager unavailable: the input reader did not yield; try again"
+                                        .to_string(),
+                                )
+                            };
+                            // Reader first, then pushes: a report always has
+                            // someone to read it.
+                            #[cfg(unix)]
+                            {
+                                if let Some(tap) = tap.as_ref() {
+                                    tap.resume();
+                                }
+                                if let Some(sub) = theme_sub.as_mut() {
+                                    let _ = sub.resume();
+                                }
+                                // Whatever was in flight belongs to a terminal
+                                // state we stopped listening to.
+                                verify = VerifyState::default();
+                            }
+                            // Repaint immediately with fresh data.
+                            previous_key = None;
+                            break 'wait;
                         }
-                        // Repaint immediately with fresh data.
-                        previous_key = None;
-                        break 'wait;
-                    }
+                        // Not yet wired: scrollback, snapshots, and view
+                        // toggles land behind these.
+                        WatchAction::Scroll(_)
+                        | WatchAction::Snapshot
+                        | WatchAction::Resume
+                        | WatchAction::ToggleWrap
+                        | WatchAction::ShiftLeft
+                        | WatchAction::ShiftRight => {}
+                        WatchAction::Ignore => {}
+                    },
                     // The reported value is ignored on purpose: it can
                     // disagree with the colors actually on screen. Every
                     // report re-arms, including one that arrives while an
@@ -276,14 +288,58 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             break 'wait;
                         }
                     }
-                    // Every other key, as before.
-                    _ => {}
+                    // The theme events exist on Windows too; their unix
+                    // arms above are compiled out there, and the crossterm
+                    // pump never produces them.
+                    #[cfg(windows)]
+                    TapEvent::ThemeNotification(_) | TapEvent::OscColor(..) => {}
                 }
             }
         }
     }
     renderer.finish().context("restoring terminal")?;
     Ok(())
+}
+
+/// What one key means, resolved by `action_for`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum WatchAction {
+    Abort,
+    Quit,
+    Page,
+    Snapshot,
+    Resume,
+    Scroll(ScrollStep),
+    ToggleWrap,
+    ShiftLeft,
+    ShiftRight,
+    Ignore,
+}
+
+/// The whole binding table, for both input paths and both modes — unix and
+/// Windows read their keys differently but mean the same things by them.
+/// Scroll while live freezes first; that is the loop's business, not the
+/// table's. View keys never freeze.
+fn action_for(key: Key, paused: bool) -> WatchAction {
+    match key {
+        Key::CtrlC => WatchAction::Abort,
+        Key::Char('q') => WatchAction::Quit,
+        Key::Char('v') | Key::Enter => WatchAction::Page,
+        Key::Char('S') => WatchAction::Snapshot,
+        Key::Char('j') | Key::Down => WatchAction::Scroll(ScrollStep::LineDown),
+        Key::Char('k') | Key::Up => WatchAction::Scroll(ScrollStep::LineUp),
+        Key::Char('d') => WatchAction::Scroll(ScrollStep::HalfDown),
+        Key::Char('u') => WatchAction::Scroll(ScrollStep::HalfUp),
+        Key::Char('f') | Key::PageDown => WatchAction::Scroll(ScrollStep::PageDown),
+        Key::Char('b') | Key::PageUp => WatchAction::Scroll(ScrollStep::PageUp),
+        Key::Char('g') | Key::Home => WatchAction::Scroll(ScrollStep::Top),
+        Key::Char('G') | Key::End => WatchAction::Scroll(ScrollStep::Bottom),
+        Key::Char('w') => WatchAction::ToggleWrap,
+        Key::Char('h') | Key::Left => WatchAction::ShiftLeft,
+        Key::Char('l') | Key::Right => WatchAction::ShiftRight,
+        Key::Esc if paused => WatchAction::Resume,
+        _ => WatchAction::Ignore,
+    }
 }
 
 /// How long lines are shown: wrapped (today's path) or chopped, shifted
@@ -614,6 +670,80 @@ mod tests {
     use ratatui::style::Color;
 
     use super::*;
+
+    #[test]
+    fn todays_keys_mean_the_same_thing_in_both_modes() {
+        for paused in [false, true] {
+            assert_eq!(action_for(Key::CtrlC, paused), WatchAction::Abort);
+            assert_eq!(action_for(Key::Char('q'), paused), WatchAction::Quit);
+            assert_eq!(action_for(Key::Char('v'), paused), WatchAction::Page);
+            assert_eq!(action_for(Key::Enter, paused), WatchAction::Page);
+        }
+    }
+
+    #[test]
+    fn navigation_keys_scroll() {
+        use crate::term::scroll::ScrollStep;
+
+        for paused in [false, true] {
+            for (key, step) in [
+                (Key::Char('j'), ScrollStep::LineDown),
+                (Key::Down, ScrollStep::LineDown),
+                (Key::Char('k'), ScrollStep::LineUp),
+                (Key::Up, ScrollStep::LineUp),
+                (Key::Char('d'), ScrollStep::HalfDown),
+                (Key::Char('u'), ScrollStep::HalfUp),
+                (Key::Char('f'), ScrollStep::PageDown),
+                (Key::PageDown, ScrollStep::PageDown),
+                (Key::Char('b'), ScrollStep::PageUp),
+                (Key::PageUp, ScrollStep::PageUp),
+                (Key::Char('g'), ScrollStep::Top),
+                (Key::Home, ScrollStep::Top),
+                (Key::Char('G'), ScrollStep::Bottom),
+                (Key::End, ScrollStep::Bottom),
+            ] {
+                assert_eq!(
+                    action_for(key, paused),
+                    WatchAction::Scroll(step),
+                    "{key:?} paused={paused}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn esc_only_means_something_when_frozen() {
+        assert_eq!(action_for(Key::Esc, false), WatchAction::Ignore);
+        assert_eq!(action_for(Key::Esc, true), WatchAction::Resume);
+    }
+
+    #[test]
+    fn view_keys_are_view_actions_in_both_modes() {
+        for paused in [false, true] {
+            assert_eq!(action_for(Key::Char('w'), paused), WatchAction::ToggleWrap);
+            assert_eq!(action_for(Key::Char('h'), paused), WatchAction::ShiftLeft);
+            assert_eq!(action_for(Key::Left, paused), WatchAction::ShiftLeft);
+            assert_eq!(action_for(Key::Char('l'), paused), WatchAction::ShiftRight);
+            assert_eq!(action_for(Key::Right, paused), WatchAction::ShiftRight);
+        }
+    }
+
+    #[test]
+    fn unbound_keys_are_ignored() {
+        for paused in [false, true] {
+            assert_eq!(action_for(Key::Char('x'), paused), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Tab, paused), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Backspace, paused), WatchAction::Ignore);
+        }
+    }
+
+    #[test]
+    fn s_is_the_snapshot_key() {
+        for paused in [false, true] {
+            assert_eq!(action_for(Key::Char('S'), paused), WatchAction::Snapshot);
+            assert_eq!(action_for(Key::Char('s'), paused), WatchAction::Ignore);
+        }
+    }
 
     #[test]
     fn the_window_is_the_max_height_or_two_short_of_the_screen() {
