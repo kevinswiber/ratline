@@ -253,7 +253,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             let events = crossterm_slice(nap)?;
             for event in events {
                 match event {
-                    TapEvent::Key(key) => match action_for(key, pause.is_some()) {
+                    TapEvent::Key(key) => match action_for(key, mode_of(pause.as_ref())) {
                         WatchAction::Abort => {
                             renderer.finish().context("restoring terminal")?;
                             return Err(AppError::Aborted);
@@ -462,6 +462,25 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     Ok(())
 }
 
+/// Which surface the loop is showing. `pause` and (later) a live window
+/// are never both active; the freeze remains reachable from every mode.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum FrameMode {
+    Live,
+    LiveScrolled,
+    Paused,
+}
+
+/// The current mode. Nothing enters `LiveScrolled` yet; the variant
+/// exists so the binding table is total over all three modes.
+fn mode_of(pause: Option<&PauseState>) -> FrameMode {
+    if pause.is_some() {
+        FrameMode::Paused
+    } else {
+        FrameMode::Live
+    }
+}
+
 /// What one key means, resolved by `action_for`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum WatchAction {
@@ -478,11 +497,11 @@ enum WatchAction {
     Ignore,
 }
 
-/// The whole binding table, for both input paths and both modes — unix and
+/// The whole binding table, for both input paths and every mode — unix and
 /// Windows read their keys differently but mean the same things by them.
-/// Scroll while live freezes first; that is the loop's business, not the
+/// What a Scroll action does while live is the loop's business, not the
 /// table's. View keys never freeze.
-fn action_for(key: Key, paused: bool) -> WatchAction {
+fn action_for(key: Key, mode: FrameMode) -> WatchAction {
     match key {
         Key::CtrlC => WatchAction::Abort,
         Key::Char('q') => WatchAction::Quit,
@@ -499,8 +518,8 @@ fn action_for(key: Key, paused: bool) -> WatchAction {
         Key::Char('w') => WatchAction::ToggleWrap,
         Key::Char('h') | Key::Left => WatchAction::ShiftLeft,
         Key::Char('l') | Key::Right => WatchAction::ShiftRight,
-        Key::Esc | Key::Char('F') if paused => WatchAction::Resume,
-        Key::Char('p') if !paused => WatchAction::Freeze,
+        Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
+        Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         _ => WatchAction::Ignore,
     }
 }
@@ -624,14 +643,13 @@ fn repaint(
 ) -> anyhow::Result<PaintKey> {
     let age_secs = pause.map_or(0, |p| age_seconds(p.viewed_at));
     let key = paint_key(pause, live_content, live_appearance, size, view, age_secs);
-    let (source, offset, paused) = match pause {
-        Some(p) => (p.frozen.as_slice(), p.scroll.offset(), true),
-        None => (full_lines, 0, false),
+    let (source, offset, mode) = match pause {
+        Some(p) => (p.frozen.as_slice(), p.scroll.offset(), FrameMode::Paused),
+        None => (full_lines, 0, FrameMode::Live),
     };
     let age = age_text(age_secs);
     paint_frame(
-        renderer, source, offset, paused, view, notice, size, max_height, faint, profile, since,
-        &age,
+        renderer, source, offset, mode, view, notice, size, max_height, faint, profile, since, &age,
     )?;
     Ok(key)
 }
@@ -673,7 +691,7 @@ fn paint_frame(
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
     lines: &[String],
     offset: usize,
-    paused: bool,
+    mode: FrameMode,
     view: ViewState,
     notice: Option<String>,
     size: (u16, u16),
@@ -685,10 +703,15 @@ fn paint_frame(
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
-    let start = if paused { offset.min(lines.len()) } else { 0 };
-    // A nonzero shift implies chopped lines, less's own rule. Chopped
-    // rendering is 1:1 line-to-row; wrapped rendering is today's path.
-    let (mut kept, hidden) = if !view.wrap || view.hshift > 0 {
+    let start = match mode {
+        FrameMode::Live => 0,
+        FrameMode::LiveScrolled | FrameMode::Paused => offset.min(lines.len()),
+    };
+    // A nonzero shift implies chopped lines, less's own rule — and so does
+    // live-scrolling, where an offset counts lines and only chopping makes
+    // a line one row. Chopped rendering is 1:1 line-to-row; wrapped
+    // rendering is today's path.
+    let (mut kept, hidden) = if !view.wrap || view.hshift > 0 || mode == FrameMode::LiveScrolled {
         let end = (start + usize::from(max_rows)).min(lines.len());
         let kept: Vec<String> = lines[start..end]
             .iter()
@@ -698,7 +721,7 @@ fn paint_frame(
     } else {
         truncate_to_rows(lines[start..].to_vec(), max_rows, cols)
     };
-    if paused {
+    if mode == FrameMode::Paused {
         kept.push(faint.render(
             &paused_notice(age, offset, kept.len(), lines.len()),
             profile,
@@ -973,13 +996,15 @@ mod tests {
 
     use super::*;
 
+    const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
+
     #[test]
-    fn todays_keys_mean_the_same_thing_in_both_modes() {
-        for paused in [false, true] {
-            assert_eq!(action_for(Key::CtrlC, paused), WatchAction::Abort);
-            assert_eq!(action_for(Key::Char('q'), paused), WatchAction::Quit);
-            assert_eq!(action_for(Key::Char('v'), paused), WatchAction::Page);
-            assert_eq!(action_for(Key::Enter, paused), WatchAction::Page);
+    fn todays_keys_mean_the_same_thing_in_every_mode() {
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::CtrlC, mode), WatchAction::Abort);
+            assert_eq!(action_for(Key::Char('q'), mode), WatchAction::Quit);
+            assert_eq!(action_for(Key::Char('v'), mode), WatchAction::Page);
+            assert_eq!(action_for(Key::Enter, mode), WatchAction::Page);
         }
     }
 
@@ -987,7 +1012,7 @@ mod tests {
     fn navigation_keys_scroll() {
         use crate::term::scroll::ScrollStep;
 
-        for paused in [false, true] {
+        for mode in ALL_MODES {
             for (key, step) in [
                 (Key::Char('j'), ScrollStep::LineDown),
                 (Key::Down, ScrollStep::LineDown),
@@ -1005,53 +1030,78 @@ mod tests {
                 (Key::End, ScrollStep::Bottom),
             ] {
                 assert_eq!(
-                    action_for(key, paused),
+                    action_for(key, mode),
                     WatchAction::Scroll(step),
-                    "{key:?} paused={paused}"
+                    "{key:?} mode={mode:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn esc_only_means_something_when_frozen() {
-        assert_eq!(action_for(Key::Esc, false), WatchAction::Ignore);
-        assert_eq!(action_for(Key::Esc, true), WatchAction::Resume);
+    fn esc_only_means_something_when_not_live() {
+        assert_eq!(action_for(Key::Esc, FrameMode::Live), WatchAction::Ignore);
+        assert_eq!(
+            action_for(Key::Esc, FrameMode::LiveScrolled),
+            WatchAction::Resume
+        );
+        assert_eq!(action_for(Key::Esc, FrameMode::Paused), WatchAction::Resume);
     }
 
     #[test]
     fn f_resumes_and_p_freezes() {
-        assert_eq!(action_for(Key::Char('F'), true), WatchAction::Resume);
-        assert_eq!(action_for(Key::Char('F'), false), WatchAction::Ignore);
-        assert_eq!(action_for(Key::Char('p'), false), WatchAction::Freeze);
-        assert_eq!(action_for(Key::Char('p'), true), WatchAction::Ignore);
+        assert_eq!(
+            action_for(Key::Char('F'), FrameMode::Live),
+            WatchAction::Ignore
+        );
+        assert_eq!(
+            action_for(Key::Char('F'), FrameMode::LiveScrolled),
+            WatchAction::Resume
+        );
+        assert_eq!(
+            action_for(Key::Char('F'), FrameMode::Paused),
+            WatchAction::Resume
+        );
+        assert_eq!(
+            action_for(Key::Char('p'), FrameMode::Live),
+            WatchAction::Freeze
+        );
+        assert_eq!(
+            action_for(Key::Char('p'), FrameMode::LiveScrolled),
+            WatchAction::Freeze
+        );
+        assert_eq!(
+            action_for(Key::Char('p'), FrameMode::Paused),
+            WatchAction::Ignore
+        );
     }
 
     #[test]
-    fn view_keys_are_view_actions_in_both_modes() {
-        for paused in [false, true] {
-            assert_eq!(action_for(Key::Char('w'), paused), WatchAction::ToggleWrap);
-            assert_eq!(action_for(Key::Char('h'), paused), WatchAction::ShiftLeft);
-            assert_eq!(action_for(Key::Left, paused), WatchAction::ShiftLeft);
-            assert_eq!(action_for(Key::Char('l'), paused), WatchAction::ShiftRight);
-            assert_eq!(action_for(Key::Right, paused), WatchAction::ShiftRight);
+    fn view_keys_are_view_actions_in_every_mode() {
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('w'), mode), WatchAction::ToggleWrap);
+            assert_eq!(action_for(Key::Char('h'), mode), WatchAction::ShiftLeft);
+            assert_eq!(action_for(Key::Left, mode), WatchAction::ShiftLeft);
+            assert_eq!(action_for(Key::Char('l'), mode), WatchAction::ShiftRight);
+            assert_eq!(action_for(Key::Right, mode), WatchAction::ShiftRight);
         }
     }
 
     #[test]
     fn unbound_keys_are_ignored() {
-        for paused in [false, true] {
-            assert_eq!(action_for(Key::Char('x'), paused), WatchAction::Ignore);
-            assert_eq!(action_for(Key::Tab, paused), WatchAction::Ignore);
-            assert_eq!(action_for(Key::Backspace, paused), WatchAction::Ignore);
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('x'), mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Char('>'), mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Tab, mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Backspace, mode), WatchAction::Ignore);
         }
     }
 
     #[test]
     fn s_is_the_snapshot_key() {
-        for paused in [false, true] {
-            assert_eq!(action_for(Key::Char('S'), paused), WatchAction::Snapshot);
-            assert_eq!(action_for(Key::Char('s'), paused), WatchAction::Ignore);
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('S'), mode), WatchAction::Snapshot);
+            assert_eq!(action_for(Key::Char('s'), mode), WatchAction::Ignore);
         }
     }
 
