@@ -86,7 +86,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         ..StyleSpec::default()
     };
 
-    let mut previous_key: Option<(u64, u16, u16, Appearance)> = None;
+    let mut previous_key: Option<PaintKey> = None;
     let mut full_lines: Vec<String> = Vec::new();
     let mut notice: Option<String> = None;
     loop {
@@ -99,40 +99,40 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         // palette swap must repaint even when the child prints the same
         // bytes.
         let size = crossterm::terminal::size().unwrap_or((80, 24));
-        if previous_key != Some((hash, size.0, size.1, palette.appearance)) || notice.is_some() {
-            previous_key = Some((hash, size.0, size.1, palette.appearance));
-            let body = String::from_utf8_lossy(&output.stdout);
-            let mut lines: Vec<String> = Vec::new();
-            if let Some(title) = &title_line {
-                lines.push(title.clone());
-            }
-            lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
-            // Child stderr joins the frame; a raw write to the terminal
-            // would shift the cursor and corrupt the relative repaint.
-            if is_tty && !output.stderr.is_empty() {
-                let err_body = String::from_utf8_lossy(&output.stderr);
-                lines.extend(
-                    err_body
-                        .trim_end_matches('\n')
-                        .split('\n')
-                        .map(str::to_string),
-                );
-            }
+        // Composed above the repaint gate: `full_lines` tracks the latest
+        // frame every tick, so paging always acts on the newest content.
+        let lines = compose_frame(title_line.as_ref(), &output, is_tty);
+        if is_tty {
+            full_lines.clone_from(&lines);
+        }
+        let key = PaintKey {
+            content: hash,
+            cols: size.0,
+            rows: size.1,
+            appearance: palette.appearance,
+            offset: 0,
+            paused: false,
+            wrap: true,
+            hshift: 0,
+        };
+        if previous_key != Some(key) || notice.is_some() {
+            previous_key = Some(key);
             if is_tty {
-                full_lines.clone_from(&lines);
-                let (cols, rows) = size;
-                let max_rows = args.max_height.unwrap_or_else(|| rows.saturating_sub(2));
-                let (mut kept, hidden) = truncate_to_rows(lines, max_rows, cols);
-                if hidden > 0 {
-                    kept.push(faint.render(
-                        &format!("… {hidden} more lines · v views all · q quits"),
-                        profile,
-                    ));
-                }
-                if let Some(text) = notice.take() {
-                    kept.push(faint.render(&text, profile));
-                }
-                renderer.draw(&kept, cols).context("writing frame")?;
+                paint_frame(
+                    &mut renderer,
+                    &full_lines,
+                    0,
+                    false,
+                    ViewState {
+                        wrap: true,
+                        hshift: 0,
+                    },
+                    notice.take(),
+                    size,
+                    args.max_height,
+                    &faint,
+                    profile,
+                )?;
             } else {
                 let mut out = std::io::stdout().lock();
                 for line in &lines {
@@ -283,6 +283,92 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         }
     }
     renderer.finish().context("restoring terminal")?;
+    Ok(())
+}
+
+/// How long lines are shown: wrapped (today's path) or chopped, shifted
+/// `hshift` columns right. View state, not scrollback state: it survives
+/// freeze/resume and pager round-trips.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+struct ViewState {
+    wrap: bool,
+    hshift: usize,
+}
+
+/// Everything a painted frame depends on; the repaint gate compares two of
+/// these. While paused, `content`/`appearance` are the freeze-time values,
+/// so new child output never repaints a frozen frame — but scroll, resize,
+/// and view toggles do.
+#[derive(Copy, Clone, PartialEq, Debug)]
+struct PaintKey {
+    content: u64,
+    cols: u16,
+    rows: u16,
+    appearance: Appearance,
+    offset: usize,
+    paused: bool,
+    wrap: bool,
+    hshift: usize,
+}
+
+/// The painted body: `max_height`, else terminal rows − 2 (one row for the
+/// notice line, one for the cursor row below the frame).
+fn window_rows(max_height: Option<u16>, rows: u16) -> u16 {
+    max_height.unwrap_or_else(|| rows.saturating_sub(2))
+}
+
+/// One frame's lines: title first, child stdout, then child stderr when it
+/// joins the frame (a raw write to the terminal would shift the cursor and
+/// corrupt the relative repaint). Trailing newlines are trimmed, not the
+/// interior ones.
+fn compose_frame(title: Option<&String>, output: &ChildOutput, join_stderr: bool) -> Vec<String> {
+    let body = String::from_utf8_lossy(&output.stdout);
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(title) = title {
+        lines.push(title.clone());
+    }
+    lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
+    if join_stderr && !output.stderr.is_empty() {
+        let err_body = String::from_utf8_lossy(&output.stderr);
+        lines.extend(
+            err_body
+                .trim_end_matches('\n')
+                .split('\n')
+                .map(str::to_string),
+        );
+    }
+    lines
+}
+
+/// The single place a tty frame body is painted: truncate to the window,
+/// append the truncation notice and the one-shot notice row, draw.
+#[allow(clippy::too_many_arguments)]
+#[allow(unused_variables)] // offset/paused/view: the paused and chopped paint branches are not yet wired.
+fn paint_frame(
+    renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
+    lines: &[String],
+    offset: usize,
+    paused: bool,
+    view: ViewState,
+    notice: Option<String>,
+    size: (u16, u16),
+    max_height: Option<u16>,
+    faint: &StyleSpec,
+    profile: ColorProfile,
+) -> anyhow::Result<()> {
+    let (cols, rows) = size;
+    let max_rows = window_rows(max_height, rows);
+    let (mut kept, hidden) = truncate_to_rows(lines.to_vec(), max_rows, cols);
+    if hidden > 0 {
+        kept.push(faint.render(
+            &format!("… {hidden} more lines · v views all · q quits"),
+            profile,
+        ));
+    }
+    if let Some(text) = notice {
+        kept.push(faint.render(&text, profile));
+    }
+    renderer.draw(&kept, cols).context("writing frame")?;
     Ok(())
 }
 
@@ -528,6 +614,30 @@ mod tests {
     use ratatui::style::Color;
 
     use super::*;
+
+    #[test]
+    fn the_window_is_the_max_height_or_two_short_of_the_screen() {
+        assert_eq!(window_rows(None, 24), 22);
+        assert_eq!(window_rows(Some(5), 24), 5);
+        assert_eq!(window_rows(None, 1), 0);
+    }
+
+    #[test]
+    fn composing_a_frame_puts_the_title_first_and_stderr_last() {
+        let output = ChildOutput {
+            stdout: b"a\nb\n".to_vec(),
+            stderr: b"boom\n".to_vec(),
+        };
+        let title = "T".to_string();
+        assert_eq!(
+            compose_frame(Some(&title), &output, true),
+            vec!["T", "a", "b", "boom"]
+        );
+        assert_eq!(
+            compose_frame(Some(&title), &output, false),
+            vec!["T", "a", "b"]
+        );
+    }
 
     #[test]
     fn adopting_a_different_appearance_reresolves_the_palette() {
