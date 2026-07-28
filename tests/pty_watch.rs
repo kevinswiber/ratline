@@ -675,10 +675,16 @@ fn first_digit_run(bytes: &[u8], min: usize) -> Option<Vec<u8>> {
 fn a_stable_frame_scrolls_live() {
     // 46 fixed lines; line 23 carries a changing stamp that is hidden in
     // the 22-row window at the top and visible at offset 1 — proof the
-    // tail keeps ticking under a scrolled window.
+    // tail keeps ticking under a scrolled window. The child counts its
+    // ticks into a file so the test can WAIT for stability instead of
+    // guessing at it from wall-clock time.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
     let rat = rat_bin();
     let script = format!(
-        "i=1; while [ $i -le 46 ]; do \
+        "echo x >> {count_path}; \
+         i=1; while [ $i -le 46 ]; do \
            if [ $i -eq 23 ]; then {rat} date --format %H%M%S%f; \
            else echo l$i; fi; i=$((i+1)); done"
     );
@@ -694,8 +700,9 @@ fn a_stable_frame_scrolls_live() {
         wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
         "expected a first frame"
     );
-    // Let the height ring fill: stability needs eight equal ticks.
-    let _ = drain_for(&session, Duration::from_millis(700));
+    // The height ring is full once eight equal ticks have been observed.
+    wait_for_ticks(&session, &count, 10);
+    let _ = drain_for(&session, Duration::from_millis(200));
 
     // A top-reaching step never enters the mode: g at the top stays Live.
     session.write_bytes(b"g");
@@ -791,12 +798,16 @@ fn an_unstable_frame_freezes_on_scroll() {
 #[test]
 fn a_shape_change_while_scrolled_freezes() {
     // Stable until the test says otherwise: the frame grows one line the
-    // moment the grow file appears, deterministically mid-scroll.
+    // moment the grow file appears, deterministically mid-scroll. The
+    // tick-count file proves stability before the first scroll key.
     let dir = tempfile::tempdir().expect("tempdir");
     let grow = dir.path().join("grow");
     let grow_path = grow.display().to_string();
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
     let script = format!(
-        "i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done; \
+        "echo x >> {count_path}; \
+         i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done; \
          if [ -e {grow_path} ]; then echo extra; fi"
     );
     let session = PtySession::spawn(
@@ -811,7 +822,8 @@ fn a_shape_change_while_scrolled_freezes() {
         wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
         "expected a first frame"
     );
-    let _ = drain_for(&session, Duration::from_millis(700));
+    wait_for_ticks(&session, &count, 10);
+    let _ = drain_for(&session, Duration::from_millis(200));
 
     session.write_bytes(b"j");
     assert!(
@@ -831,7 +843,7 @@ fn a_shape_change_while_scrolled_freezes() {
         &session,
         &mut terminal,
         b"frame changed shape",
-        Duration::from_secs(5),
+        Duration::from_secs(8),
     )
     .expect("expected the one-shot shape notice");
     assert!(
@@ -849,6 +861,27 @@ fn a_shape_change_while_scrolled_freezes() {
         !session.kill_if_alive(Duration::from_secs(2)),
         "watch should have exited on q"
     );
+}
+
+/// Wait until the child's tick-count file proves at least `ticks`
+/// invocations have started (so `ticks - 1` have completed and been
+/// observed). Wall-clock drains are not stability evidence on a slow CI
+/// runner; the count file is. Keeps the pty drained while waiting.
+fn wait_for_ticks(session: &PtySession, count_file: &std::path::Path, ticks: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let seen = std::fs::read_to_string(count_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if seen >= ticks {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never reached {ticks} ticks ({seen} seen)"
+        );
+        let _ = drain_for(session, Duration::from_millis(50));
+    }
 }
 
 /// Every `v`-prefixed six-digit counter value in the byte stream — the
