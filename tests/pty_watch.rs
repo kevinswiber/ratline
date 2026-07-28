@@ -1656,6 +1656,154 @@ fn a_theme_flip_during_a_child_run_reruns_it_under_the_new_appearance() {
     );
 }
 
+#[test]
+fn resuming_from_a_pause_paints_at_once_and_still_refreshes() {
+    // The idle-at-F half of the resume contract. Red provenance:
+    // assertion 1 fails on any tree where resume waits for the forced
+    // tick before painting (the pre-async stall, or a dropped
+    // in-place repaint); assertion 2 fails if resume loses its
+    // request_now (the fresh frame would wait for the natural tick at
+    // t≈11 s); assertion 3 catches a spurious double-spawn.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!(
+        "echo x >> {count_path}; /bin/sleep 1; n=$(wc -l < {count_path}); printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "10s", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v000001", Duration::from_secs(5)),
+        "expected the first frame"
+    );
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused ·".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected p to freeze"
+    );
+    session.write_bytes(b"F");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"since ",
+            Duration::from_millis(500)
+        ),
+        "expected the collapse to paint without waiting out the child"
+    );
+    assert!(
+        wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(4)),
+        "expected the fresh-tick self-heal to deliver"
+    );
+    // A settle before reading child-side evidence: one startup child,
+    // one self-heal child, nothing else.
+    let _ = drain_for(&session, Duration::from_millis(1500));
+    let runs = std::fs::read_to_string(&count)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(runs, 2, "resume must spawn exactly one fresh child");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn resuming_while_a_child_is_in_flight_collapses_at_once_and_never_doubles() {
+    // The in-flight half: F while a child runs must paint NOW, be
+    // satisfied by that child's completion, and not double-spawn. Red
+    // provenance: assertion 1 fails on any tree where the collapse
+    // blocks on the in-flight tick; assertion 3 fails if a pending
+    // request force-spawns on top of the completion that satisfied it
+    // (count reads 3 well before the next honest tick at t≈13 s).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!(
+        "echo x >> {count_path}; n=$(wc -l < {count_path}); \
+         if [ $n -ge 2 ]; then /bin/sleep 3; fi; printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "5s", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v000001", Duration::from_secs(5)),
+        "expected the fast first frame"
+    );
+    // Child-side evidence the SECOND child is in flight (its top-of-
+    // script append) with ~3 s of sleep left.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+        < 2
+    {
+        let chunk = session.read_available(Duration::from_millis(20));
+        terminal.respond(&session, &chunk);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second child never started"
+        );
+    }
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused ·".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected p to freeze while the child runs"
+    );
+    session.write_bytes(b"F");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"since ",
+            Duration::from_millis(500)
+        ),
+        "expected the collapse to paint while the child is still running"
+    );
+    assert!(
+        wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(6)),
+        "expected the in-flight completion to deliver the fresh frame"
+    );
+    // Inside the quiet gap before the next natural tick: the
+    // completion satisfied the request, so exactly two children ran.
+    let _ = drain_for(&session, Duration::from_millis(1500));
+    let runs = std::fs::read_to_string(&count)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(runs, 2, "the in-flight completion must satisfy the request");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
 /// The last complete \r\n-delimited row containing `needle`.
 fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
     bytes
