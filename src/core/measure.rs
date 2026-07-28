@@ -250,6 +250,50 @@ pub fn wrap_display(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Drop the first `hshift` display columns of `line`, keep the next `cols`,
+/// replaying any SGR state opened in the dropped prefix and closing with a
+/// reset iff the kept segment leaves state open. Never splits an escape. No
+/// visible text remaining => the empty string (never an orphan SGR prefix).
+/// A double-width rune straddling either cut edge is dropped whole.
+#[allow(dead_code)] // Not yet wired into watch's chopped paint branch.
+pub fn shift_chop(line: &str, hshift: usize, cols: usize) -> String {
+    // Walk off the dropped prefix: every printable starting before column
+    // `hshift` goes (straddlers whole), escapes feed the state tracker.
+    let mut state = SgrState::default();
+    let mut dropped = 0;
+    let mut kept_start = None;
+    let mut offset = 0;
+    for chunk in chunks(line) {
+        match chunk {
+            Chunk::Escape(e) => {
+                state.apply(e);
+                offset += e.len();
+            }
+            Chunk::Text(t, w) => {
+                if dropped >= hshift {
+                    kept_start = Some(offset);
+                    break;
+                }
+                dropped += w;
+                offset += t.len();
+            }
+        }
+    }
+    let Some(kept_start) = kept_start else {
+        return String::new();
+    };
+    let (head, _) = split_at_width(&line[kept_start..], cols);
+    if display_width(head) == 0 {
+        return String::new();
+    }
+    let mut out = format!("{}{head}", state.prefix());
+    state.apply_all(head);
+    if state.is_open() {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
 /// Byte offset of the last plain-space chunk, if any.
 fn last_space_offset(s: &str) -> Option<usize> {
     let mut offset = 0;
@@ -419,5 +463,58 @@ mod tests {
     fn wrap_of_empty_and_zero_width_terminates() {
         assert_eq!(wrap_display("", 5), vec![String::new()]);
         assert_eq!(wrap_display("abc", 0), vec!["abc".to_string()]);
+    }
+
+    #[test]
+    fn a_zero_shift_is_a_plain_clip() {
+        assert_eq!(shift_chop("abcdef", 0, 4), "abcd");
+        assert_eq!(shift_chop("abc", 0, 5), "abc");
+    }
+
+    #[test]
+    fn a_shift_drops_display_columns_not_bytes() {
+        assert_eq!(shift_chop("abcdef", 2, 3), "cde");
+    }
+
+    #[test]
+    fn sgr_opened_in_the_dropped_prefix_survives() {
+        let shifted = shift_chop("\x1b[31mabcdef\x1b[0m", 2, 3);
+        assert!(shifted.starts_with("\x1b[31m"), "lost the red: {shifted:?}");
+        assert_eq!(strip_escapes(&shifted), "cde");
+        // A reset that falls inside the kept window survives in place.
+        assert_eq!(
+            shift_chop("\x1b[31mab\x1b[0mcdef", 1, 3),
+            "\x1b[31mb\x1b[0mcd"
+        );
+    }
+
+    #[test]
+    fn an_escape_is_never_split() {
+        // The shift lands exactly where an escape sits in the byte stream;
+        // it is replayed via the tracker, whole.
+        assert_eq!(
+            shift_chop("ab\x1b[31mcdef\x1b[0m", 2, 3),
+            "\x1b[31mcde\x1b[0m"
+        );
+        assert_eq!(shift_chop("ab\x1b[31mcd", 3, 2), "\x1b[31md\x1b[0m");
+    }
+
+    #[test]
+    fn a_shift_past_the_end_yields_exactly_empty() {
+        assert_eq!(shift_chop("abc", 10, 5), "");
+        assert_eq!(shift_chop("\x1b[31mabc\x1b[0m", 10, 5), "");
+    }
+
+    #[test]
+    fn open_sgr_state_is_closed_at_the_cut() {
+        assert_eq!(shift_chop("\x1b[31mabcdef", 2, 3), "\x1b[31mcde\x1b[0m");
+        // A segment whose source already closed its state gains no extra reset.
+        assert_eq!(shift_chop("\x1b[31mab\x1b[0mcd", 2, 3), "cd");
+    }
+
+    #[test]
+    fn a_wide_rune_cut_on_either_edge_is_dropped_whole() {
+        assert_eq!(shift_chop("你好", 1, 3), "好");
+        assert_eq!(shift_chop("a你", 0, 2), "a");
     }
 }
