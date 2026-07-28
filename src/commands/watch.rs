@@ -1167,17 +1167,16 @@ struct ChildOutput {
     stderr: Vec<u8>,
 }
 
-/// Run one tick of the child, capturing both streams. On a tty the stderr
-/// joins the painted frame (raw terminal writes would corrupt the repaint);
-/// piped mode forwards it to our stderr. Interactive mode nulls the child's
-/// stdin so it cannot eat keystrokes. Loop mode renders spawn failures as
-/// content so a transient failure does not tear down the dashboard; once
-/// mode fails loudly.
-fn run_child(
+/// The child for one tick, fully configured on the loop thread: the
+/// shell or direct form, a null stdin while we own the keyboard, and
+/// the per-tick environment measured by the CALLER — whoever runs the
+/// command never reads the terminal and never sees the palette.
+fn build_command(
     args: &WatchArgs,
     interactive: bool,
     appearance: Appearance,
-) -> Result<ChildOutput, AppError> {
+    size: (u16, u16),
+) -> std::process::Command {
     let mut command = if args.shell {
         shell_command(&args.command.join(" "))
     } else {
@@ -1190,19 +1189,36 @@ fn run_child(
     }
     // Children lay out against the frame without a tty side channel: the
     // size is re-measured every tick, so scripts adapt to resizes live.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = size;
     command.env("RAT_WIDTH", cols.to_string());
     command.env("RAT_HEIGHT", rows.to_string());
     // Children inherit the controlling terminal, so a child that resolved its
     // own appearance would query a terminal this process is reading from.
     // Hand it the verdict instead.
     command.env("RAT_APPEARANCE", appearance.as_str());
-    match command.output() {
-        Ok(out) => Ok(ChildOutput {
-            stdout: out.stdout,
-            stderr: out.stderr,
+    command
+}
+
+/// Run one tick of the child, capturing both streams. On a tty the stderr
+/// joins the painted frame (raw terminal writes would corrupt the repaint);
+/// piped mode forwards it to our stderr. Interactive mode nulls the child's
+/// stdin so it cannot eat keystrokes. Loop mode renders spawn failures as
+/// content so a transient failure does not tear down the dashboard; once
+/// mode fails loudly.
+fn run_child(
+    args: &WatchArgs,
+    interactive: bool,
+    appearance: Appearance,
+) -> Result<ChildOutput, AppError> {
+    let size = crossterm::terminal::size().unwrap_or((80, 24));
+    let command = build_command(args, interactive, appearance, size);
+    let outcome = crate::core::child::run_tick(command);
+    match outcome.spawn_error {
+        None => Ok(ChildOutput {
+            stdout: outcome.stdout,
+            stderr: outcome.stderr,
         }),
-        Err(err) => {
+        Some(err) => {
             if args.once {
                 Err(anyhow!("running {:?}: {err}", args.command[0]).into())
             } else {
@@ -1768,5 +1784,80 @@ mod tests {
             verify.reply(OscColorKind::Background, white()),
             Some(Appearance::Light)
         );
+    }
+
+    fn watch_args(command: &[&str], shell: bool) -> WatchArgs {
+        WatchArgs {
+            interval: "2s".to_string(),
+            once: false,
+            clear: false,
+            no_hide_cursor: false,
+            no_sync: false,
+            shell,
+            title: None,
+            max_height: None,
+            snapshot_dir: None,
+            snapshot_ansi: false,
+            no_wrap: false,
+            command: command.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    // Lossy-String views dodge the OsStr comparison-impl maze: these
+    // are ASCII fixtures, so lossy is lossless here.
+    fn program_of(cmd: &std::process::Command) -> String {
+        cmd.get_program().to_string_lossy().into_owned()
+    }
+
+    fn argv_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn every_child_is_told_the_frame_size_and_appearance() {
+        let args = watch_args(&["some-tool", "--flag"], false);
+        let cmd = build_command(&args, true, Appearance::Light, (100, 40));
+        let envs: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(envs.get("RAT_WIDTH").map(String::as_str), Some("100"));
+        assert_eq!(envs.get("RAT_HEIGHT").map(String::as_str), Some("40"));
+        assert_eq!(
+            envs.get("RAT_APPEARANCE").map(String::as_str),
+            Some("light")
+        );
+    }
+
+    #[test]
+    fn direct_mode_runs_the_command_verbatim() {
+        let args = watch_args(&["some-tool", "--flag", "value"], false);
+        let cmd = build_command(&args, false, Appearance::Dark, (80, 24));
+        assert_eq!(program_of(&cmd), "some-tool");
+        assert_eq!(argv_of(&cmd), ["--flag", "value"]);
+    }
+
+    #[test]
+    fn shell_mode_goes_through_the_platform_shell() {
+        let args = watch_args(&["echo hi"], true);
+        let cmd = build_command(&args, false, Appearance::Dark, (80, 24));
+        #[cfg(unix)]
+        {
+            assert_eq!(program_of(&cmd), "sh");
+            assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
+        }
+        #[cfg(windows)]
+        {
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
+            assert_eq!(program_of(&cmd), shell);
+            assert_eq!(argv_of(&cmd), ["/C", "echo hi"]);
+        }
     }
 }
