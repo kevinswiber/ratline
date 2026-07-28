@@ -289,13 +289,13 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             std::thread::sleep(nap);
             continue;
         }
-        // 5. Wherever the displayed row counts — the paused row by
-        // default, the live row when flipped — the age advances once
-        // per second, riding this nap cycle: a long-interval dashboard
-        // must not wait a whole tick to admit how stale it is. The
-        // only visible delta is the status row, so the repaint is
-        // bounded to status-row bytes (and to none at all while the
-        // text holds).
+        // 5. When the displayed row counts — either row, under the
+        // flipped time style — the age advances once per second,
+        // riding this nap cycle: a long-interval dashboard must not
+        // wait a whole tick to admit how stale it is. The only
+        // visible delta is the status row, so the repaint is bounded
+        // to status-row bytes (and to none at all while the text
+        // holds). Under the default stamps nothing here ever fires.
         if let (Some(prev), Some(l)) = (previous_key, live.as_ref()) {
             let want_age = displayed_age(pause.as_ref(), live_scroll, view.alt_time, l.changed_at);
             if prev.age_secs != want_age {
@@ -813,9 +813,9 @@ struct ViewState {
     /// patched over the child's own styling. Wrap-agnostic: the
     /// splices are zero display cells.
     highlight: bool,
-    /// Flip both time rows to their alternate presentation: the live
-    /// row counts instead of stamping, the paused row stamps instead
-    /// of counting. Presentation only — each row keeps its meaning.
+    /// Flip both time rows from wall-clock stamps to counting ages.
+    /// Presentation only — each row keeps its meaning, and both rows
+    /// always share one style.
     alt_time: bool,
 }
 
@@ -902,8 +902,9 @@ fn age_text(age_secs: u64) -> String {
 }
 
 /// Whole seconds the displayed status row is counting; 0 when it shows
-/// an absolute stamp or no time at all. The paused row counts by
-/// default and flips to a stamp; the live row is the mirror image; the
+/// an absolute stamp or no time at all. ONE style at a time: both rows
+/// stamp by default and count only when flipped — a frozen frame must
+/// never read differently from the live one beside it. The
 /// live-scrolled row carries no time in either state.
 fn displayed_age(
     pause: Option<&PauseState>,
@@ -911,11 +912,10 @@ fn displayed_age(
     alt_time: bool,
     changed_at: jiff::Timestamp,
 ) -> u64 {
-    match (pause, live_scroll) {
-        (Some(p), _) if !alt_time => age_seconds(p.viewed_at),
-        (Some(_), _) | (None, Some(_)) => 0,
-        (None, None) if alt_time => age_seconds(changed_at),
-        (None, None) => 0,
+    match (alt_time, pause, live_scroll) {
+        (true, Some(p), _) => age_seconds(p.viewed_at),
+        (true, None, None) => age_seconds(changed_at),
+        _ => 0,
     }
 }
 
@@ -929,13 +929,14 @@ fn live_time_segment(alt_time: bool, since: &str, live_age_secs: u64) -> String 
     }
 }
 
-/// The paused row's segment: the counting age, or the viewed frame's
-/// wall clock when the presentation is flipped.
+/// The paused row's segment: the viewed frame's wall clock, or its
+/// counting age when the presentation is flipped — the same
+/// stamp-then-counter order the live row follows.
 fn paused_time_segment(alt_time: bool, viewed_at: jiff::Timestamp, age_secs: u64) -> String {
     if alt_time {
-        format!("at {}", local_hms(viewed_at))
-    } else {
         age_text(age_secs)
+    } else {
+        format!("at {}", local_hms(viewed_at))
     }
 }
 
@@ -1668,20 +1669,21 @@ mod tests {
             history_seq: None,
         };
         let ls = LiveScroll::start(ScrollStep::LineDown, 50, 10);
-        // Counting arms (clock tolerance: at least the constructed age).
+        // Counting arms (clock tolerance: at least the constructed
+        // age) — BOTH rows count exactly when flipped, never before.
         assert!(
-            displayed_age(Some(&p), None, false, old) >= 100,
-            "paused default counts"
+            displayed_age(Some(&p), None, true, old) >= 100,
+            "paused flipped counts"
         );
         assert!(
             displayed_age(None, None, true, old) >= 100,
-            "live alternate counts"
+            "live flipped counts"
         );
-        // Absolute / no-time arms are exactly zero.
+        // Default arms are stamps: exactly zero.
         assert_eq!(
-            displayed_age(Some(&p), None, true, old),
+            displayed_age(Some(&p), None, false, old),
             0,
-            "paused alternate is a stamp"
+            "paused default is a stamp"
         );
         assert_eq!(
             displayed_age(None, None, false, old),
@@ -1708,14 +1710,14 @@ mod tests {
     }
 
     #[test]
-    fn the_paused_segment_flips_between_counter_and_stamp() {
+    fn the_paused_segment_stamps_by_default_and_counts_flipped() {
         let t = jiff::Timestamp::from_second(1_785_067_200).expect("timestamp");
-        assert_eq!(paused_time_segment(false, t, 3), "just now");
-        assert_eq!(paused_time_segment(false, t, 14), "14s ago");
         assert_eq!(
-            paused_time_segment(true, t, 999),
+            paused_time_segment(false, t, 999),
             format!("at {}", local_hms(t))
         );
+        assert_eq!(paused_time_segment(true, t, 3), "just now");
+        assert_eq!(paused_time_segment(true, t, 14), "14s ago");
     }
 
     #[test]

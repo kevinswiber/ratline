@@ -87,8 +87,8 @@ if the moment you were reading slides away, step back to it with `<`.
 Nothing ever pauses on its own. `p` parks the frame deliberately — the
 command keeps running behind it, but nothing repaints over what you're
 reading — and `Esc` or `F` return to the live tail. The paused row
-counts how long the view has been parked:
-`paused · 14s ago · lines 2-23 of 30 · Esc resumes`. `q` quits and `S`
+stamps the moment the frame on screen was current:
+`paused · at 14:03:52 · lines 2-23 of 30 · Esc resumes`. `q` quits and `S`
 snapshots from either mode, and while paused `v` pages the frozen frame —
 which is also where search lives: page into `less` and search there. One
 deliberate divergence from `less`: Enter pages rather than scrolling one
@@ -96,15 +96,15 @@ line.
 
 Step back in time with `<` (or `,`): each press parks on the previous
 distinct frame, and `>` (or `.`) steps forward again. The paused row's
-age says how old the frame on screen is, and `S` and `v` act on the
+stamp says when the frame on screen was current, and `S` and `v` act on the
 frame being viewed — step back to when it broke, press `S`. History
 lives in memory only while the session runs, bounded to a few MiB of
 distinct frames.
 
-`t` flips how the two time rows read, without changing what they mean:
-the live row's `since 14:03:52` becomes a counting `changed 14s ago`,
-and the paused row's counting age becomes `at 14:03:52` — the
-wall-clock moment the frame on screen was current. Press `t` again to
+`t` flips both time rows from wall-clock stamps to counting ages,
+without changing what they mean: the live row's `since 14:03:52`
+becomes `changed 14s ago`, and the paused row's `at 14:03:52` becomes
+`14s ago`. One style at a time, on every surface — press `t` again to
 flip back.
 
 Two view toggles work live or frozen, without pausing anything: `w`

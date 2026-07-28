@@ -332,14 +332,13 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
         wait_for(
             &session,
             &mut terminal,
-            "paused · just now ·".as_bytes(),
+            "paused · at ".as_bytes(),
             Duration::from_secs(2)
         ),
         "expected the paused row after the freeze key"
     );
-    // Drain the freeze paint. While the age still reads "just now" the
-    // per-second status repaint is byte-identical, so the differ writes
-    // nothing: a parked frame is byte-silent through the plateau even
+    // Drain the freeze paint. The default paused row is a static
+    // wall-clock stamp, so a parked frame is byte-silent outright even
     // though the child keeps changing behind it.
     let _ = drain_for(&session, Duration::from_millis(300));
     let leaked = session.read_available(Duration::from_millis(1500));
@@ -349,8 +348,10 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
         String::from_utf8_lossy(&leaked)
     );
 
-    // At ten seconds the age starts counting: a write must arrive from
-    // the wait loop — no tick ever repaints a frozen frame.
+    // t flips the row to a counting age; at ten seconds it starts
+    // counting: a write must arrive from the wait loop — no tick ever
+    // repaints a frozen frame.
+    session.write_bytes(b"t");
     let mut seen = wait_for_bytes(&session, &mut terminal, b"s ago", Duration::from_secs(12))
         .expect("expected the counting age to repaint the status row");
     seen.extend(drain_for(&session, Duration::from_millis(1200)));
@@ -372,8 +373,10 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
         "frame content repainted while parked (digit run of {longest_digit_run})"
     );
 
-    // Esc resumes: a live frame arrives, recognizable by its since row —
-    // the one needle a parked status repaint can never produce.
+    // Back to the default style, then Esc resumes: a live frame
+    // arrives, recognizable by its since row — the one needle a parked
+    // status repaint can never produce.
+    session.write_bytes(b"t");
     session.write_bytes(b"\x1b");
     assert!(
         wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
@@ -458,21 +461,25 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
     // p freezes (a stable frame's scroll keys live-scroll instead), then
     // j scrolls the frozen window one line down.
     session.write_bytes(b"p");
+    // Segment-wise: the wall-clock stamp between the two segments is
+    // nondeterministic digits.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "· lines 1-22 of 30 · Esc resumes".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected the frozen window at the top");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            "paused · just now · lines 1-22 of 30 · Esc resumes".as_bytes(),
-            Duration::from_secs(2)
-        ),
-        "expected the frozen window at the top"
+        contains(&seen, "paused · at ".as_bytes()),
+        "expected the paused row to stamp the freeze moment"
     );
     session.write_bytes(b"j");
     assert!(
         wait_for(
             &session,
             &mut terminal,
-            "paused · just now · lines 2-23 of 30 · Esc resumes".as_bytes(),
+            "· lines 2-23 of 30 · Esc resumes".as_bytes(),
             Duration::from_secs(2)
         ),
         "expected the paused row one line down"
@@ -1224,7 +1231,7 @@ fn p_freezes_and_f_resumes() {
         wait_for(
             &session,
             &mut terminal,
-            "paused · just now".as_bytes(),
+            "paused · at ".as_bytes(),
             Duration::from_secs(2)
         ),
         "expected p to freeze the frame"
@@ -2206,7 +2213,7 @@ fn t_flips_the_live_row_and_back() {
 }
 
 #[test]
-fn t_shows_the_paused_frames_wall_clock() {
+fn the_paused_row_shows_a_wall_clock_and_t_makes_it_count() {
     let dir = tempfile::tempdir().expect("tempdir");
     let count = dir.path().join("count").display().to_string();
     let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
@@ -2223,19 +2230,9 @@ fn t_shows_the_paused_frames_wall_clock() {
         "expected a first counter frame"
     );
     session.write_bytes(b"p");
-    assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            "paused · just now".as_bytes(),
-            Duration::from_secs(2)
-        ),
-        "expected the default counting paused row"
-    );
-    session.write_bytes(b"t");
     let needle = "paused · at ".as_bytes();
     let bytes = wait_for_bytes(&session, &mut terminal, needle, Duration::from_secs(2))
-        .expect("expected the wall-clock paused row after t");
+        .expect("expected the default wall-clock paused row");
     let pos = bytes
         .windows(needle.len())
         .rposition(|w| w == needle)
@@ -2249,6 +2246,16 @@ fn t_shows_the_paused_frames_wall_clock() {
                 .all(|&i| stamp[i].is_ascii_digit()),
         "expected an HH:MM:SS stamp, got {:?}",
         String::from_utf8_lossy(stamp)
+    );
+    session.write_bytes(b"t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused · just now".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the counting paused row after t"
     );
     session.write_bytes(b"q");
     assert!(
