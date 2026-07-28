@@ -388,6 +388,16 @@ pub struct WatchArgs {
     /// Cap the painted height (defaults to terminal height minus two)
     #[arg(long)]
     pub max_height: Option<u16>,
+    /// Directory the `S` key writes snapshots into (defaults to the
+    /// current directory)
+    #[arg(long, env = "RAT_SNAPSHOT_DIR", value_name = "DIR")]
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Keep escape sequences in snapshots instead of stripping them
+    #[arg(long)]
+    pub snapshot_ansi: bool,
+    /// Chop long lines instead of wrapping (toggle at runtime with `w`)
+    #[arg(long)]
+    pub no_wrap: bool,
     /// Command to run each tick (after --)
     #[arg(last = true, required = true)]
     pub command: Vec<String>,

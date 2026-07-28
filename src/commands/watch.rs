@@ -92,7 +92,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     let mut full_lines: Vec<String> = Vec::new();
     let mut pause: Option<PauseState> = None;
     let mut view = ViewState {
-        wrap: true,
+        wrap: !args.no_wrap,
         hshift: 0,
     };
     let mut notice: Option<String> = None;

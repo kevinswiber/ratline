@@ -260,3 +260,51 @@ fn an_explicit_parent_appearance_reaches_children() {
         .success()
         .stdout("dark\n");
 }
+
+#[test]
+fn snapshot_flags_are_accepted() {
+    // The flags ride along in scripted runs; --once has no input loop, so
+    // no snapshot is ever taken and nothing lands in the directory.
+    let dir = tempfile::tempdir().expect("tempdir");
+    rat()
+        .args([
+            "watch",
+            "--once",
+            "--snapshot-dir",
+            &dir.path().display().to_string(),
+            "--snapshot-ansi",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("hi"));
+    assert_eq!(
+        std::fs::read_dir(dir.path()).expect("read tempdir").count(),
+        0,
+        "a snapshot appeared without the snapshot key"
+    );
+}
+
+#[test]
+fn no_wrap_is_accepted_and_leaves_piped_output_alone() {
+    // The toggle is a tty-view feature: the piped branch prints lines raw
+    // and never wrapped them in the first place, so --no-wrap changes
+    // nothing there.
+    let long_line = "x".repeat(200);
+    rat()
+        .args([
+            "watch",
+            "--once",
+            "--no-wrap",
+            "--",
+            &rat_bin(),
+            "style",
+            &long_line,
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(long_line.as_str()));
+}

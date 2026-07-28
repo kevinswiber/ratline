@@ -9,6 +9,8 @@ pub fn rat() -> Command {
     // Both can change which palette a run picks, so tests pin neither.
     cmd.env_remove("RAT_APPEARANCE");
     cmd.env_remove("COLORFGBG");
+    // A developer's shell must not redirect where test snapshots land.
+    cmd.env_remove("RAT_SNAPSHOT_DIR");
     cmd
 }
 
@@ -30,5 +32,6 @@ pub fn rat_detached() -> Command {
     }
     cmd.env_remove("RAT_APPEARANCE");
     cmd.env_remove("COLORFGBG");
+    cmd.env_remove("RAT_SNAPSHOT_DIR");
     Command::from_std(cmd)
 }
