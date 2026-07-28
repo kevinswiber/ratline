@@ -52,12 +52,71 @@ pub fn frame_bytes(
     out
 }
 
+/// Maximum percentage of rows that may differ before a changed-rows rewrite
+/// stops paying for itself and the full repaint takes over.
+const DIFF_MAX_CHANGED_PCT: usize = 60;
+
+/// The changed-rows rewrite: `Some(bytes)` when `next` can be painted by
+/// rewriting only the rows that differ from `prev`; `None` means "emit the
+/// full sequence". `Some(String::new())` means byte-identical: write nothing.
+///
+/// Eligibility: equal line counts, every line in both frames exactly one
+/// terminal row (no wrapping), and no more than `DIFF_MAX_CHANGED_PCT` of
+/// rows changed. The emitted stream is purely relative — no newlines (which
+/// could scroll), no absolute positioning, no queries.
+fn diff_bytes(prev: &[String], next: &[String], term_width: u16, sync: bool) -> Option<String> {
+    if prev.len() != next.len() {
+        return None;
+    }
+    // 1:1 check: every line is at least one row, so the row sum equals the
+    // line count only when every line occupies exactly one row.
+    if usize::from(rendered_rows(prev, term_width)) != prev.len()
+        || usize::from(rendered_rows(next, term_width)) != next.len()
+    {
+        return None;
+    }
+    let changed: Vec<usize> = (0..next.len()).filter(|&i| prev[i] != next[i]).collect();
+    if changed.is_empty() {
+        return Some(String::new());
+    }
+    if changed.len() * 100 > next.len() * DIFF_MAX_CHANGED_PCT {
+        return None;
+    }
+    let mut out = String::new();
+    if sync {
+        out.push_str("\x1b[?2026h");
+    }
+    // The cursor rests on the line below the frame; row i sits len-i rows
+    // above it. Walk row to row with relative moves only and finish by
+    // returning to the resting line, so the net vertical displacement is
+    // zero and nothing can scroll.
+    let mut above = 0usize;
+    for &i in &changed {
+        let target = next.len() - i;
+        if target > above {
+            out.push_str(&format!("\x1b[{}A", target - above));
+        } else {
+            out.push_str(&format!("\x1b[{}B", above - target));
+        }
+        above = target;
+        out.push_str("\r\x1b[2K");
+        out.push_str(&next[i]);
+        out.push('\r');
+    }
+    out.push_str(&format!("\x1b[{above}B"));
+    if sync {
+        out.push_str("\x1b[?2026l");
+    }
+    Some(out)
+}
+
 /// Repaints blocks of pre-rendered ANSI lines in place. Generic over the
 /// writer so tests assert exact bytes against a Vec<u8>.
 pub struct InlineRenderer<W: Write> {
     out: W,
     prev_rows: u16,
     prev_lines: Vec<String>,
+    diff_invalid: bool,
     hide_cursor: bool,
     sync: bool,
     clear_screen: bool,
@@ -73,6 +132,7 @@ impl<W: Write> InlineRenderer<W> {
             out,
             prev_rows: 0,
             prev_lines: Vec::new(),
+            diff_invalid: false,
             hide_cursor: false,
             sync: true,
             clear_screen: false,
@@ -102,6 +162,7 @@ impl<W: Write> InlineRenderer<W> {
     /// Repaint: one assembled string, one write, one flush (I8 — the
     /// synchronized frame never spans a blocking operation).
     pub fn draw(&mut self, lines: &[String], term_width: u16) -> std::io::Result<()> {
+        let width_unchanged = self.last_width == Some(term_width);
         // A resize invalidates the wrap-derived row count (reflowing
         // terminals change how many rows the old frame occupies), so a
         // relative move-up can no longer be trusted: repaint from scratch,
@@ -120,13 +181,28 @@ impl<W: Write> InlineRenderer<W> {
         }
         let wipe = self.clear_screen && !self.screen_cleared;
         self.screen_cleared = true;
-        bytes.push_str(&frame_bytes(
-            self.prev_rows,
-            lines,
-            term_width,
-            self.sync,
-            wipe,
-        ));
+        let diff = if width_unchanged
+            && !wipe
+            && !self.diff_invalid
+            && self.prev_lines.len() == usize::from(self.prev_rows)
+        {
+            diff_bytes(&self.prev_lines, lines, term_width, self.sync)
+        } else {
+            None
+        };
+        match diff {
+            Some(rewrite) => bytes.push_str(&rewrite),
+            None => {
+                bytes.push_str(&frame_bytes(
+                    self.prev_rows,
+                    lines,
+                    term_width,
+                    self.sync,
+                    wipe,
+                ));
+                self.diff_invalid = false;
+            }
+        }
         self.out.write_all(bytes.as_bytes())?;
         self.out.flush()?;
         self.prev_rows = rendered_rows(lines, term_width);
@@ -166,6 +242,10 @@ impl<W: Write> InlineRenderer<W> {
         self.screen_cleared = false;
         self.cursor_hidden = false;
         self.finished = false;
+        // The pager may have left anything on the frame's rows, so a
+        // changed-rows rewrite cannot be trusted until a full repaint
+        // reclaims them.
+        self.diff_invalid = true;
     }
 
     /// Restore the cursor. Idempotent; also runs on drop.
@@ -311,6 +391,110 @@ mod tests {
             !s.contains("\x1b[2A"),
             "resize must repaint without a stale move-up: {s:?}"
         );
+    }
+
+    /// Net vertical cursor displacement across all CSI `A`/`B` moves.
+    fn net_vertical(s: &str) -> i64 {
+        let mut net = 0i64;
+        let mut rest = s;
+        while let Some(idx) = rest.find("\x1b[") {
+            rest = &rest[idx + 2..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let n: i64 = digits.parse().unwrap_or(1);
+            match rest[digits.len()..].chars().next() {
+                Some('A') => net += n,
+                Some('B') => net -= n,
+                _ => {}
+            }
+        }
+        net
+    }
+
+    #[test]
+    fn an_identical_frame_writes_nothing() {
+        let f = lines(&["a", "b", "c"]);
+        assert_eq!(diff_bytes(&f, &f, 80, false), Some(String::new()));
+    }
+
+    #[test]
+    fn one_changed_row_rewrites_one_row() {
+        let prev = lines(&["a", "b", "c"]);
+        let next = lines(&["a", "X", "c"]);
+        let s = diff_bytes(&prev, &next, 80, false).expect("eligible");
+        assert_eq!(s.matches("\x1b[2K").count(), 1, "got: {s:?}");
+        assert!(s.contains('X'), "got: {s:?}");
+        assert!(!s.contains('\n'), "a newline could scroll: {s:?}");
+        assert!(!s.contains("\x1b[0J"), "got: {s:?}");
+        assert_eq!(net_vertical(&s), 0, "must land on the resting line: {s:?}");
+    }
+
+    #[test]
+    fn sync_markers_wrap_the_rewrite() {
+        let prev = lines(&["a", "b"]);
+        let next = lines(&["a", "X"]);
+        let s = diff_bytes(&prev, &next, 80, true).expect("eligible");
+        assert!(s.starts_with("\x1b[?2026h"), "got: {s:?}");
+        assert!(s.ends_with("\x1b[?2026l"), "got: {s:?}");
+    }
+
+    #[test]
+    fn too_much_change_declines() {
+        // 2 of 3 rows changed: 67% > DIFF_MAX_CHANGED_PCT.
+        let prev = lines(&["a", "b", "c"]);
+        let next = lines(&["x", "y", "c"]);
+        assert_eq!(diff_bytes(&prev, &next, 80, false), None);
+    }
+
+    #[test]
+    fn unequal_lengths_decline() {
+        let prev = lines(&["a", "b"]);
+        let next = lines(&["a", "b", "c"]);
+        assert_eq!(diff_bytes(&prev, &next, 80, false), None);
+        assert_eq!(diff_bytes(&next, &prev, 80, false), None);
+    }
+
+    #[test]
+    fn a_wrapped_row_declines() {
+        // A line wider than the terminal occupies >1 row: not 1:1.
+        let wide = "a".repeat(100);
+        let prev = lines(&["a", "b"]);
+        let next = lines(&[&wide, "b"]);
+        assert_eq!(diff_bytes(&prev, &next, 80, false), None);
+        assert_eq!(diff_bytes(&next, &prev, 80, false), None);
+    }
+
+    #[test]
+    fn an_eligible_draw_takes_the_diff_path() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["a", "b", "c"]), 80).unwrap();
+            r.draw(&lines(&["a", "X", "c"]), 80).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s.matches("\x1b[0J").count(),
+            1,
+            "only the first draw wipes: {s:?}"
+        );
+        assert!(s.contains("\x1b[2K"), "got: {s:?}");
+    }
+
+    #[test]
+    fn an_ineligible_draw_falls_back() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["a", "b", "c"]), 80).unwrap();
+            r.draw(&lines(&["a", "b"]), 80).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s.matches("\x1b[0J").count(),
+            2,
+            "a height change takes the full path: {s:?}"
+        );
+        assert!(!s.contains("\x1b[2K"), "got: {s:?}");
     }
 
     #[test]
