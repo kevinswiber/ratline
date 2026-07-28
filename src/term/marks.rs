@@ -98,6 +98,33 @@ fn flush_run(run: Option<std::ops::Range<usize>>, line: usize, marks: &mut [Line
     }
 }
 
+/// Display columns the gutter occupies: the mark cell and a gap.
+pub const GUTTER_COLS: usize = 2;
+
+/// Prefix window rows with their gutter cells. `marks` indexes the
+/// FULL source frame; `start` is the window's first source line.
+/// `mark_cell` is the pre-rendered marked cell (styled mark + space) —
+/// opaque here, the caller owns glyph, style, and profile; unmarked
+/// and out-of-range rows get two spaces.
+pub fn prefix_rows(
+    rows: Vec<String>,
+    marks: &[LineMark],
+    start: usize,
+    mark_cell: &str,
+) -> Vec<String> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let cell = if marks.get(start + i).is_some_and(|m| m.changed) {
+                mark_cell
+            } else {
+                "  "
+            };
+            format!("{cell}{row}")
+        })
+        .collect()
+}
+
 fn joined_stripped(lines: &[String]) -> String {
     lines
         .iter()
@@ -117,6 +144,70 @@ mod tests {
     /// The gutter view of a marks vector, for terse assertions.
     fn changed(marks: &[LineMark]) -> Vec<bool> {
         marks.iter().map(|m| m.changed).collect()
+    }
+
+    /// A LineMark vector from gutter bools, for the prefix tests.
+    fn line_marks(changed: &[bool]) -> Vec<LineMark> {
+        changed
+            .iter()
+            .map(|&c| LineMark {
+                changed: c,
+                cells: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn marked_rows_get_the_mark_cell_and_unmarked_rows_get_spaces() {
+        let rows = frame(&["one", "two"]);
+        assert_eq!(
+            prefix_rows(rows, &line_marks(&[true, false]), 0, "\x1b[1mM\x1b[0m "),
+            frame(&["\x1b[1mM\x1b[0m one", "  two"])
+        );
+    }
+
+    #[test]
+    fn the_window_start_offsets_into_the_marks() {
+        // The window shows source lines 2..4 of a five-line frame;
+        // only source line 3 changed.
+        let rows = frame(&["line-two", "line-three"]);
+        assert_eq!(
+            prefix_rows(
+                rows,
+                &line_marks(&[false, false, false, true, false]),
+                2,
+                "M "
+            ),
+            frame(&["  line-two", "M line-three"])
+        );
+    }
+
+    #[test]
+    fn rows_beyond_the_marks_get_spaces() {
+        // Defensive: a marks/rows mismatch must never panic mid-paint.
+        let rows = frame(&["a", "b"]);
+        assert_eq!(
+            prefix_rows(rows, &line_marks(&[true]), 0, "M "),
+            frame(&["M a", "  b"])
+        );
+    }
+
+    #[test]
+    fn the_gutter_cell_occupies_its_declared_columns() {
+        use crate::core::measure::display_width;
+        let plain = prefix_rows(frame(&["x"]), &line_marks(&[false]), 0, "M ");
+        assert_eq!(display_width(&plain[0]), GUTTER_COLS + 1);
+        let marked = prefix_rows(frame(&["x"]), &line_marks(&[true]), 0, "M ");
+        assert_eq!(display_width(&marked[0]), GUTTER_COLS + 1);
+    }
+
+    #[test]
+    fn escape_carrying_rows_are_prefixed_untouched() {
+        let rows = frame(&["\x1b[31mred\x1b[0m"]);
+        assert_eq!(
+            prefix_rows(rows, &line_marks(&[true]), 0, "M "),
+            frame(&["M \x1b[31mred\x1b[0m"])
+        );
     }
 
     #[test]
