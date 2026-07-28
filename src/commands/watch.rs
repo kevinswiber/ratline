@@ -345,6 +345,33 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             previous_key = None;
                             break 'wait;
                         }
+                        WatchAction::Freeze => {
+                            // A deliberate park, no scroll: read a changing
+                            // value in place. Same freeze as a scroll key's,
+                            // at offset zero.
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            pause.get_or_insert_with(|| PauseState {
+                                frozen: full_lines.clone(),
+                                scroll: ScrollState::new(),
+                                content: hash,
+                                appearance: palette.appearance,
+                                viewed_at: jiff::Timestamp::now(),
+                            });
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                &full_lines,
+                                hash,
+                                palette.appearance,
+                                view,
+                                None,
+                                size,
+                                args.max_height,
+                                &faint,
+                                profile,
+                                &since,
+                            )?);
+                        }
                         action @ (WatchAction::ToggleWrap
                         | WatchAction::ShiftLeft
                         | WatchAction::ShiftRight) => {
@@ -443,6 +470,7 @@ enum WatchAction {
     Page,
     Snapshot,
     Resume,
+    Freeze,
     Scroll(ScrollStep),
     ToggleWrap,
     ShiftLeft,
@@ -471,7 +499,8 @@ fn action_for(key: Key, paused: bool) -> WatchAction {
         Key::Char('w') => WatchAction::ToggleWrap,
         Key::Char('h') | Key::Left => WatchAction::ShiftLeft,
         Key::Char('l') | Key::Right => WatchAction::ShiftRight,
-        Key::Esc if paused => WatchAction::Resume,
+        Key::Esc | Key::Char('F') if paused => WatchAction::Resume,
+        Key::Char('p') if !paused => WatchAction::Freeze,
         _ => WatchAction::Ignore,
     }
 }
@@ -988,6 +1017,14 @@ mod tests {
     fn esc_only_means_something_when_frozen() {
         assert_eq!(action_for(Key::Esc, false), WatchAction::Ignore);
         assert_eq!(action_for(Key::Esc, true), WatchAction::Resume);
+    }
+
+    #[test]
+    fn f_resumes_and_p_freezes() {
+        assert_eq!(action_for(Key::Char('F'), true), WatchAction::Resume);
+        assert_eq!(action_for(Key::Char('F'), false), WatchAction::Ignore);
+        assert_eq!(action_for(Key::Char('p'), false), WatchAction::Freeze);
+        assert_eq!(action_for(Key::Char('p'), true), WatchAction::Ignore);
     }
 
     #[test]

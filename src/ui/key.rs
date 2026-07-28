@@ -139,10 +139,19 @@ mod tests {
         ] {
             assert_eq!(from_crossterm(press(code, KeyModifiers::NONE)), Some(key));
         }
-        // The snapshot key arrives shifted.
+        // The snapshot key and the resume alias arrive shifted; the
+        // freeze key plain.
         assert_eq!(
             from_crossterm(press(KeyCode::Char('S'), KeyModifiers::SHIFT)),
             Some(Key::Char('S'))
+        );
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('F'), KeyModifiers::SHIFT)),
+            Some(Key::Char('F'))
+        );
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(Key::Char('p'))
         );
     }
 

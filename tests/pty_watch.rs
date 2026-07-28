@@ -643,6 +643,66 @@ fn s_writes_a_snapshot_of_the_frame() {
 }
 
 #[test]
+fn p_freezes_and_f_resumes() {
+    // A deliberate freeze needs no scroll: p parks the frame in place.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "50ms",
+            "--",
+            &rat_bin(),
+            "date",
+            "--format",
+            "%H%M%S%f",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[?2026h",
+            Duration::from_secs(2)
+        ),
+        "expected a first frame"
+    );
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused · just now".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected p to freeze the frame"
+    );
+    // The tail is stopped: changing child output paints nothing.
+    let _ = drain_for(&session, Duration::from_millis(300));
+    let leaked = session.read_available(Duration::from_millis(400));
+    assert!(
+        leaked.is_empty(),
+        "the tail kept painting after p: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
+
+    session.write_bytes(b"F");
+    assert!(
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
+        "expected F to resume the live tail"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
 fn q_quits_from_a_frozen_frame() {
     let session = PtySession::spawn(
         &rat_bin(),
