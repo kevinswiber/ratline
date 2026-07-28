@@ -744,15 +744,16 @@ fn paint_key(
     age_secs: u64,
 ) -> PaintKey {
     // A live-scrolled key carries the LIVE hash: the tail keeps
-    // repainting under the offset — that is the point of the mode.
-    let (content, appearance, offset, paused, age_secs) = match pause {
-        Some(p) => (p.content, p.appearance, p.scroll.offset(), true, age_secs),
+    // repainting under the offset — that is the point of the mode. The
+    // displayed age arrives computed (which surface counts is the
+    // caller's business, see `displayed_age`) and rides verbatim.
+    let (content, appearance, offset, paused) = match pause {
+        Some(p) => (p.content, p.appearance, p.scroll.offset(), true),
         None => (
             live_content,
             live_appearance,
             live_scroll.map_or(0, LiveScroll::offset),
             false,
-            0,
         ),
     };
     PaintKey {
@@ -789,13 +790,64 @@ fn age_text(age_secs: u64) -> String {
     }
 }
 
-/// The live status row: the truncation notice when rows are hidden, always
-/// naming the last content change.
-fn live_notice(hidden: usize, since: &str) -> String {
-    if hidden > 0 {
-        format!("… {hidden} more lines · since {since} · v views all · q quits")
+/// Whole seconds the displayed status row is counting; 0 when it shows
+/// an absolute stamp or no time at all. The paused row counts by
+/// default and flips to a stamp; the live row is the mirror image; the
+/// live-scrolled row carries no time in either state.
+// The toggle that flips presentation lands with its key; the pure time
+// layer and its tests land first.
+#[cfg_attr(not(test), allow(dead_code))]
+fn displayed_age(
+    pause: Option<&PauseState>,
+    live_scroll: Option<LiveScroll>,
+    alt_time: bool,
+    changed_at: jiff::Timestamp,
+) -> u64 {
+    match (pause, live_scroll) {
+        (Some(p), _) if !alt_time => age_seconds(p.viewed_at),
+        (Some(_), _) | (None, Some(_)) => 0,
+        (None, None) if alt_time => age_seconds(changed_at),
+        (None, None) => 0,
+    }
+}
+
+/// The live row's time segment: the last-change stamp, or its counting
+/// form when the presentation is flipped.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_time_segment(alt_time: bool, since: &str, live_age_secs: u64) -> String {
+    if alt_time {
+        format!("changed {}", age_text(live_age_secs))
     } else {
         format!("since {since}")
+    }
+}
+
+/// The paused row's segment: the counting age, or the viewed frame's
+/// wall clock when the presentation is flipped.
+#[cfg_attr(not(test), allow(dead_code))]
+fn paused_time_segment(alt_time: bool, viewed_at: jiff::Timestamp, age_secs: u64) -> String {
+    if alt_time {
+        format!("at {}", local_hms(viewed_at))
+    } else {
+        age_text(age_secs)
+    }
+}
+
+/// `t` as local wall-clock HH:MM:SS — the `since` stamp's format.
+#[cfg_attr(not(test), allow(dead_code))]
+fn local_hms(t: jiff::Timestamp) -> String {
+    t.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%H:%M:%S")
+        .to_string()
+}
+
+/// The live status row: the truncation notice when rows are hidden,
+/// carrying the pre-formatted time segment.
+fn live_notice(hidden: usize, time_seg: &str) -> String {
+    if hidden > 0 {
+        format!("… {hidden} more lines · {time_seg} · v views all · q quits")
+    } else {
+        time_seg.to_string()
     }
 }
 
@@ -984,7 +1036,7 @@ fn paint_frame(
     let status = match mode {
         FrameMode::Paused => paused_notice(age, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => scrolled_notice(offset, kept.len(), lines.len()),
-        FrameMode::Live => live_notice(hidden, since),
+        FrameMode::Live => live_notice(hidden, &format!("since {since}")),
     };
     kept.push(faint.render(&status, profile));
     if let Some(text) = notice {
@@ -1409,11 +1461,11 @@ mod tests {
     }
 
     #[test]
-    fn the_live_rows_carry_the_since_stamp() {
-        assert_eq!(live_notice(0, "18:47:53"), "since 18:47:53");
+    fn the_live_rows_carry_the_time_segment() {
+        assert_eq!(live_notice(0, "since 18:47:53"), "since 18:47:53");
         assert_eq!(
-            live_notice(8, "18:47:53"),
-            "… 8 more lines · since 18:47:53 · v views all · q quits"
+            live_notice(8, "changed 14s ago"),
+            "… 8 more lines · changed 14s ago · v views all · q quits"
         );
     }
 
@@ -1425,7 +1477,8 @@ mod tests {
             gutter: false,
             highlight: false,
         };
-        // A live key never ages, whatever the caller computed.
+        // The key carries the caller's displayed age verbatim; which
+        // surface counts is the caller's business.
         let live = paint_key(None, None, 42, Appearance::Dark, (80, 24), view, 14);
         assert_eq!(
             live,
@@ -1440,7 +1493,7 @@ mod tests {
                 hshift: 4,
                 gutter: false,
                 highlight: false,
-                age_secs: 0,
+                age_secs: 14,
             }
         );
         let scroll = ScrollState::default().step(ScrollStep::LineDown, 50, 10);
@@ -1469,7 +1522,7 @@ mod tests {
                 hshift: 4,
                 gutter: false,
                 highlight: false,
-                age_secs: 0,
+                age_secs: 14,
             }
         );
         let paused = paint_key(Some(&p), None, 42, Appearance::Dark, (80, 24), view, 14);
@@ -1498,6 +1551,81 @@ mod tests {
         assert_eq!(age_text(10), "10s ago");
         assert_eq!(age_text(14), "14s ago");
         assert_eq!(age_text(75), "1m 15s ago");
+    }
+
+    #[test]
+    fn the_displayed_age_counts_only_where_the_row_counts() {
+        let old = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - 100)
+            .expect("timestamp");
+        let p = PauseState {
+            frozen: vec!["x".to_string()],
+            scroll: ScrollState::default(),
+            content: 7,
+            appearance: Appearance::Dark,
+            viewed_at: old,
+            history_seq: None,
+        };
+        let ls = LiveScroll::start(ScrollStep::LineDown, 50, 10);
+        // Counting arms (clock tolerance: at least the constructed age).
+        assert!(
+            displayed_age(Some(&p), None, false, old) >= 100,
+            "paused default counts"
+        );
+        assert!(
+            displayed_age(None, None, true, old) >= 100,
+            "live alternate counts"
+        );
+        // Absolute / no-time arms are exactly zero.
+        assert_eq!(
+            displayed_age(Some(&p), None, true, old),
+            0,
+            "paused alternate is a stamp"
+        );
+        assert_eq!(
+            displayed_age(None, None, false, old),
+            0,
+            "live default is a stamp"
+        );
+        assert_eq!(
+            displayed_age(None, Some(ls), true, old),
+            0,
+            "the scrolled row has no time"
+        );
+        assert_eq!(displayed_age(None, Some(ls), false, old), 0);
+    }
+
+    #[test]
+    fn the_live_segment_flips_between_stamp_and_counter() {
+        assert_eq!(live_time_segment(false, "18:47:53", 999), "since 18:47:53");
+        assert_eq!(live_time_segment(true, "18:47:53", 0), "changed just now");
+        assert_eq!(live_time_segment(true, "18:47:53", 14), "changed 14s ago");
+        assert_eq!(
+            live_time_segment(true, "18:47:53", 75),
+            "changed 1m 15s ago"
+        );
+    }
+
+    #[test]
+    fn the_paused_segment_flips_between_counter_and_stamp() {
+        let t = jiff::Timestamp::from_second(1_785_067_200).expect("timestamp");
+        assert_eq!(paused_time_segment(false, t, 3), "just now");
+        assert_eq!(paused_time_segment(false, t, 14), "14s ago");
+        assert_eq!(
+            paused_time_segment(true, t, 999),
+            format!("at {}", local_hms(t))
+        );
+    }
+
+    #[test]
+    fn local_hms_is_a_wall_clock_stamp() {
+        let s = local_hms(jiff::Timestamp::from_second(1_785_067_200).expect("timestamp"));
+        let b = s.as_bytes();
+        assert_eq!(b.len(), 8, "HH:MM:SS: {s}");
+        assert!(b[2] == b':' && b[5] == b':', "{s}");
+        assert!(
+            [0, 1, 3, 4, 6, 7].iter().all(|&i| b[i].is_ascii_digit()),
+            "{s}"
+        );
     }
 
     #[test]
