@@ -161,6 +161,10 @@ mod tests {
             from_crossterm(press(KeyCode::Char('c'), KeyModifiers::NONE)),
             Some(Key::Char('c'))
         );
+        assert_eq!(
+            from_crossterm(press(KeyCode::Char('t'), KeyModifiers::NONE)),
+            Some(Key::Char('t'))
+        );
         // The scrub keys: shifted and unshifted spellings both survive.
         for (ch, mods) in [
             ('<', KeyModifiers::SHIFT),

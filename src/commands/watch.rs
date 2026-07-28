@@ -101,6 +101,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     // whether the gate repaints.
     let mut last_hash: Option<u64> = None;
     let mut since = String::new();
+    let mut changed_at = jiff::Timestamp::now();
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
     let mut history = History::new();
@@ -109,6 +110,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         hshift: 0,
         gutter: false,
         highlight: false,
+        alt_time: false,
     };
     let mut notice: Option<String> = None;
     loop {
@@ -116,9 +118,14 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         let mut combined = output.stdout.clone();
         combined.extend_from_slice(&output.stderr);
         let hash = signature(&combined);
+        // One clock read per tick: the absolute stamp, the counting
+        // form, and the history entry a scrub later shows all name the
+        // same instant.
+        let now = jiff::Timestamp::now();
         if last_hash != Some(hash) {
             last_hash = Some(hash);
-            since = jiff::Zoned::now().strftime("%H:%M:%S").to_string();
+            changed_at = now;
+            since = local_hms(now);
         }
         // The terminal size joins the change key: a resize must repaint
         // even when the content is unchanged. So does the appearance: a
@@ -132,7 +139,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             full_lines.clone_from(&lines);
             // Every distinct frame is retained (byte-capped, deduped) so
             // the scrub keys can walk back through it.
-            history.record(hash, &lines, jiff::Timestamp::now());
+            history.record(hash, &lines, now);
         }
         // A resize while frozen must not leave the window past the frame.
         if let Some(p) = pause.as_mut() {
@@ -160,7 +167,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             palette.appearance,
             size,
             view,
-            pause.as_ref().map_or(0, |p| age_seconds(p.viewed_at)),
+            displayed_age(pause.as_ref(), live_scroll, view.alt_time, changed_at),
         );
         if previous_key != Some(key) || notice.is_some() {
             previous_key = Some(key);
@@ -179,6 +186,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     &faint,
                     profile,
                     &since,
+                    changed_at,
                     &history,
                 )?;
             } else {
@@ -220,15 +228,15 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                 std::thread::sleep(nap);
                 continue;
             }
-            // While parked, the counting age advances once per second,
-            // riding this nap cycle — a long-interval dashboard must not
-            // wait a whole tick to admit how stale it is. The only
-            // visible delta is the status row, so the repaint is bounded
-            // to status-row bytes (and to none at all while the text
-            // holds).
-            if let Some(p) = pause.as_ref()
-                && previous_key.is_some_and(|k| k.age_secs != age_seconds(p.viewed_at))
-            {
+            // Wherever the displayed row counts — the paused row by
+            // default, the live row when flipped — the age advances once
+            // per second, riding this nap cycle: a long-interval
+            // dashboard must not wait a whole tick to admit how stale it
+            // is. The only visible delta is the status row, so the
+            // repaint is bounded to status-row bytes (and to none at all
+            // while the text holds).
+            let want_age = displayed_age(pause.as_ref(), live_scroll, view.alt_time, changed_at);
+            if previous_key.is_some_and(|k| k.age_secs != want_age) {
                 previous_key = Some(repaint(
                     &mut renderer,
                     pause.as_ref(),
@@ -243,6 +251,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     &faint,
                     profile,
                     &since,
+                    changed_at,
                     &history,
                 )?);
             }
@@ -373,6 +382,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    changed_at,
                                     &history,
                                 )?);
                             }
@@ -405,6 +415,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    changed_at,
                                     &history,
                                 )?);
                             }
@@ -438,6 +449,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    changed_at,
                                     &history,
                                 )?);
                             }
@@ -497,6 +509,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    changed_at,
                                     &history,
                                 )?);
                             }
@@ -504,7 +517,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             | WatchAction::ShiftLeft
                             | WatchAction::ShiftRight
                             | WatchAction::ToggleGutter
-                            | WatchAction::ToggleHighlight) => {
+                            | WatchAction::ToggleHighlight
+                            | WatchAction::ToggleTime) => {
                                 // View state, not scrollback state: applies to
                                 // live and frozen frames alike, never freezes
                                 // the tail, repaints in place. Right shift is
@@ -514,6 +528,9 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     WatchAction::ToggleGutter => view.gutter = !view.gutter,
                                     WatchAction::ToggleHighlight => {
                                         view.highlight = !view.highlight;
+                                    }
+                                    WatchAction::ToggleTime => {
+                                        view.alt_time = !view.alt_time;
                                     }
                                     WatchAction::ShiftLeft => {
                                         view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
@@ -535,6 +552,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    changed_at,
                                     &history,
                                 )?);
                             }
@@ -561,6 +579,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    changed_at,
                                     &history,
                                 )?);
                             }
@@ -639,6 +658,7 @@ enum WatchAction {
     ShiftRight,
     ToggleGutter,
     ToggleHighlight,
+    ToggleTime,
     Ignore,
 }
 
@@ -665,6 +685,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('l') | Key::Right => WatchAction::ShiftRight,
         Key::Char('D') => WatchAction::ToggleGutter,
         Key::Char('c') => WatchAction::ToggleHighlight,
+        Key::Char('t') => WatchAction::ToggleTime,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
@@ -708,6 +729,10 @@ struct ViewState {
     /// patched over the child's own styling. Wrap-agnostic: the
     /// splices are zero display cells.
     highlight: bool,
+    /// Flip both time rows to their alternate presentation: the live
+    /// row counts instead of stamping, the paused row stamps instead
+    /// of counting. Presentation only — each row keeps its meaning.
+    alt_time: bool,
 }
 
 /// Everything a painted frame depends on; the repaint gate compares two of
@@ -726,6 +751,7 @@ struct PaintKey {
     hshift: usize,
     gutter: bool,
     highlight: bool,
+    alt_time: bool,
     /// Whole seconds since the viewed frame was current; 0 while live.
     /// Advancing once per second is what lets the paused age repaint.
     age_secs: u64,
@@ -767,6 +793,7 @@ fn paint_key(
         hshift: view.hshift,
         gutter: view.gutter,
         highlight: view.highlight,
+        alt_time: view.alt_time,
         age_secs,
     }
 }
@@ -794,9 +821,6 @@ fn age_text(age_secs: u64) -> String {
 /// an absolute stamp or no time at all. The paused row counts by
 /// default and flips to a stamp; the live row is the mirror image; the
 /// live-scrolled row carries no time in either state.
-// The toggle that flips presentation lands with its key; the pure time
-// layer and its tests land first.
-#[cfg_attr(not(test), allow(dead_code))]
 fn displayed_age(
     pause: Option<&PauseState>,
     live_scroll: Option<LiveScroll>,
@@ -813,7 +837,6 @@ fn displayed_age(
 
 /// The live row's time segment: the last-change stamp, or its counting
 /// form when the presentation is flipped.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_time_segment(alt_time: bool, since: &str, live_age_secs: u64) -> String {
     if alt_time {
         format!("changed {}", age_text(live_age_secs))
@@ -824,7 +847,6 @@ fn live_time_segment(alt_time: bool, since: &str, live_age_secs: u64) -> String 
 
 /// The paused row's segment: the counting age, or the viewed frame's
 /// wall clock when the presentation is flipped.
-#[cfg_attr(not(test), allow(dead_code))]
 fn paused_time_segment(alt_time: bool, viewed_at: jiff::Timestamp, age_secs: u64) -> String {
     if alt_time {
         format!("at {}", local_hms(viewed_at))
@@ -834,7 +856,6 @@ fn paused_time_segment(alt_time: bool, viewed_at: jiff::Timestamp, age_secs: u64
 }
 
 /// `t` as local wall-clock HH:MM:SS — the `since` stamp's format.
-#[cfg_attr(not(test), allow(dead_code))]
 fn local_hms(t: jiff::Timestamp) -> String {
     t.to_zoned(jiff::tz::TimeZone::system())
         .strftime("%H:%M:%S")
@@ -869,9 +890,10 @@ fn repaint(
     faint: &StyleSpec,
     profile: ColorProfile,
     since: &str,
+    changed_at: jiff::Timestamp,
     history: &History,
 ) -> anyhow::Result<PaintKey> {
-    let age_secs = pause.map_or(0, |p| age_seconds(p.viewed_at));
+    let age_secs = displayed_age(pause, live_scroll, view.alt_time, changed_at);
     let key = paint_key(
         pause,
         live_scroll,
@@ -910,7 +932,11 @@ fn repaint(
         }
         .render("▌", profile)
     );
-    let age = age_text(age_secs);
+    let time_live = live_time_segment(view.alt_time, since, age_seconds(changed_at));
+    let time_paused = pause.map_or_else(
+        || age_text(0),
+        |p| paused_time_segment(view.alt_time, p.viewed_at, age_seconds(p.viewed_at)),
+    );
     paint_frame(
         renderer,
         source,
@@ -922,8 +948,8 @@ fn repaint(
         max_height,
         faint,
         profile,
-        since,
-        &age,
+        &time_live,
+        &time_paused,
         marks.as_deref(),
         &mark_cell,
     )?;
@@ -974,8 +1000,8 @@ fn paint_frame(
     max_height: Option<u16>,
     faint: &StyleSpec,
     profile: ColorProfile,
-    since: &str,
-    age: &str,
+    time_live: &str,
+    time_paused: &str,
     marks: Option<&[LineMark]>,
     mark_cell: &str,
 ) -> anyhow::Result<()> {
@@ -1034,9 +1060,9 @@ fn paint_frame(
         kept = prefix_rows(kept, marks, start, mark_cell);
     }
     let status = match mode {
-        FrameMode::Paused => paused_notice(age, offset, kept.len(), lines.len()),
+        FrameMode::Paused => paused_notice(time_paused, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => scrolled_notice(offset, kept.len(), lines.len()),
-        FrameMode::Live => live_notice(hidden, &format!("since {since}")),
+        FrameMode::Live => live_notice(hidden, time_live),
     };
     kept.push(faint.render(&status, profile));
     if let Some(text) = notice {
@@ -1411,6 +1437,13 @@ mod tests {
     }
 
     #[test]
+    fn t_toggles_the_time_display_in_every_mode() {
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('t'), mode), WatchAction::ToggleTime);
+        }
+    }
+
+    #[test]
     fn view_keys_are_view_actions_in_every_mode() {
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::Char('w'), mode), WatchAction::ToggleWrap);
@@ -1476,6 +1509,7 @@ mod tests {
             hshift: 4,
             gutter: false,
             highlight: false,
+            alt_time: false,
         };
         // The key carries the caller's displayed age verbatim; which
         // surface counts is the caller's business.
@@ -1493,6 +1527,7 @@ mod tests {
                 hshift: 4,
                 gutter: false,
                 highlight: false,
+                alt_time: false,
                 age_secs: 14,
             }
         );
@@ -1522,6 +1557,7 @@ mod tests {
                 hshift: 4,
                 gutter: false,
                 highlight: false,
+                alt_time: false,
                 age_secs: 14,
             }
         );
@@ -1539,6 +1575,7 @@ mod tests {
                 hshift: 4,
                 gutter: false,
                 highlight: false,
+                alt_time: false,
                 age_secs: 14,
             }
         );

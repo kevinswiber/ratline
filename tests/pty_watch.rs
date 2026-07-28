@@ -1718,3 +1718,153 @@ fn no_color_keeps_the_highlight_out_of_the_bytes() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn t_flips_the_live_row_and_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
+        "expected the default absolute live row"
+    );
+    session.write_bytes(b"t");
+    // A changing child re-arms the last-change clock every tick, so the
+    // flipped row correctly pins inside the just-now grace.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"changed just now",
+            Duration::from_secs(2)
+        ),
+        "expected the counting live row after t"
+    );
+    session.write_bytes(b"t");
+    assert!(
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
+        "expected the absolute row back after a second t"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn t_shows_the_paused_frames_wall_clock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "paused · just now".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the default counting paused row"
+    );
+    session.write_bytes(b"t");
+    let needle = "paused · at ".as_bytes();
+    let bytes = wait_for_bytes(&session, &mut terminal, needle, Duration::from_secs(2))
+        .expect("expected the wall-clock paused row after t");
+    let pos = bytes
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .expect("needle position");
+    let stamp = &bytes[pos + needle.len()..pos + needle.len() + 8];
+    assert!(
+        stamp[2] == b':'
+            && stamp[5] == b':'
+            && [0, 1, 3, 4, 6, 7]
+                .iter()
+                .all(|&i| stamp[i].is_ascii_digit()),
+        "expected an HH:MM:SS stamp, got {:?}",
+        String::from_utf8_lossy(stamp)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn the_flipped_live_row_counts() {
+    // A STATIC child: the last-change clock stays put, so the flipped
+    // row genuinely counts — through the ten-second just-now grace and
+    // out the other side. An event-driven needle wait, not a drain.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "200ms",
+            "--shell",
+            "--",
+            "echo steady-static-line",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady-static-line",
+            Duration::from_secs(2)
+        ),
+        "expected the first frame"
+    );
+    session.write_bytes(b"t");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"changed just now",
+            Duration::from_secs(2)
+        ),
+        "expected the counting row inside the grace"
+    );
+    // age_text says "just now" through 9s and "10s ago" at ten, so
+    // "changed 1" first appears at the plateau's edge.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"changed 1",
+            Duration::from_secs(15)
+        ),
+        "expected the count to emerge from the just-now plateau"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
