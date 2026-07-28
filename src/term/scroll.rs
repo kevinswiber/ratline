@@ -61,6 +61,104 @@ pub fn max_offset(total: usize, window: usize) -> usize {
     total.saturating_sub(window)
 }
 
+/// Ticks of equal composed height before live-scroll trusts the frame.
+pub const STABLE_TICKS: usize = 8;
+
+/// Observes the composed line count every tick; the frame is stable when
+/// the last `STABLE_TICKS` observations exist and all agree.
+#[derive(Clone, Debug, Default)]
+pub struct HeightTracker {
+    counts: std::collections::VecDeque<usize>,
+}
+
+impl HeightTracker {
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn new() -> HeightTracker {
+        HeightTracker::default()
+    }
+
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn observe(&mut self, lines: usize) {
+        if self.counts.len() == STABLE_TICKS {
+            self.counts.pop_front();
+        }
+        self.counts.push_back(lines);
+    }
+
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn stable(&self) -> bool {
+        self.counts.len() == STABLE_TICKS && self.counts.iter().all(|&c| c == self.counts[0])
+    }
+}
+
+/// A window over the LIVE frame. Offset 0 is the live view itself; `G`
+/// pins the window to the growing tail until any other step unpins it.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct LiveScroll {
+    offset: usize,
+    pinned: bool,
+}
+
+impl LiveScroll {
+    /// Entering live-scroll: one step from offset 0.
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn start(step: ScrollStep, total: usize, window: usize) -> LiveScroll {
+        LiveScroll {
+            offset: 0,
+            pinned: false,
+        }
+        .step(step, total, window)
+    }
+
+    /// pinned = (step == `ScrollStep::Bottom`); any other step unpins.
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn step(self, step: ScrollStep, total: usize, window: usize) -> LiveScroll {
+        LiveScroll {
+            offset: ScrollState {
+                offset: self.offset,
+            }
+            .step(step, total, window)
+            .offset(),
+            pinned: step == ScrollStep::Bottom,
+        }
+    }
+
+    /// Every tick: pinned tracks the tail; unpinned holds, clamped.
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn reanchor(self, total: usize, window: usize) -> LiveScroll {
+        let limit = max_offset(total, window.max(1));
+        LiveScroll {
+            offset: if self.pinned {
+                limit
+            } else {
+                self.offset.min(limit)
+            },
+            ..self
+        }
+    }
+
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn offset(self) -> usize {
+        self.offset
+    }
+
+    /// Offset 0 means the window is the live view: collapse the mode.
+    #[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+    pub fn at_top(self) -> bool {
+        self.offset == 0
+    }
+}
+
+/// The live-scrolled status row.
+#[allow(dead_code)] // Not yet wired into watch's scroll dispatch.
+pub fn scrolled_notice(offset: usize, shown: usize, total: usize) -> String {
+    format!(
+        "lines {}-{} of {total} · live · g follows",
+        offset + 1,
+        offset + shown
+    )
+}
+
 /// The row that replaces the truncation notice while frozen. `age` is the
 /// pre-formatted time since the viewed frame was current ("just now",
 /// "14s ago"); `shown` is how many lines the paint actually kept.
@@ -144,6 +242,88 @@ mod tests {
         let deep = ScrollState { offset: 8 };
         assert_eq!(deep.clamp(30, 40).offset(), 0);
         assert_eq!(deep.clamp(10, 5).offset(), 5);
+    }
+
+    #[test]
+    fn stability_needs_a_full_ring_of_equal_counts() {
+        let mut t = HeightTracker::new();
+        for _ in 0..STABLE_TICKS - 1 {
+            t.observe(30);
+        }
+        assert!(!t.stable(), "seven observations are not enough");
+        t.observe(30);
+        assert!(t.stable(), "eight equal observations are");
+
+        let mut jitter = HeightTracker::new();
+        for _ in 0..STABLE_TICKS - 1 {
+            jitter.observe(30);
+        }
+        jitter.observe(29);
+        assert!(!jitter.stable(), "one odd height spoils the ring");
+        for _ in 0..STABLE_TICKS {
+            jitter.observe(29);
+        }
+        assert!(jitter.stable(), "the rolling ring recovers");
+    }
+
+    #[test]
+    fn starting_a_live_scroll_steps_from_the_top() {
+        let one = LiveScroll::start(ScrollStep::LineDown, 46, 22);
+        assert_eq!(one.offset(), 1);
+        assert!(!one.at_top());
+        let bottom = LiveScroll::start(ScrollStep::Bottom, 46, 22);
+        assert_eq!(bottom.offset(), max_offset(46, 22));
+    }
+
+    #[test]
+    fn a_pinned_window_tracks_a_growing_tail() {
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 46, 22);
+        assert_eq!(pinned.reanchor(50, 22).offset(), 28);
+    }
+
+    #[test]
+    fn an_unpinned_window_holds_and_clamps() {
+        let mut s = LiveScroll::start(ScrollStep::LineDown, 46, 22);
+        for _ in 0..8 {
+            s = s.step(ScrollStep::LineDown, 46, 22);
+        }
+        assert_eq!(s.offset(), 9);
+        assert_eq!(s.reanchor(46, 22).offset(), 9, "an unpinned window holds");
+        assert_eq!(
+            s.reanchor(10, 22).offset(),
+            0,
+            "a shrunk frame pulls it back"
+        );
+    }
+
+    #[test]
+    fn any_step_but_bottom_unpins() {
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 46, 22);
+        let unpinned = pinned.step(ScrollStep::LineUp, 46, 22);
+        assert_eq!(unpinned.offset(), 23);
+        assert_eq!(
+            unpinned.reanchor(50, 22).offset(),
+            23,
+            "an unpinned window no longer tracks the tail"
+        );
+        let repinned = unpinned.step(ScrollStep::Bottom, 46, 22);
+        assert_eq!(repinned.reanchor(50, 22).offset(), 28, "G re-pins");
+    }
+
+    #[test]
+    fn reaching_the_top_reports_it() {
+        let deep = LiveScroll::start(ScrollStep::PageDown, 46, 22);
+        assert!(deep.step(ScrollStep::Top, 46, 22).at_top());
+        let one = LiveScroll::start(ScrollStep::LineDown, 46, 22);
+        assert!(one.step(ScrollStep::LineUp, 46, 22).at_top());
+    }
+
+    #[test]
+    fn the_scrolled_row_names_the_range() {
+        assert_eq!(
+            scrolled_notice(8, 22, 46),
+            "lines 9-30 of 46 · live · g follows"
+        );
     }
 
     #[test]
