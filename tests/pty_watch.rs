@@ -888,6 +888,56 @@ fn a_shape_change_while_scrolled_stays_live() {
 }
 
 #[test]
+fn resuming_from_a_live_window_does_not_rerun_the_child() {
+    // A slow child (2 s) on a long interval: Esc from a live-scrolled
+    // window must collapse IN PLACE from the frame already on hand. A
+    // forced fresh tick would block on the child and cost the whole
+    // reload — the stall belongs to resume-from-Paused only, where the
+    // content is genuinely stale.
+    let script = "/bin/sleep 2; i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done";
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "10s", "--shell", "--", script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"l1", Duration::from_secs(5)),
+        "expected a first frame"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            "· live · g follows".as_bytes(),
+            b"paused",
+            Duration::from_secs(2)
+        ),
+        "expected the frame to live-scroll"
+    );
+
+    session.write_bytes(b"\x1b");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"since ",
+            Duration::from_millis(1500)
+        ),
+        "expected Esc to collapse in place, well inside the child's 2s runtime"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
 fn a_scroll_on_a_frame_that_fits_is_a_noop() {
     // Nothing hidden, nothing to scroll: navigation keys do nothing at
     // all — no live window, and certainly no freeze.

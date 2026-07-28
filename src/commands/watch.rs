@@ -371,12 +371,35 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 )?);
                             }
                             WatchAction::Resume => {
-                                // Fresh content wants a fresh tick: the same
-                                // self-heal the pager return uses.
-                                pause = None;
+                                if pause.is_some() {
+                                    // A pause shows genuinely stale content:
+                                    // fresh content wants a fresh tick — the
+                                    // same self-heal the pager return uses.
+                                    pause = None;
+                                    live_scroll = None;
+                                    previous_key = None;
+                                    break 'wait;
+                                }
+                                // A live window's frame is already current:
+                                // collapse in place. Forcing a tick here
+                                // would only stall on a slow child.
                                 live_scroll = None;
-                                previous_key = None;
-                                break 'wait;
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    &full_lines,
+                                    hash,
+                                    palette.appearance,
+                                    view,
+                                    None,
+                                    size,
+                                    args.max_height,
+                                    &faint,
+                                    profile,
+                                    &since,
+                                )?);
                             }
                             WatchAction::Freeze => {
                                 // A deliberate park: read a changing value in
