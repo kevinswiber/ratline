@@ -25,6 +25,8 @@ crossterm = { version = "0.29.0", features = ["use-dev-tty"] }
 clap = { version = "4.6.4", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4.6.7"
 anyhow = "1.0.104"
+# Character-level diff behind watch's change markers.
+dissimilar = "1"
 jiff = "0.2.35"
 unicode-width = "0.2.2"
 strip-ansi-escapes = "0.2.1"
