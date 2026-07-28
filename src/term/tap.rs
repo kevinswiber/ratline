@@ -51,7 +51,7 @@ impl TapScanner {
             self.buf.push(byte);
 
             if self.buf.len() == 2 {
-                if !matches!(self.buf[1], b'[' | b']') {
+                if !matches!(self.buf[1], b'[' | b']' | b'O') {
                     // Not a recognized introducer: the leading ESC was not
                     // the start of a sequence this scanner understands.
                     // Drop it and reprocess this byte as an ordinary one.
@@ -70,13 +70,23 @@ impl TapScanner {
 
             if self.buf[1] == b'[' {
                 // A CSI run is complete at an ECMA-48 final byte; only the
-                // semantic interpretation is report-specific.
+                // semantic interpretation is report-specific. The report
+                // parser is offered the run first — a DSR 997 report can
+                // never be decoded as a key.
                 if (0x40..=0x7e).contains(&byte) {
                     if let Some(appearance) = parse_color_scheme_report(&self.buf) {
                         events.push(TapEvent::ThemeNotification(appearance));
+                    } else if let Some(key) = decode_csi(&self.buf) {
+                        events.push(TapEvent::Key(key));
                     }
                     self.buf.clear();
                 }
+            } else if self.buf[1] == b'O' {
+                // An SS3 run is complete at its third byte, the final.
+                if let Some(key) = decode_ss3(byte) {
+                    events.push(TapEvent::Key(key));
+                }
+                self.buf.clear();
             } else {
                 // The len == 2 branch above only lets `[` or `]` continue.
                 debug_assert_eq!(self.buf[1], b']');
@@ -99,12 +109,43 @@ impl Default for TapScanner {
 }
 
 /// 0x03 → CtrlC; b'\r' | b'\n' → Enter; printable ASCII (0x20..=0x7e) →
-/// Char; everything else → None. Watch acts only on CtrlC/q/v/Enter.
+/// Char; everything else → None. What a key *means* is the consumer's
+/// business — the scanner only decodes.
 pub fn decode_key(byte: u8) -> Option<Key> {
     match byte {
         0x03 => Some(Key::CtrlC),
         b'\r' | b'\n' => Some(Key::Enter),
         0x20..=0x7e => Some(Key::Char(byte as char)),
+        _ => None,
+    }
+}
+
+/// Exact matches only: ESC [ A/B/C/D, ESC [ H/F, ESC [ 1~/4~/7~/8~,
+/// ESC [ 5~/6~. A private or parameterized run is never a key.
+pub fn decode_csi(seq: &[u8]) -> Option<Key> {
+    match seq {
+        b"\x1b[A" => Some(Key::Up),
+        b"\x1b[B" => Some(Key::Down),
+        b"\x1b[C" => Some(Key::Right),
+        b"\x1b[D" => Some(Key::Left),
+        b"\x1b[H" | b"\x1b[1~" | b"\x1b[7~" => Some(Key::Home),
+        b"\x1b[F" | b"\x1b[4~" | b"\x1b[8~" => Some(Key::End),
+        b"\x1b[5~" => Some(Key::PageUp),
+        b"\x1b[6~" => Some(Key::PageDown),
+        _ => None,
+    }
+}
+
+/// Complete SS3 run (ESC O <final>): application-cursor arrows + Home/End;
+/// function-key finals are None.
+pub fn decode_ss3(final_byte: u8) -> Option<Key> {
+    match final_byte {
+        b'A' => Some(Key::Up),
+        b'B' => Some(Key::Down),
+        b'C' => Some(Key::Right),
+        b'D' => Some(Key::Left),
+        b'H' => Some(Key::Home),
+        b'F' => Some(Key::End),
         _ => None,
     }
 }
@@ -340,11 +381,52 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_arrow_key_is_dropped_silently() {
-        // Watch parity: arrow keys do nothing today either, so the scanner
-        // must not surface one as stray characters.
+    fn arrow_keys_decode_through_the_scanner() {
         let mut scanner = TapScanner::new();
-        assert_eq!(scanner.feed(b"\x1b[A"), vec![]);
+        assert_eq!(scanner.feed(b"\x1b[A"), vec![TapEvent::Key(Key::Up)]);
+        assert_eq!(scanner.feed(b"\x1b[B"), vec![TapEvent::Key(Key::Down)]);
+        assert_eq!(scanner.feed(b"\x1b[C"), vec![TapEvent::Key(Key::Right)]);
+        assert_eq!(scanner.feed(b"\x1b[D"), vec![TapEvent::Key(Key::Left)]);
+    }
+
+    #[test]
+    fn page_and_home_end_sequences_decode() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b[5~"), vec![TapEvent::Key(Key::PageUp)]);
+        assert_eq!(scanner.feed(b"\x1b[6~"), vec![TapEvent::Key(Key::PageDown)]);
+        assert_eq!(scanner.feed(b"\x1b[H"), vec![TapEvent::Key(Key::Home)]);
+        assert_eq!(scanner.feed(b"\x1b[F"), vec![TapEvent::Key(Key::End)]);
+        assert_eq!(scanner.feed(b"\x1b[1~"), vec![TapEvent::Key(Key::Home)]);
+        assert_eq!(scanner.feed(b"\x1b[4~"), vec![TapEvent::Key(Key::End)]);
+        assert_eq!(scanner.feed(b"\x1b[7~"), vec![TapEvent::Key(Key::Home)]);
+        assert_eq!(scanner.feed(b"\x1b[8~"), vec![TapEvent::Key(Key::End)]);
+    }
+
+    #[test]
+    fn a_theme_report_is_still_a_report_not_a_key() {
+        // The report parser is offered a complete CSI run first; a private
+        // or parameterized run is never decoded as a key.
+        let mut scanner = TapScanner::new();
+        assert_eq!(
+            scanner.feed(b"\x1b[?997;2n"),
+            vec![TapEvent::ThemeNotification(Appearance::Light)]
+        );
+    }
+
+    #[test]
+    fn a_split_arrow_reassembles_across_feeds() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b["), vec![]);
+        assert_eq!(scanner.feed(b"B"), vec![TapEvent::Key(Key::Down)]);
+    }
+
+    #[test]
+    fn an_application_cursor_arrow_decodes() {
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1bOA"), vec![TapEvent::Key(Key::Up)]);
+        // F4 on several terminals: a function-key final is not a key here —
+        // without SS3 decoding it would degrade to Char('S').
+        assert_eq!(scanner.feed(b"\x1bOS"), vec![]);
     }
 
     #[test]
