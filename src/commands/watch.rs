@@ -17,7 +17,7 @@ use crate::style_spec::StyleSpec;
 use crate::term::history::History;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::scroll::{
-    HSHIFT_STEP, HeightTracker, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
+    HSHIFT_STEP, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
 };
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
@@ -102,8 +102,6 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     let mut since = String::new();
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
-    let mut heights = HeightTracker::new();
-    let mut prev_height: Option<usize> = None;
     let mut history = History::new();
     let mut view = ViewState {
         wrap: !args.no_wrap,
@@ -133,34 +131,20 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             // the scrub keys can walk back through it.
             history.record(hash, &lines, jiff::Timestamp::now());
         }
-        let height_changed = prev_height.is_some_and(|h| h != lines.len());
-        prev_height = Some(lines.len());
-        heights.observe(lines.len());
         // A resize while frozen must not leave the window past the frame.
         if let Some(p) = pause.as_mut() {
             let window = usize::from(window_rows(args.max_height, size.1));
             p.scroll = p.scroll.clamp(p.frozen.len(), window);
         }
-        // A live window rides the tail: re-anchor every tick, collapse at
-        // the top — and freeze the moment the frame changes shape, because
-        // an offset into a reflowing frame points at nothing in particular.
+        // A live window rides the tail whatever shape the frame takes:
+        // a pinned window tracks the end, an unpinned one holds its
+        // offset clamped into the new shape, and reaching the top
+        // collapses to the live view. Freezing is never implicit — the
+        // history ring holds any moment that slides away.
         if let Some(ls) = live_scroll {
             let window = usize::from(window_rows(args.max_height, size.1));
-            if height_changed {
-                pause = Some(PauseState {
-                    frozen: full_lines.clone(),
-                    scroll: ScrollState::at(ls.offset()).clamp(full_lines.len(), window),
-                    content: hash,
-                    appearance: palette.appearance,
-                    viewed_at: jiff::Timestamp::now(),
-                    history_seq: history.newest_seq(),
-                });
-                live_scroll = None;
-                notice = Some("frame changed shape".to_string());
-            } else {
-                let re = ls.reanchor(full_lines.len(), window);
-                live_scroll = (!re.at_top()).then_some(re);
-            }
+            let re = ls.reanchor(full_lines.len(), window);
+            live_scroll = (!re.at_top()).then_some(re);
         }
         // While frozen the key holds the freeze-time content/appearance:
         // new child output and adopted palettes do not repaint, but
@@ -349,9 +333,9 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 // The repaint happens here, in place —
                                 // re-entering the tick loop would re-run the
                                 // child per keypress. A frozen window scrolls
-                                // its copy; a stable live frame scrolls a
-                                // window over the LIVE frame; an unstable one
-                                // freezes first, so the copy holds still.
+                                // its copy; otherwise scrolling is always a
+                                // live viewport — freezing is explicit (p or
+                                // <), never a side effect of navigation.
                                 let size = crossterm::terminal::size().unwrap_or((80, 24));
                                 let window = usize::from(window_rows(args.max_height, size.1));
                                 if let Some(p) = pause.as_mut() {
@@ -359,27 +343,16 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 } else if let Some(ls) = live_scroll {
                                     let stepped = ls.step(step, full_lines.len(), window);
                                     live_scroll = (!stepped.at_top()).then_some(stepped);
-                                } else if heights.stable() {
+                                } else {
                                     let ls = LiveScroll::start(step, full_lines.len(), window);
                                     if ls.at_top() {
-                                        // A top-reaching entry never enters the
-                                        // mode: stay Live, nothing to paint.
+                                        // A top-reaching entry never enters
+                                        // the mode — including any scroll
+                                        // over a frame that fits the window:
+                                        // stay Live, nothing to paint.
                                         continue;
                                     }
                                     live_scroll = Some(ls);
-                                } else {
-                                    pause = Some(PauseState {
-                                        frozen: full_lines.clone(),
-                                        scroll: ScrollState::new().step(
-                                            step,
-                                            full_lines.len(),
-                                            window,
-                                        ),
-                                        content: hash,
-                                        appearance: palette.appearance,
-                                        viewed_at: jiff::Timestamp::now(),
-                                        history_seq: history.newest_seq(),
-                                    });
                                 }
                                 previous_key = Some(repaint(
                                     &mut renderer,
@@ -1311,7 +1284,7 @@ mod tests {
                 age_secs: 0,
             }
         );
-        let scroll = ScrollState::new().step(ScrollStep::LineDown, 50, 10);
+        let scroll = ScrollState::default().step(ScrollStep::LineDown, 50, 10);
         let p = PauseState {
             frozen: vec!["x".to_string()],
             scroll,

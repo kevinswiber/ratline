@@ -675,16 +675,10 @@ fn first_digit_run(bytes: &[u8], min: usize) -> Option<Vec<u8>> {
 fn a_stable_frame_scrolls_live() {
     // 46 fixed lines; line 23 carries a changing stamp that is hidden in
     // the 22-row window at the top and visible at offset 1 — proof the
-    // tail keeps ticking under a scrolled window. The child counts its
-    // ticks into a file so the test can WAIT for stability instead of
-    // guessing at it from wall-clock time.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let count = dir.path().join("count");
-    let count_path = count.display().to_string();
+    // tail keeps ticking under a scrolled window.
     let rat = rat_bin();
     let script = format!(
-        "echo x >> {count_path}; \
-         i=1; while [ $i -le 46 ]; do \
+        "i=1; while [ $i -le 46 ]; do \
            if [ $i -eq 23 ]; then {rat} date --format %H%M%S%f; \
            else echo l$i; fi; i=$((i+1)); done"
     );
@@ -700,8 +694,6 @@ fn a_stable_frame_scrolls_live() {
         wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
         "expected a first frame"
     );
-    // The height ring is full once eight equal ticks have been observed.
-    wait_for_ticks(&session, &count, 10);
     let _ = drain_for(&session, Duration::from_millis(200));
 
     // A top-reaching step never enters the mode: g at the top stays Live.
@@ -756,13 +748,48 @@ fn a_stable_frame_scrolls_live() {
 }
 
 #[test]
-fn an_unstable_frame_freezes_on_scroll() {
-    // The line count alternates every tick: stability is never satisfied
-    // and a scroll key falls back to the freeze.
+fn the_first_scroll_after_launch_scrolls_live() {
+    // No warm-up: the very first scroll key after the first frame moves
+    // a live window. Freezing is explicit (p or <), never a fallback.
+    let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
+    let rat = rat_bin();
+    let mut args: Vec<&str> = vec!["watch", "-n", "50ms", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat, &args, &[]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            "lines 2-23 of 30 · live · g follows".as_bytes(),
+            b"paused",
+            Duration::from_secs(2)
+        ),
+        "expected the first scroll to live-scroll, never freeze"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn a_jittering_frame_scrolls_live_without_freezing() {
+    // The line count alternates every tick (30 ⇄ 31). Scrolling is a
+    // live viewport even so: the window re-anchors into the current
+    // shape and never captures a frozen copy on its own.
     let dir = tempfile::tempdir().expect("tempdir");
     let flag = dir.path().join("flag").display().to_string();
     let script = format!(
-        "if [ -e {flag} ]; then rm -f {flag}; echo one; echo two; else : > {flag}; echo one; fi"
+        "i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done; \
+         if [ -e {flag} ]; then rm -f {flag}; echo extra; else : > {flag}; fi"
     );
     let session = PtySession::spawn(
         &rat_bin(),
@@ -773,20 +800,19 @@ fn an_unstable_frame_freezes_on_scroll() {
     let mut terminal = FakeTerminal::dark();
 
     assert!(
-        wait_for(&session, &mut terminal, b"one", Duration::from_secs(2)),
+        wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
         "expected a first frame"
     );
-    let _ = drain_for(&session, Duration::from_millis(700));
-
     session.write_bytes(b"j");
     assert!(
-        wait_for(
+        wait_for_without(
             &session,
             &mut terminal,
-            "paused · just now".as_bytes(),
+            "· live · g follows".as_bytes(),
+            b"paused",
             Duration::from_secs(2)
         ),
-        "expected a jittering frame to freeze on scroll"
+        "expected a jittering frame to live-scroll, never freeze"
     );
     session.write_bytes(b"q");
     assert!(
@@ -796,18 +822,16 @@ fn an_unstable_frame_freezes_on_scroll() {
 }
 
 #[test]
-fn a_shape_change_while_scrolled_freezes() {
-    // Stable until the test says otherwise: the frame grows one line the
-    // moment the grow file appears, deterministically mid-scroll. The
-    // tick-count file proves stability before the first scroll key.
+fn a_shape_change_while_scrolled_stays_live() {
+    // The frame grows one line the moment the grow file appears,
+    // deterministically mid-scroll. The window must stay LIVE and
+    // re-anchor into the new shape: the status row names the new total,
+    // and neither a freeze nor a shape notice ever appears.
     let dir = tempfile::tempdir().expect("tempdir");
     let grow = dir.path().join("grow");
     let grow_path = grow.display().to_string();
-    let count = dir.path().join("count");
-    let count_path = count.display().to_string();
     let script = format!(
-        "echo x >> {count_path}; \
-         i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done; \
+        "i=1; while [ $i -le 30 ]; do echo l$i; i=$((i+1)); done; \
          if [ -e {grow_path} ]; then echo extra; fi"
     );
     let session = PtySession::spawn(
@@ -822,9 +846,6 @@ fn a_shape_change_while_scrolled_freezes() {
         wait_for(&session, &mut terminal, b"l1", Duration::from_secs(2)),
         "expected a first frame"
     );
-    wait_for_ticks(&session, &count, 10);
-    let _ = drain_for(&session, Duration::from_millis(200));
-
     session.write_bytes(b"j");
     assert!(
         wait_for_without(
@@ -834,27 +855,30 @@ fn a_shape_change_while_scrolled_freezes() {
             b"paused",
             Duration::from_secs(2)
         ),
-        "expected a stable frame to live-scroll"
+        "expected the frame to live-scroll"
     );
 
-    // The frame changes shape under the scrolled window: auto-freeze.
     std::fs::write(&grow, b"").expect("create the grow file");
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        b"frame changed shape",
+        "of 31 · live · g follows".as_bytes(),
         Duration::from_secs(8),
     )
-    .expect("expected the one-shot shape notice");
+    .expect("expected the scrolled row to pick up the new total, still live");
     assert!(
-        contains(&seen, "paused ·".as_bytes()),
-        "the shape change must land in a freeze"
+        !contains(&seen, b"paused"),
+        "a shape change must not freeze a live window"
+    );
+    assert!(
+        !contains(&seen, b"frame changed shape"),
+        "the auto-freeze notice is gone with the mechanism"
     );
 
     session.write_bytes(b"\x1b");
     assert!(
         wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
-        "expected Esc to resume the live tail"
+        "expected Esc to return to the live view"
     );
     session.write_bytes(b"q");
     assert!(
@@ -863,25 +887,37 @@ fn a_shape_change_while_scrolled_freezes() {
     );
 }
 
-/// Wait until the child's tick-count file proves at least `ticks`
-/// invocations have started (so `ticks - 1` have completed and been
-/// observed). Wall-clock drains are not stability evidence on a slow CI
-/// runner; the count file is. Keeps the pty drained while waiting.
-fn wait_for_ticks(session: &PtySession, count_file: &std::path::Path, ticks: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let seen = std::fs::read_to_string(count_file)
-            .map(|s| s.lines().count())
-            .unwrap_or(0);
-        if seen >= ticks {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the child never reached {ticks} ticks ({seen} seen)"
-        );
-        let _ = drain_for(session, Duration::from_millis(50));
-    }
+#[test]
+fn a_scroll_on_a_frame_that_fits_is_a_noop() {
+    // Nothing hidden, nothing to scroll: navigation keys do nothing at
+    // all — no live window, and certainly no freeze.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    session.write_bytes(b"j");
+    let noop = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        !contains(&noop, "· live ·".as_bytes()),
+        "a fitting frame has nowhere to scroll"
+    );
+    assert!(
+        !contains(&noop, b"paused"),
+        "a scroll key must never freeze a fitting frame"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
 }
 
 /// Every `v`-prefixed six-digit counter value in the byte stream — the

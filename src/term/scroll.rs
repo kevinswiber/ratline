@@ -19,10 +19,6 @@ pub struct ScrollState {
 }
 
 impl ScrollState {
-    pub fn new() -> ScrollState {
-        ScrollState { offset: 0 }
-    }
-
     /// A state parked at `offset` — how a live-scrolled window freezes in
     /// place. Clamp separately when the frame may have shrunk.
     pub fn at(offset: usize) -> ScrollState {
@@ -65,33 +61,6 @@ impl ScrollState {
 /// The last offset that still fills the window: total - window, floored at 0.
 pub fn max_offset(total: usize, window: usize) -> usize {
     total.saturating_sub(window)
-}
-
-/// Ticks of equal composed height before live-scroll trusts the frame.
-pub const STABLE_TICKS: usize = 8;
-
-/// Observes the composed line count every tick; the frame is stable when
-/// the last `STABLE_TICKS` observations exist and all agree.
-#[derive(Clone, Debug, Default)]
-pub struct HeightTracker {
-    counts: std::collections::VecDeque<usize>,
-}
-
-impl HeightTracker {
-    pub fn new() -> HeightTracker {
-        HeightTracker::default()
-    }
-
-    pub fn observe(&mut self, lines: usize) {
-        if self.counts.len() == STABLE_TICKS {
-            self.counts.pop_front();
-        }
-        self.counts.push_back(lines);
-    }
-
-    pub fn stable(&self) -> bool {
-        self.counts.len() == STABLE_TICKS && self.counts.iter().all(|&c| c == self.counts[0])
-    }
 }
 
 /// A window over the LIVE frame. Offset 0 is the live view itself; `G`
@@ -186,14 +155,16 @@ mod tests {
         let bottom = ScrollState { offset: 8 };
         assert_eq!(bottom.step(ScrollStep::LineDown, 30, 22).offset(), 8);
         assert_eq!(
-            ScrollState::new().step(ScrollStep::LineUp, 30, 22).offset(),
+            ScrollState::default()
+                .step(ScrollStep::LineUp, 30, 22)
+                .offset(),
             0
         );
     }
 
     #[test]
     fn half_and_full_steps_use_the_window() {
-        let top = ScrollState::new();
+        let top = ScrollState::default();
         assert_eq!(top.step(ScrollStep::HalfDown, 40, 22).offset(), 11);
         assert_eq!(top.step(ScrollStep::PageDown, 30, 22).offset(), 8);
         let half = ScrollState { offset: 11 };
@@ -202,7 +173,7 @@ mod tests {
 
     #[test]
     fn a_half_step_is_never_zero() {
-        let top = ScrollState::new();
+        let top = ScrollState::default();
         assert_eq!(top.step(ScrollStep::HalfDown, 30, 1).offset(), 1);
         assert_eq!(top.step(ScrollStep::HalfDown, 30, 0).offset(), 1);
     }
@@ -213,7 +184,9 @@ mod tests {
         assert_eq!(deep.step(ScrollStep::Top, 30, 22).offset(), 0);
         assert_eq!(deep.step(ScrollStep::Bottom, 30, 22).offset(), 8);
         assert_eq!(
-            ScrollState::new().step(ScrollStep::Bottom, 30, 22).offset(),
+            ScrollState::default()
+                .step(ScrollStep::Bottom, 30, 22)
+                .offset(),
             8
         );
     }
@@ -230,7 +203,7 @@ mod tests {
             ScrollStep::Top,
             ScrollStep::Bottom,
         ] {
-            assert_eq!(ScrollState::new().step(step, 3, 22).offset(), 0);
+            assert_eq!(ScrollState::default().step(step, 3, 22).offset(), 0);
         }
     }
 
@@ -240,28 +213,6 @@ mod tests {
         assert_eq!(deep.clamp(30, 40).offset(), 0);
         assert_eq!(deep.clamp(10, 5).offset(), 5);
         assert_eq!(ScrollState::at(8).offset(), 8);
-    }
-
-    #[test]
-    fn stability_needs_a_full_ring_of_equal_counts() {
-        let mut t = HeightTracker::new();
-        for _ in 0..STABLE_TICKS - 1 {
-            t.observe(30);
-        }
-        assert!(!t.stable(), "seven observations are not enough");
-        t.observe(30);
-        assert!(t.stable(), "eight equal observations are");
-
-        let mut jitter = HeightTracker::new();
-        for _ in 0..STABLE_TICKS - 1 {
-            jitter.observe(30);
-        }
-        jitter.observe(29);
-        assert!(!jitter.stable(), "one odd height spoils the ring");
-        for _ in 0..STABLE_TICKS {
-            jitter.observe(29);
-        }
-        assert!(jitter.stable(), "the rolling ring recovers");
     }
 
     #[test]
