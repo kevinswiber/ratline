@@ -57,6 +57,7 @@ pub fn frame_bytes(
 pub struct InlineRenderer<W: Write> {
     out: W,
     prev_rows: u16,
+    prev_lines: Vec<String>,
     hide_cursor: bool,
     sync: bool,
     clear_screen: bool,
@@ -71,6 +72,7 @@ impl<W: Write> InlineRenderer<W> {
         InlineRenderer {
             out,
             prev_rows: 0,
+            prev_lines: Vec::new(),
             hide_cursor: false,
             sync: true,
             clear_screen: false,
@@ -128,8 +130,14 @@ impl<W: Write> InlineRenderer<W> {
         self.out.write_all(bytes.as_bytes())?;
         self.out.flush()?;
         self.prev_rows = rendered_rows(lines, term_width);
+        self.prev_lines = lines.to_vec();
         self.finished = false;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn prev_lines(&self) -> &[String] {
+        &self.prev_lines
     }
 
     /// Erase the current frame and forget it.
@@ -144,6 +152,7 @@ impl<W: Write> InlineRenderer<W> {
         self.out.write_all(bytes.as_bytes())?;
         self.out.flush()?;
         self.prev_rows = 0;
+        self.prev_lines.clear();
         Ok(())
     }
 
@@ -276,6 +285,32 @@ mod tests {
             "\x1b[?25h", // drop restores the cursor
         );
         assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn the_renderer_retains_what_it_painted() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+        r.draw(&lines(&["a", "b"]), 80).unwrap();
+        assert_eq!(r.prev_lines(), lines(&["a", "b"]).as_slice());
+        r.draw(&lines(&["a", "b", "c"]), 80).unwrap();
+        assert_eq!(r.prev_lines(), lines(&["a", "b", "c"]).as_slice());
+    }
+
+    #[test]
+    fn a_width_change_still_resets_the_row_count() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["a", "b"]), 80).unwrap();
+            r.draw(&lines(&["x"]), 60).unwrap();
+            assert_eq!(r.prev_lines(), lines(&["x"]).as_slice());
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            !s.contains("\x1b[2A"),
+            "resize must repaint without a stale move-up: {s:?}"
+        );
     }
 
     #[test]
