@@ -1601,6 +1601,61 @@ fn once_paints_one_frame_and_exits() {
     );
 }
 
+#[test]
+fn a_theme_flip_during_a_child_run_reruns_it_under_the_new_appearance() {
+    // A theme adoption is an ENVIRONMENT change: the in-flight child
+    // was started under the old RAT_APPEARANCE and must not satisfy
+    // the repaint's tick — a fresh child has to run. The 8 s window is
+    // an 18-second discriminator: a merely-satisfied request would
+    // not show the light child until the natural tick at t≈22 s.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let count_path = count.display().to_string();
+    let script = format!("echo x >> {count_path}; /bin/sleep 2; echo appearance=$RAT_APPEARANCE");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "20s", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    // The first child is RUNNING and no frame exists yet — the flip
+    // lands mid-run, before the first paint.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+        < 1
+    {
+        let chunk = session.read_available(Duration::from_millis(20));
+        terminal.respond(&session, &chunk);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first child never started"
+        );
+    }
+    // The terminal's colors change, then it announces the change —
+    // one stale report and two corrected ones, as a real flip sends.
+    terminal.set("rgb:0000/0000/0000", "rgb:ffff/ffff/ffff");
+    session.write_bytes(b"\x1b[?997;1n\x1b[?997;2n\x1b[?997;2n");
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"appearance=light",
+            Duration::from_secs(8)
+        ),
+        "expected a fresh child under the new appearance"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
 /// The last complete \r\n-delimited row containing `needle`.
 fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
     bytes

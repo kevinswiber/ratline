@@ -667,10 +667,12 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                         let debug_notice = std::env::var_os("RAT_DEBUG_APPEARANCE")
                             .is_some()
                             .then(|| format!("appearance → {}", verdict.as_str()));
-                        // Our own chrome flips at once; the fresh tick this
-                        // requests re-renders the child itself under the new
-                        // environment.
-                        schedule.request_now();
+                        // Our own chrome flips at once; the fresh child
+                        // this requests re-renders under the new
+                        // environment. A RESPAWN, not a plain request: the
+                        // in-flight child was started under the old
+                        // RAT_APPEARANCE and cannot satisfy this.
+                        schedule.request_respawn();
                         if let Some(live) = live.as_ref() {
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
