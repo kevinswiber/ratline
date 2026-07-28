@@ -544,6 +544,90 @@ fn s_writes_a_snapshot_of_the_frame() {
 }
 
 #[test]
+fn q_quits_from_a_frozen_frame() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(wait_for(
+        &session,
+        &mut terminal,
+        b"hi",
+        Duration::from_secs(2)
+    ));
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(&session, &mut terminal, b"paused", Duration::from_secs(2)),
+        "expected the frame to freeze"
+    );
+    session.write_bytes(b"q");
+    // A clean exit from paused mode still unsubscribes on the way out.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"\x1b[?2031l",
+            Duration::from_secs(2)
+        ),
+        "expected the theme unsubscribe while quitting from paused mode"
+    );
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q while frozen"
+    );
+}
+
+#[test]
+fn v_pages_the_frozen_frame() {
+    let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
+    let rat = rat_bin();
+    let mut args: Vec<&str> = vec!["watch", "-n", "50ms", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session =
+        PtySession::spawn(&rat, &args, &[("RAT_PAGER", "/bin/cat")]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(wait_for(
+        &session,
+        &mut terminal,
+        b"l1",
+        Duration::from_secs(2)
+    ));
+    session.write_bytes(b"G");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 9-30 of 30",
+            Duration::from_secs(2)
+        ),
+        "expected the bottom of the frozen frame"
+    );
+    session.write_bytes(b"v");
+    // The pager streams the frozen body (no paused row), so this needle
+    // can only come from the post-pager repaint — which repaints the
+    // FROZEN window, proving paging did not resume the tail.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"lines 9-30 of 30",
+            Duration::from_secs(2)
+        ),
+        "expected the frozen window back after the pager returned"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
 fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
     // The pager's alternate screen restores the pre-pager frame with the
     // cursor below it; the next frame must climb over and replace that
