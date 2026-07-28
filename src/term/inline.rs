@@ -56,6 +56,10 @@ pub fn frame_bytes(
 /// stops paying for itself and the full repaint takes over.
 const DIFF_MAX_CHANGED_PCT: usize = 60;
 
+/// The rewrite path cannot heal writes it did not make (a full repaint's
+/// wipe can), so a periodic full repaint bounds any accumulated damage.
+const FORCED_FULL_EVERY: u32 = 50;
+
 /// The changed-rows rewrite: `Some(bytes)` when `next` can be painted by
 /// rewriting only the rows that differ from `prev`; `None` means "emit the
 /// full sequence". `Some(String::new())` means byte-identical: write nothing.
@@ -68,6 +72,29 @@ fn diff_bytes(prev: &[String], next: &[String], term_width: u16, sync: bool) -> 
     if prev.len() != next.len() {
         return None;
     }
+    if prev == next {
+        return Some(String::new());
+    }
+    // Bottom-row fast path: when only the single-row last line changed,
+    // the rewrite needs no wrap math on the rows above — the last row is
+    // always exactly one step from the resting cursor.
+    if let (Some(prev_last), Some(next_last)) = (prev.last(), next.last())
+        && prev[..prev.len() - 1] == next[..next.len() - 1]
+        && rendered_rows(std::slice::from_ref(prev_last), term_width) == 1
+        && rendered_rows(std::slice::from_ref(next_last), term_width) == 1
+    {
+        let mut out = String::new();
+        if sync {
+            out.push_str("\x1b[?2026h");
+        }
+        out.push_str("\x1b[1A\r\x1b[2K");
+        out.push_str(next_last);
+        out.push_str("\r\x1b[1B");
+        if sync {
+            out.push_str("\x1b[?2026l");
+        }
+        return Some(out);
+    }
     // 1:1 check: every line is at least one row, so the row sum equals the
     // line count only when every line occupies exactly one row.
     if usize::from(rendered_rows(prev, term_width)) != prev.len()
@@ -76,9 +103,6 @@ fn diff_bytes(prev: &[String], next: &[String], term_width: u16, sync: bool) -> 
         return None;
     }
     let changed: Vec<usize> = (0..next.len()).filter(|&i| prev[i] != next[i]).collect();
-    if changed.is_empty() {
-        return Some(String::new());
-    }
     if changed.len() * 100 > next.len() * DIFF_MAX_CHANGED_PCT {
         return None;
     }
@@ -117,6 +141,7 @@ pub struct InlineRenderer<W: Write> {
     prev_rows: u16,
     prev_lines: Vec<String>,
     diff_invalid: bool,
+    draws_since_full: u32,
     hide_cursor: bool,
     sync: bool,
     clear_screen: bool,
@@ -133,6 +158,7 @@ impl<W: Write> InlineRenderer<W> {
             prev_rows: 0,
             prev_lines: Vec::new(),
             diff_invalid: false,
+            draws_since_full: 0,
             hide_cursor: false,
             sync: true,
             clear_screen: false,
@@ -181,10 +207,12 @@ impl<W: Write> InlineRenderer<W> {
         }
         let wipe = self.clear_screen && !self.screen_cleared;
         self.screen_cleared = true;
-        let diff = if width_unchanged
+        self.draws_since_full += 1;
+        let diff = if !self.diff_invalid
             && !wipe
-            && !self.diff_invalid
+            && width_unchanged
             && self.prev_lines.len() == usize::from(self.prev_rows)
+            && self.draws_since_full < FORCED_FULL_EVERY
         {
             diff_bytes(&self.prev_lines, lines, term_width, self.sync)
         } else {
@@ -201,6 +229,7 @@ impl<W: Write> InlineRenderer<W> {
                     wipe,
                 ));
                 self.diff_invalid = false;
+                self.draws_since_full = 0;
             }
         }
         self.out.write_all(bytes.as_bytes())?;
@@ -461,6 +490,65 @@ mod tests {
         let next = lines(&[&wide, "b"]);
         assert_eq!(diff_bytes(&prev, &next, 80, false), None);
         assert_eq!(diff_bytes(&next, &prev, 80, false), None);
+    }
+
+    #[test]
+    fn only_the_last_row_changed_rewrites_it_even_under_wrap() {
+        // The earlier wide line wraps (not 1:1), but only the single-row
+        // last line changed: the bottom-row fast path still applies.
+        let wide = "a".repeat(100);
+        let prev = lines(&[&wide, "count: 1"]);
+        let next = lines(&[&wide, "count: 2"]);
+        let s = diff_bytes(&prev, &next, 80, false).expect("bottom-row eligible");
+        assert_eq!(s, "\x1b[1A\r\x1b[2Kcount: 2\r\x1b[1B");
+        let s = diff_bytes(&prev, &next, 80, true).expect("bottom-row eligible");
+        assert_eq!(s, "\x1b[?2026h\x1b[1A\r\x1b[2Kcount: 2\r\x1b[1B\x1b[?2026l");
+    }
+
+    #[test]
+    fn a_wide_last_row_declines_the_fast_path() {
+        let prev = lines(&["a", &"x".repeat(100)]);
+        let next = lines(&["a", &"y".repeat(100)]);
+        assert_eq!(diff_bytes(&prev, &next, 80, false), None);
+    }
+
+    #[test]
+    fn a_pager_round_trip_forces_a_full_repaint() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["a", "b"]), 80).unwrap();
+            r.resume_over_own_frame();
+            r.draw(&lines(&["a", "c"]), 80).unwrap();
+            r.draw(&lines(&["a", "d"]), 80).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s.matches("\x1b[0J").count(),
+            2,
+            "the pager may have left anything on those rows: {s:?}"
+        );
+        assert!(s.contains("\x1b[2K"), "the next change diffs again: {s:?}");
+    }
+
+    #[test]
+    fn the_fiftieth_draw_is_full() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out).with_sync_output(false);
+            r.draw(&lines(&["base", "n=0"]), 80).unwrap();
+            for i in 1..=50 {
+                r.draw(&lines(&["base", &format!("n={i}")]), 80).unwrap();
+            }
+            // The forced full reset the counter: the next change diffs.
+            r.draw(&lines(&["base", "n=51"]), 80).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s.matches("\x1b[0J").count(),
+            2,
+            "the first draw and the 50th after it are full: {s:?}"
+        );
     }
 
     #[test]
