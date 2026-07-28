@@ -1358,3 +1358,163 @@ fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
         "watch should have exited on q"
     );
 }
+
+/// The last complete \r\n-delimited row containing `needle`.
+fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|row| row.strip_suffix(b"\r").unwrap_or(row))
+        .rfind(|row| contains(row, needle))
+}
+
+#[test]
+fn the_gutter_marks_the_changed_line_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!(
+        "echo steady-anchor-line; echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"D");
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "▌".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected a gutter mark after D");
+    let counter_row = row_containing(&bytes, b"v0").expect("a counter row");
+    assert!(
+        contains(counter_row, "▌".as_bytes()),
+        "the changed row must carry the mark: {:?}",
+        String::from_utf8_lossy(counter_row)
+    );
+    let steady_row = row_containing(&bytes, b"steady-anchor-line").expect("the steady row");
+    assert!(
+        !contains(steady_row, "▌".as_bytes()),
+        "an unchanged row must not be marked: {:?}",
+        String::from_utf8_lossy(steady_row)
+    );
+    assert!(
+        contains(steady_row, b"  steady-anchor-line"),
+        "the unmarked two-space cell must precede the content: {:?}",
+        String::from_utf8_lossy(steady_row)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn the_gutter_column_survives_a_shift() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!(
+        "echo 12345678-steady-remainder; echo x >> {count}; n=$(wc -l < {count}); \
+         printf 'counter-mark v%06d\\n' $n"
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"D");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "▌".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected a gutter mark after D"
+    );
+    session.write_bytes(b"l");
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"-steady-remainder",
+        Duration::from_secs(2),
+    )
+    .expect("expected the shifted frame");
+    let steady_row = row_containing(&bytes, b"-steady-remainder").expect("the shifted row");
+    assert!(
+        !contains(steady_row, b"12345678"),
+        "the content region must have shifted: {:?}",
+        String::from_utf8_lossy(steady_row)
+    );
+    let counter_row = row_containing(&bytes, b"v0").expect("a counter row");
+    assert!(
+        contains(counter_row, "▌".as_bytes()),
+        "the margin sits outside the shift window: {:?}",
+        String::from_utf8_lossy(counter_row)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn toggling_the_gutter_off_restores_the_plain_frame() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"D");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "▌".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected a gutter mark after D"
+    );
+    session.write_bytes(b"D");
+    // Swallow the transition — a marked frame may still be in flight.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    let bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
+        .expect("expected a plain counter row after toggling off");
+    assert!(
+        !contains(&bytes, "▌".as_bytes()),
+        "no mark cell may survive the toggle: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}

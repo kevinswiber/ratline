@@ -16,6 +16,7 @@ use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::history::History;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
+use crate::term::marks::{GUTTER_COLS, LineMark, changed_marks, prefix_rows};
 use crate::term::scroll::{
     HSHIFT_STEP, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
 };
@@ -106,6 +107,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     let mut view = ViewState {
         wrap: !args.no_wrap,
         hshift: 0,
+        gutter: false,
     };
     let mut notice: Option<String> = None;
     loop {
@@ -168,7 +170,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     live_scroll,
                     &full_lines,
                     hash,
-                    palette.appearance,
+                    &palette,
                     view,
                     notice.take(),
                     size,
@@ -176,6 +178,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     &faint,
                     profile,
                     &since,
+                    &history,
                 )?;
             } else {
                 let mut out = std::io::stdout().lock();
@@ -231,7 +234,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     live_scroll,
                     &full_lines,
                     hash,
-                    palette.appearance,
+                    &palette,
                     view,
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
@@ -239,6 +242,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     &faint,
                     profile,
                     &since,
+                    &history,
                 )?);
             }
             #[cfg(unix)]
@@ -360,7 +364,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     live_scroll,
                                     &full_lines,
                                     hash,
-                                    palette.appearance,
+                                    &palette,
                                     view,
                                     None,
                                     size,
@@ -368,6 +372,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    &history,
                                 )?);
                             }
                             WatchAction::Resume => {
@@ -391,7 +396,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     live_scroll,
                                     &full_lines,
                                     hash,
-                                    palette.appearance,
+                                    &palette,
                                     view,
                                     None,
                                     size,
@@ -399,6 +404,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    &history,
                                 )?);
                             }
                             WatchAction::Freeze => {
@@ -423,7 +429,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     live_scroll,
                                     &full_lines,
                                     hash,
-                                    palette.appearance,
+                                    &palette,
                                     view,
                                     None,
                                     size,
@@ -431,6 +437,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    &history,
                                 )?);
                             }
                             action @ (WatchAction::ScrubBack | WatchAction::ScrubForward) => {
@@ -481,7 +488,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     live_scroll,
                                     &full_lines,
                                     hash,
-                                    palette.appearance,
+                                    &palette,
                                     view,
                                     None,
                                     size,
@@ -489,17 +496,20 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    &history,
                                 )?);
                             }
                             action @ (WatchAction::ToggleWrap
                             | WatchAction::ShiftLeft
-                            | WatchAction::ShiftRight) => {
+                            | WatchAction::ShiftRight
+                            | WatchAction::ToggleGutter) => {
                                 // View state, not scrollback state: applies to
                                 // live and frozen frames alike, never freezes
                                 // the tail, repaints in place. Right shift is
                                 // unclamped, like less; left clamps at zero.
                                 match action {
                                     WatchAction::ToggleWrap => view.wrap = !view.wrap,
+                                    WatchAction::ToggleGutter => view.gutter = !view.gutter,
                                     WatchAction::ShiftLeft => {
                                         view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
                                     }
@@ -512,7 +522,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     live_scroll,
                                     &full_lines,
                                     hash,
-                                    palette.appearance,
+                                    &palette,
                                     view,
                                     None,
                                     size,
@@ -520,6 +530,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    &history,
                                 )?);
                             }
                             WatchAction::Snapshot => {
@@ -537,7 +548,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     live_scroll,
                                     &full_lines,
                                     hash,
-                                    palette.appearance,
+                                    &palette,
                                     view,
                                     Some(text),
                                     size,
@@ -545,6 +556,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                     &faint,
                                     profile,
                                     &since,
+                                    &history,
                                 )?);
                             }
                             WatchAction::Ignore => {}
@@ -620,6 +632,7 @@ enum WatchAction {
     ToggleWrap,
     ShiftLeft,
     ShiftRight,
+    ToggleGutter,
     Ignore,
 }
 
@@ -644,6 +657,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('w') => WatchAction::ToggleWrap,
         Key::Char('h') | Key::Left => WatchAction::ShiftLeft,
         Key::Char('l') | Key::Right => WatchAction::ShiftRight,
+        Key::Char('D') => WatchAction::ToggleGutter,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
@@ -672,12 +686,17 @@ struct PauseState {
 }
 
 /// How long lines are shown: wrapped (today's path) or chopped, shifted
-/// `hshift` columns right. View state, not scrollback state: it survives
-/// freeze/resume and pager round-trips.
+/// `hshift` columns right, with or without the change gutter. View
+/// state, not scrollback state: it survives freeze/resume and pager
+/// round-trips.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 struct ViewState {
     wrap: bool,
     hshift: usize,
+    /// The margin column marking lines that changed against the
+    /// previous distinct frame. Implies chopped rendering: mark i
+    /// aligning with line i needs 1:1 line-to-row.
+    gutter: bool,
 }
 
 /// Everything a painted frame depends on; the repaint gate compares two of
@@ -694,6 +713,7 @@ struct PaintKey {
     paused: bool,
     wrap: bool,
     hshift: usize,
+    gutter: bool,
     /// Whole seconds since the viewed frame was current; 0 while live.
     /// Advancing once per second is what lets the paused age repaint.
     age_secs: u64,
@@ -732,6 +752,7 @@ fn paint_key(
         paused,
         wrap: view.wrap,
         hshift: view.hshift,
+        gutter: view.gutter,
         age_secs,
     }
 }
@@ -775,7 +796,7 @@ fn repaint(
     live_scroll: Option<LiveScroll>,
     full_lines: &[String],
     live_content: u64,
-    live_appearance: Appearance,
+    palette: &Palette,
     view: ViewState,
     notice: Option<String>,
     size: (u16, u16),
@@ -783,13 +804,14 @@ fn repaint(
     faint: &StyleSpec,
     profile: ColorProfile,
     since: &str,
+    history: &History,
 ) -> anyhow::Result<PaintKey> {
     let age_secs = pause.map_or(0, |p| age_seconds(p.viewed_at));
     let key = paint_key(
         pause,
         live_scroll,
         live_content,
-        live_appearance,
+        palette.appearance,
         size,
         view,
         age_secs,
@@ -799,9 +821,46 @@ fn repaint(
         (None, Some(ls)) => (full_lines, ls.offset(), FrameMode::LiveScrolled),
         (None, None) => (full_lines, 0, FrameMode::Live),
     };
+    // Marks compare the viewed frame against the previous DISTINCT
+    // frame — the pause's anchored entry (re-resolved through `nearest`
+    // when evicted), else the newest. No predecessor means no marks.
+    let marks: Option<Vec<LineMark>> = view.gutter.then(|| {
+        let anchor = match pause {
+            Some(p) => p
+                .history_seq
+                .and_then(|seq| history.nearest(seq).map(|e| e.seq)),
+            None => history.newest_seq(),
+        };
+        let prev = anchor.and_then(|seq| history.prev(seq));
+        changed_marks(prev.map(|e| e.frame.as_slice()), source)
+    });
+    // The accent rides the live theme system, so the cell is built at
+    // paint time from the current palette, never cached.
+    let mark_cell = format!(
+        "{} ",
+        StyleSpec {
+            bold: true,
+            foreground: Some(palette.accent),
+            ..StyleSpec::default()
+        }
+        .render("▌", profile)
+    );
     let age = age_text(age_secs);
     paint_frame(
-        renderer, source, offset, mode, view, notice, size, max_height, faint, profile, since, &age,
+        renderer,
+        source,
+        offset,
+        mode,
+        view,
+        notice,
+        size,
+        max_height,
+        faint,
+        profile,
+        since,
+        &age,
+        marks.as_deref(),
+        &mark_cell,
     )?;
     Ok(key)
 }
@@ -852,6 +911,8 @@ fn paint_frame(
     profile: ColorProfile,
     since: &str,
     age: &str,
+    marks: Option<&[LineMark]>,
+    mark_cell: &str,
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
@@ -859,20 +920,28 @@ fn paint_frame(
         FrameMode::Live => 0,
         FrameMode::LiveScrolled | FrameMode::Paused => offset.min(lines.len()),
     };
-    // A nonzero shift implies chopped lines, less's own rule — and so does
-    // live-scrolling, where an offset counts lines and only chopping makes
-    // a line one row. Chopped rendering is 1:1 line-to-row; wrapped
-    // rendering is today's path.
-    let (mut kept, hidden) = if !view.wrap || view.hshift > 0 || mode == FrameMode::LiveScrolled {
-        let end = (start + usize::from(max_rows)).min(lines.len());
-        let kept: Vec<String> = lines[start..end]
-            .iter()
-            .map(|line| shift_chop(line, view.hshift, usize::from(cols)))
-            .collect();
-        (kept, lines.len() - end)
-    } else {
-        truncate_to_rows(lines[start..].to_vec(), max_rows, cols)
-    };
+    // The gutter is its own region: content renders into what is left.
+    let content_cols = usize::from(cols).saturating_sub(if view.gutter { GUTTER_COLS } else { 0 });
+    // A nonzero shift implies chopped lines, less's own rule — and so do
+    // live-scrolling and the gutter, where an offset (or a mark) counts
+    // lines and only chopping makes a line one row. Chopped rendering is
+    // 1:1 line-to-row; wrapped rendering is today's path.
+    let (mut kept, hidden) =
+        if !view.wrap || view.hshift > 0 || mode == FrameMode::LiveScrolled || view.gutter {
+            let end = (start + usize::from(max_rows)).min(lines.len());
+            let kept: Vec<String> = lines[start..end]
+                .iter()
+                .map(|line| shift_chop(line, view.hshift, content_cols))
+                .collect();
+            (kept, lines.len() - end)
+        } else {
+            truncate_to_rows(lines[start..].to_vec(), max_rows, cols)
+        };
+    // Body rows only: the status and notice rows below are chrome and
+    // stay unprefixed at full width.
+    if let Some(marks) = marks {
+        kept = prefix_rows(kept, marks, start, mark_cell);
+    }
     let status = match mode {
         FrameMode::Paused => paused_notice(age, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => scrolled_notice(offset, kept.len(), lines.len()),
@@ -1227,6 +1296,20 @@ mod tests {
     }
 
     #[test]
+    fn shift_d_toggles_the_gutter_in_every_mode() {
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('D'), mode), WatchAction::ToggleGutter);
+        }
+        // The half-page scroll is untouched by its shifted neighbour.
+        for mode in ALL_MODES {
+            assert_eq!(
+                action_for(Key::Char('d'), mode),
+                WatchAction::Scroll(ScrollStep::HalfDown)
+            );
+        }
+    }
+
+    #[test]
     fn view_keys_are_view_actions_in_every_mode() {
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::Char('w'), mode), WatchAction::ToggleWrap);
@@ -1290,6 +1373,7 @@ mod tests {
         let view = ViewState {
             wrap: true,
             hshift: 4,
+            gutter: false,
         };
         // A live key never ages, whatever the caller computed.
         let live = paint_key(None, None, 42, Appearance::Dark, (80, 24), view, 14);
@@ -1304,6 +1388,7 @@ mod tests {
                 paused: false,
                 wrap: true,
                 hshift: 4,
+                gutter: false,
                 age_secs: 0,
             }
         );
@@ -1331,6 +1416,7 @@ mod tests {
                 paused: false,
                 wrap: true,
                 hshift: 4,
+                gutter: false,
                 age_secs: 0,
             }
         );
@@ -1346,6 +1432,7 @@ mod tests {
                 paused: true,
                 wrap: true,
                 hshift: 4,
+                gutter: false,
                 age_secs: 14,
             }
         );
