@@ -91,6 +91,12 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
 
     let mut previous_key: Option<PaintKey> = None;
     let mut full_lines: Vec<String> = Vec::new();
+    // The live status row names the ABSOLUTE local time of the last
+    // content change: a counting age would change every tick and defeat
+    // the repaint gate. Tracked against the tick hash, independent of
+    // whether the gate repaints.
+    let mut last_hash: Option<u64> = None;
+    let mut since = String::new();
     let mut pause: Option<PauseState> = None;
     let mut view = ViewState {
         wrap: !args.no_wrap,
@@ -102,6 +108,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         let mut combined = output.stdout.clone();
         combined.extend_from_slice(&output.stderr);
         let hash = signature(&combined);
+        if last_hash != Some(hash) {
+            last_hash = Some(hash);
+            since = jiff::Zoned::now().strftime("%H:%M:%S").to_string();
+        }
         // The terminal size joins the change key: a resize must repaint
         // even when the content is unchanged. So does the appearance: a
         // palette swap must repaint even when the child prints the same
@@ -137,6 +147,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     args.max_height,
                     &faint,
                     profile,
+                    &since,
                 )?;
             } else {
                 let mut out = std::io::stdout().lock();
@@ -291,6 +302,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 args.max_height,
                                 &faint,
                                 profile,
+                                &since,
                             )?);
                         }
                         WatchAction::Resume => {
@@ -327,6 +339,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 args.max_height,
                                 &faint,
                                 profile,
+                                &since,
                             )?);
                         }
                         WatchAction::Snapshot => {
@@ -350,6 +363,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 args.max_height,
                                 &faint,
                                 profile,
+                                &since,
                             )?);
                         }
                         WatchAction::Ignore => {}
@@ -491,6 +505,16 @@ fn paint_key(
     }
 }
 
+/// The live status row: the truncation notice when rows are hidden, always
+/// naming the last content change.
+fn live_notice(hidden: usize, since: &str) -> String {
+    if hidden > 0 {
+        format!("… {hidden} more lines · since {since} · v views all · q quits")
+    } else {
+        format!("since {since}")
+    }
+}
+
 /// The consolidated in-place paint: build the key for the current
 /// (pause, view) state, draw the matching source, and return the key that
 /// was painted — so a dispatch arm cannot paint and forget the gate.
@@ -507,6 +531,7 @@ fn repaint(
     max_height: Option<u16>,
     faint: &StyleSpec,
     profile: ColorProfile,
+    since: &str,
 ) -> anyhow::Result<PaintKey> {
     let key = paint_key(pause, live_content, live_appearance, size, view);
     let (source, offset, paused) = match pause {
@@ -514,7 +539,7 @@ fn repaint(
         None => (full_lines, 0, false),
     };
     paint_frame(
-        renderer, source, offset, paused, view, notice, size, max_height, faint, profile,
+        renderer, source, offset, paused, view, notice, size, max_height, faint, profile, since,
     )?;
     Ok(key)
 }
@@ -563,6 +588,7 @@ fn paint_frame(
     max_height: Option<u16>,
     faint: &StyleSpec,
     profile: ColorProfile,
+    since: &str,
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
@@ -581,11 +607,8 @@ fn paint_frame(
     };
     if paused {
         kept.push(faint.render(&paused_notice(offset, kept.len(), lines.len()), profile));
-    } else if hidden > 0 {
-        kept.push(faint.render(
-            &format!("… {hidden} more lines · v views all · q quits"),
-            profile,
-        ));
+    } else {
+        kept.push(faint.render(&live_notice(hidden, since), profile));
     }
     if let Some(text) = notice {
         kept.push(faint.render(&text, profile));
@@ -926,6 +949,15 @@ mod tests {
             assert_eq!(action_for(Key::Char('S'), paused), WatchAction::Snapshot);
             assert_eq!(action_for(Key::Char('s'), paused), WatchAction::Ignore);
         }
+    }
+
+    #[test]
+    fn the_live_rows_carry_the_since_stamp() {
+        assert_eq!(live_notice(0, "18:47:53"), "since 18:47:53");
+        assert_eq!(
+            live_notice(8, "18:47:53"),
+            "… 8 more lines · since 18:47:53 · v views all · q quits"
+        );
     }
 
     #[test]

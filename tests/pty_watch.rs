@@ -30,6 +30,33 @@ fn drain_for(session: &PtySession, total: std::time::Duration) -> Vec<u8> {
     }
 }
 
+/// `wait_for`, returning the accumulated bytes once `needle` appears —
+/// for assertions that need to inspect text near the needle.
+fn wait_for_bytes(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needle: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let chunk = session.read_available((deadline - now).min(Duration::from_millis(50)));
+        if chunk.is_empty() {
+            continue;
+        }
+        terminal.respond(session, &chunk);
+        seen.extend_from_slice(&chunk);
+        if contains(&seen, needle) {
+            return Some(seen);
+        }
+    }
+}
+
 /// `wait_for`, but panicking the moment `forbidden` shows up in the
 /// accumulated output.
 fn wait_for_without(
@@ -339,6 +366,51 @@ fn a_navigation_key_freezes_the_frame_and_stops_the_tail() {
 }
 
 #[test]
+fn every_live_frame_names_its_last_change() {
+    // A static child: after the first frame nothing changes, so the
+    // absolute stamp must hold the repaint gate shut.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    let mut seen = wait_for_bytes(&session, &mut terminal, b"since ", Duration::from_secs(2))
+        .expect("expected the live since row");
+    // The stamp may straddle a chunk boundary; give it a moment to land.
+    seen.extend(drain_for(&session, Duration::from_millis(150)));
+    let at = seen
+        .windows(6)
+        .position(|w| w == b"since ")
+        .expect("just matched");
+    let stamp = &seen[at + 6..at + 14];
+    assert!(
+        stamp.iter().enumerate().all(|(i, b)| match i {
+            2 | 5 => *b == b':',
+            _ => b.is_ascii_digit(),
+        }),
+        "expected an HH:MM:SS stamp, got {:?}",
+        String::from_utf8_lossy(stamp)
+    );
+
+    // Static content and an absolute stamp: not one further byte painted.
+    let leaked = session.read_available(Duration::from_millis(400));
+    assert!(
+        leaked.is_empty(),
+        "the stamp must not defeat the repaint gate: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
 fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
     // 30 static lines on a 24-row pty: a 22-row window, 8 hidden.
     let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
@@ -348,14 +420,18 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
     let session = PtySession::spawn(&rat_bin(), &args, &[]).expect("spawn under a pty");
     let mut terminal = FakeTerminal::dark();
 
+    // The truncation row also carries the since stamp between these two
+    // segments; both arrive in the same paint.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "v views all · q quits".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected the live truncation notice");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            "… 8 more lines · v views all · q quits".as_bytes(),
-            Duration::from_secs(2)
-        ),
-        "expected the live truncation notice"
+        contains(&seen, "… 8 more lines".as_bytes()),
+        "expected the hidden-line count in the truncation row"
     );
 
     session.write_bytes(b"j");
@@ -381,14 +457,16 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
     );
 
     session.write_bytes(b"\x1b");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "v views all · q quits".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected the live truncation notice back after Esc");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            "… 8 more lines · v views all · q quits".as_bytes(),
-            Duration::from_secs(2)
-        ),
-        "expected the live truncation notice back after Esc"
+        contains(&seen, "… 8 more lines".as_bytes()),
+        "expected the hidden-line count back after Esc"
     );
     session.write_bytes(b"q");
     assert!(
@@ -647,14 +725,14 @@ fn leaving_the_pager_erases_the_stale_frame_before_repainting() {
         Duration::from_secs(2)
     ));
     session.write_bytes(b"v");
-    // The one-row frame means the post-pager repaint must move up exactly
-    // one row before its erase; without that the frame lands below the
-    // restored copy.
+    // The two-row frame (content + status row) means the post-pager
+    // repaint must move up exactly two rows before its erase; without
+    // that the frame lands below the restored copy.
     assert!(
         wait_for(
             &session,
             &mut terminal,
-            b"\x1b[1A\r\x1b[0J",
+            b"\x1b[2A\r\x1b[0J",
             Duration::from_secs(2)
         ),
         "expected the post-pager repaint to climb over the restored frame"
