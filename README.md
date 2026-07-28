@@ -96,11 +96,33 @@ frame being viewed — step back to when it broke, press `S`. History
 lives in memory only while the session runs, bounded to a few MiB of
 distinct frames.
 
+`t` flips how the two time rows read, without changing what they mean:
+the live row's `since 14:03:52` becomes a counting `changed 14s ago`,
+and the paused row's counting age becomes `at 14:03:52` — the
+wall-clock moment the frame on screen was current. Press `t` again to
+flip back.
+
 Two view toggles work live or frozen, without pausing anything: `w`
 switches long lines between wrapped and chopped, and `h`/`l` (or
 Left/Right) scroll the view horizontally in 8-column steps. As in `less`,
 a horizontally shifted view shows chopped lines until you shift back to
 the left edge. Start chopped with `--no-wrap`.
+
+Two change markers show what moved against the previous distinct
+frame, and both work live, scrolled, frozen, or stepped back in time —
+a scrubbed frame shows what changed into it. `D` toggles a margin
+column marking the changed lines; `c` highlights the changed
+characters in place, in reverse video layered over the output's own
+colors. Run either or both. The marks stay put until the output
+changes again, so on a slow dashboard they answer "what moved last",
+and they mark content only: a line that merely changed color stays
+unmarked, and so does pure whitespace reshuffling, like a table
+re-aligning its columns. A removed line leaves nothing to highlight,
+so deletions show in the gutter only. The gutter is its own column —
+it never scrolls away when you shift with `h`/`l`, and while it's on,
+long lines render chopped, the same rule as a shifted view. The
+character highlights follow the text wherever it goes: wrapped,
+chopped, or shifted.
 
 `S` writes the frame being viewed to `rat-watch-YYYYMMDD-HHMMSS.txt` in
 `--snapshot-dir` (or `RAT_SNAPSHOT_DIR`, or the directory the watch was
