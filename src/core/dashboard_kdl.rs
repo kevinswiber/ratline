@@ -199,94 +199,20 @@ fn record(seen: &mut Vec<&'static str>, k: &'static Key, at: &str) -> anyhow::Re
     Ok(())
 }
 
-pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
-    let doc: kdl::KdlDocument = text.parse().context("reading the dashboard KDL")?;
-    // SCAFFOLD — this detector and `parse_split` live for exactly one
-    // task (added in 2.1, deleted in 3.2). Which spelling a file is
-    // written in is a property of the FILE: a top-level `row`/`column`
-    // means the panes are declared where they sit, a `layout` block
-    // means they are declared flat and placed by name. Both build the
-    // same `DashboardFile`, which is the point — while both parsers
-    // exist, a ported fixture can be A/B'd against the grammar it came
-    // from. When the last one is ported, this goes with them.
-    let mut inline = false;
-    let mut split = false;
-    for node in doc.nodes() {
-        match node.name().value() {
-            "row" | "column" => inline = true,
-            "layout" => split = true,
-            _ => {}
-        }
-    }
-    if inline && split {
-        bail!(
-            "a dashboard is written EITHER as flat `pane` declarations placed by a \
-             `layout` block, OR as `row`/`column` nodes with the panes inside them — \
-             this file does both"
-        );
-    }
-    if split {
-        parse_split(&doc)
-    } else {
-        parse_inline(&doc)
-    }
-}
-
-/// SCAFFOLD (dies in 3.2 with the detector above): the outgoing
-/// spelling — a flat `pane` list plus a `layout` block that places the
-/// panes by name.
-fn parse_split(doc: &kdl::KdlDocument) -> anyhow::Result<DashboardFile> {
-    let mut file = DashboardFile::default();
-    // Pane blocks are walked AFTER the whole first pass, so a
-    // `defaults` node anywhere in the document still supplies the
-    // `shell` the command split depends on.
-    let mut panes: Vec<(kdl::KdlNode, String)> = Vec::new();
-    let mut pane_index = 0usize;
-    for node in doc.nodes() {
-        match node.name().value() {
-            "gap" => file.gap = Some(usize_field(node, "gap")?),
-            "row-gap" => file.row_gap = Some(usize_field(node, "row-gap")?),
-            "defaults" => {
-                if !positional(node).is_empty() {
-                    bail!("defaults takes no name — it holds the keys every pane inherits");
-                }
-                file.defaults = pane_block(node, None, false)?;
-            }
-            "pane" => {
-                pane_index += 1;
-                let name = one_name(node, &format!("pane #{pane_index}"))?;
-                panes.push((node.clone(), name));
-            }
-            "layout" => {
-                refuse_container_properties(node, "layout", "a layout")?;
-                file.layout = Some(layout_rows(node)?);
-            }
-            other => {
-                bail!("unknown node {other:?}: expected gap, row-gap, defaults, pane, or layout")
-            }
-        }
-    }
-    let default_shell = file.defaults.shell.unwrap_or(false);
-    for (node, name) in panes {
-        file.panes
-            .push(pane_block(&node, Some(name), default_shell)?);
-    }
-    Ok(file)
-}
-
-/// The grammar: a pane is declared inside the `row`/`column` that places
-/// it, and there is no `layout` block.
+/// The document: settings, then the tree. A pane is declared inside the
+/// `row`/`column` that places it.
 ///
 /// The lift is parser-only. A pane's block becomes a `PaneDecl` in
 /// `panes` — in document order, which is the order `SourceId`s are
 /// handed out — and its name becomes a `LayoutDecl::Pane` in the tree.
 /// `DashboardFile` never learns where the panes were written, so
 /// `into_registry` stays the one validation path.
-fn parse_inline(doc: &kdl::KdlDocument) -> anyhow::Result<DashboardFile> {
+pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
+    let doc: kdl::KdlDocument = text.parse().context("reading the dashboard KDL")?;
     let mut file = DashboardFile::default();
-    // The tree is walked AFTER the whole first pass, for the same reason
-    // the flat list was: a `defaults` node anywhere in the document
-    // still supplies the `shell` the command split depends on.
+    // The tree is walked AFTER the whole first pass, so a `defaults`
+    // node anywhere in the document still supplies the `shell` the
+    // command split depends on.
     let mut tree: Vec<&kdl::KdlNode> = Vec::new();
     for node in doc.nodes() {
         match node.name().value() {
@@ -299,9 +225,17 @@ fn parse_inline(doc: &kdl::KdlDocument) -> anyhow::Result<DashboardFile> {
                 file.defaults = pane_block(node, None, false)?;
             }
             "pane" | "row" | "column" => tree.push(node),
+            // Placement used to live in its own block, so a reader who
+            // writes one is not guessing — they know a grammar that was
+            // real. The error owes them the spelling that replaced it.
+            "layout" => bail!(
+                "there is no `layout` block — a pane is declared inside the row or column \
+                 that places it: write `row {{ pane \"log\" {{ … }} pane \"branch\" {{ … }} }}`"
+            ),
             other => {
                 bail!(
-                    "unknown node {other:?}: expected gap, row-gap, defaults, pane, row, or column"
+                    "unknown node {other:?} — a dashboard's top level takes \
+                     gap, row-gap, defaults, pane, row, or column"
                 )
             }
         }
@@ -546,21 +480,6 @@ fn many_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<Vec<Strin
         .collect()
 }
 
-/// `layout { row "a"; row "b" "c"; row { column "d" "e" } }` — a
-/// node's string arguments are pane leaves, its children are nested
-/// row/column blocks, appended after the arguments in source order.
-fn layout_rows(node: &kdl::KdlNode) -> anyhow::Result<Vec<LayoutDecl>> {
-    let Some(children) = node.children() else {
-        return Ok(Vec::new());
-    };
-    children
-        .nodes()
-        .iter()
-        .enumerate()
-        .map(|(index, child)| Ok(layout_node(child, index + 1)?.normalized()))
-        .collect()
-}
-
 /// The container's own name — `a row` / `a column` — for the errors that
 /// say what it holds.
 fn container_kind(node: &kdl::KdlNode) -> &'static str {
@@ -578,9 +497,6 @@ fn refuse_container_properties(node: &kdl::KdlNode, label: &str, kind: &str) -> 
         return Ok(());
     };
     let prop = entry.name().expect("filtered to properties").value();
-    if kind == "a layout" {
-        bail!("{label} takes no properties — a layout holds `row` and `column` blocks");
-    }
     if prop == "gap" || prop == "row-gap" {
         bail!(
             "{label}: {kind} takes no properties — `{prop}` is the whole dashboard's, declared once at the top level as `{prop} 1`"
@@ -626,39 +542,6 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
     }
 }
 
-fn layout_node(node: &kdl::KdlNode, position: usize) -> anyhow::Result<LayoutDecl> {
-    let label = format!("{} #{position}", node.name().value());
-    refuse_container_properties(node, &label, container_kind(node))?;
-    let mut cells: Vec<LayoutDecl> = strings(node)?.into_iter().map(LayoutDecl::Pane).collect();
-    if let Some(children) = node.children() {
-        for (index, child) in children.nodes().iter().enumerate() {
-            cells.push(layout_node(child, index + 1)?);
-        }
-    }
-    match node.name().value() {
-        "row" => Ok(LayoutDecl::Row(cells)),
-        "column" => Ok(LayoutDecl::Column(cells)),
-        other => Err(anyhow!(
-            "unknown node {other:?} in layout: expected row or column"
-        )),
-    }
-}
-
-/// Every positional argument of a node, as strings.
-fn strings(node: &kdl::KdlNode) -> anyhow::Result<Vec<String>> {
-    node.entries()
-        .iter()
-        .filter(|entry| entry.name().is_none())
-        .map(|entry| {
-            entry
-                .value()
-                .as_string()
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("{}: expected a string", node.name().value()))
-        })
-        .collect()
-}
-
 /// Checked, field-named conversion: a negative value must FAIL LOUDLY,
 /// never wrap — `as usize` would turn `gap -1` into a repeat count near
 /// usize::MAX, which `" ".repeat(gap)` would try to allocate.
@@ -700,18 +583,14 @@ pane "clock" {
     width "2fr"
 }
 
-pane "branch" {
-    command "git" "branch" "--show-current"
-}
-
-pane "notes" {
-    command "rat style hello"
-    interval "never"
-}
-
-layout {
-    row "clock"
-    row "branch" "notes"
+row {
+    pane "branch" {
+        command "git" "branch" "--show-current"
+    }
+    pane "notes" {
+        command "rat style hello"
+        interval "never"
+    }
 }
 "#;
 
@@ -753,43 +632,8 @@ layout {
 
     // ---------------------------------------------------------------
     // The inline tree: a pane is declared inside the row or column that
-    // places it. The `SPLIT_*` consts and the equality assertions
-    // against them are the MIGRATION HARNESS — they state that the two
-    // spellings declare the same dashboard while both parsers exist,
-    // and they are deleted with the split parser in task 3.2. The
-    // inline-only assertions are the permanent tests.
+    // places it.
     // ---------------------------------------------------------------
-
-    const SPLIT_THREE_PANE: &str = r#"
-gap 1
-
-defaults {
-    interval "5s"
-    border "rounded"
-    padding "0 1"
-    height 7
-}
-
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
-}
-
-pane "branch" {
-    command "git" "status" "--short" "--branch"
-}
-
-pane "clock" {
-    command "date" "+%H:%M:%S"
-    interval "1s"
-    height 4
-}
-
-layout {
-    row "log" "branch"
-    row "clock"
-}
-"#;
 
     const INLINE_THREE_PANE: &str = r#"
 gap 1
@@ -817,43 +661,6 @@ row {
         interval "1s"
         height 4
     }
-}
-"#;
-
-    const SPLIT_NESTED: &str = r#"
-gap 1
-
-defaults {
-    interval "5s"
-    height 7
-}
-
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
-}
-
-pane "branch" {
-    command "git" "status" "--short" "--branch"
-}
-
-pane "clock" {
-    command "date" "+%H:%M:%S"
-    interval "1s"
-    height 4
-}
-
-pane "nested" {
-    command "rat" "dashboard" "examples/panes.kdl" "--once"
-    height 15
-}
-
-layout {
-    row {
-        column "log" "branch"
-        column "clock"
-    }
-    row "nested"
 }
 "#;
 
@@ -890,101 +697,23 @@ pane "nested" {
 }
 "#;
 
-    // ---------------------------------------------------------------
-    // CHARACTERIZATION PINS (task 3.1, deleted with the split parser in
-    // 3.2). Each const is an example file's text captured VERBATIM while
-    // it was still the file's text, so editing the file is mechanically
-    // constrained: they were green the moment they were written, and
-    // the port is what puts them at risk. A pin that goes red means the
-    // rewrite changed the dashboard, not just its spelling.
-    // ---------------------------------------------------------------
-
-    const OLD_SPLIT_PANES: &str = r#"
-gap 1
-
-defaults {
-    interval "5s"
-    border "rounded"
-    padding "0 1"
-    height 7
-}
-
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
-}
-
-pane "branch" {
-    command "git" "status" "--short" "--branch"
-}
-
-pane "clock" {
-    command "date" "+%H:%M:%S"
-    interval "1s"
-    height 4
-}
-
-layout {
-    row "log" "branch"
-    row "clock"
-}
-"#;
-
-    const OLD_SPLIT_PANES_NESTED: &str = r#"
-gap 1
-
-defaults {
-    interval "5s"
-    border "rounded"
-    padding "0 1"
-    height 7
-}
-
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
-}
-
-pane "branch" {
-    command "git" "status" "--short" "--branch"
-}
-
-pane "clock" {
-    command "date" "+%H:%M:%S"
-    interval "1s"
-    height 4
-}
-
-pane "nested" {
-    command "rat" "dashboard" "examples/panes.kdl" "--once"
-    height 15
-}
-
-layout {
-    row {
-        column "log" "branch"
-        column "clock"
-    }
-    row "nested"
-}
-"#;
-
+    /// The examples are the grammar most people will read first, so
+    /// `include_str!` puts them in the suite: one that stops parsing
+    /// fails a test instead of rotting quietly in the repository. (This
+    /// is what survives of 3.1's characterization pins — they compared
+    /// each example against the text it replaced, and that comparison
+    /// lost its second side when the old parser went.)
     #[test]
-    fn the_ported_example_declares_the_dashboard_it_always_did() {
-        // `include_str!` also means an example that stops parsing fails
-        // a test instead of rotting quietly in the repository.
-        assert_eq!(
-            parse(OLD_SPLIT_PANES).expect("the captured text parses"),
-            parse(include_str!("../../examples/panes.kdl")).expect("the example parses")
-        );
-    }
-
-    #[test]
-    fn the_ported_nested_example_declares_the_dashboard_it_always_did() {
-        assert_eq!(
-            parse(OLD_SPLIT_PANES_NESTED).expect("the captured text parses"),
-            parse(include_str!("../../examples/panes-nested.kdl")).expect("the example parses")
-        );
+    fn the_shipped_examples_declare_real_dashboards() {
+        for text in [
+            include_str!("../../examples/panes.kdl"),
+            include_str!("../../examples/panes-nested.kdl"),
+        ] {
+            parse(text)
+                .expect("the example parses")
+                .into_registry()
+                .expect("the example validates");
+        }
     }
 
     fn names_of(file: &DashboardFile) -> Vec<&str> {
@@ -1007,16 +736,11 @@ layout {
 
     #[test]
     fn an_inline_pane_declares_where_it_sits() {
-        let split = parse(SPLIT_THREE_PANE).expect("the split spelling parses");
         let inline = parse(INLINE_THREE_PANE).expect("the inline spelling parses");
-        // The whole claim in one line: lifting the panes out of the tree
-        // reaches the same declaration the `layout` block reaches.
-        assert_eq!(split, inline);
-
-        // Spot-check both halves of the lift, so a mutual regression
-        // cannot pass by breaking the two spellings identically — and
-        // so the lift is visibly a MOVE, not a resolution: every token
-        // is still exactly what the file wrote.
+        // The lift is visibly a MOVE, not a resolution: a pane written
+        // inside its row lands in the flat declaration list, its name
+        // lands in the tree, and every token is still exactly what the
+        // file wrote.
         assert_eq!(names_of(&inline), ["log", "branch", "clock"]);
         assert_eq!(
             inline.panes[0].command,
@@ -1038,8 +762,7 @@ layout {
                     LayoutDecl::Pane("log".to_string()),
                     LayoutDecl::Pane("branch".to_string()),
                 ]),
-                // The one-cell row collapses to its cell, exactly as
-                // `row "clock"` did.
+                // The one-cell row collapses to its cell.
                 LayoutDecl::Pane("clock".to_string()),
             ])
         );
@@ -1047,13 +770,11 @@ layout {
 
     #[test]
     fn the_inline_tree_nests_to_the_same_depth() {
-        let split = parse(SPLIT_NESTED).expect("the split spelling parses");
         let inline = parse(INLINE_NESTED).expect("the inline spelling parses");
-        assert_eq!(split, inline);
-
-        // Document order is declaration order is `SourceId` order: a
-        // depth-first walk of the tree hands out the same ids the flat
-        // list did, or the two files describe different engines.
+        // Document order is declaration order is `SourceId` order: the
+        // walk is depth-first, so a pane's id is its reading position —
+        // and the last pane here is a top-level one, after two levels of
+        // nesting (D-2).
         assert_eq!(names_of(&inline), ["log", "branch", "clock", "nested"]);
         assert_eq!(inline.panes[3].height, Some(15));
         assert_eq!(
@@ -1069,28 +790,6 @@ layout {
                 LayoutDecl::Pane("nested".to_string()),
             ])
         );
-    }
-
-    #[test]
-    fn both_spellings_resolve_to_the_same_registry() {
-        // The declaration assertions above are the contract; this is the
-        // resolved model behind them — same sources, same boxes, same
-        // composition, out of the one validation path. (Dies with the
-        // split parser in 3.2.)
-        for (split_text, inline_text) in [
-            (SPLIT_THREE_PANE, INLINE_THREE_PANE),
-            (SPLIT_NESTED, INLINE_NESTED),
-        ] {
-            let split = parse(split_text)
-                .expect("split parses")
-                .into_registry()
-                .expect("split validates");
-            let inline = parse(inline_text)
-                .expect("inline parses")
-                .into_registry()
-                .expect("inline validates");
-            assert_same_registry(&split, &inline);
-        }
     }
 
     #[test]
@@ -1203,6 +902,28 @@ layout {
         assert_eq!(
             container_err("row {\n    panel {\n        command \"date\"\n    }\n}\n"),
             "row #1 > panel #1: unknown node \"panel\" — a row holds `pane`, `row`, and `column` blocks"
+        );
+    }
+
+    /// The deleted spelling teaches (I-57). A `layout` block was the
+    /// whole of the old grammar's placement, so meeting one is not an
+    /// unknown-token complaint — it is a reader who knows the old
+    /// spelling, and the error owes them the new one.
+    #[test]
+    fn a_layout_block_says_there_is_none() {
+        assert_eq!(
+            container_err(
+                "pane \"log\" {\n    command \"date\"\n}\nlayout {\n    row \"log\"\n}\n"
+            ),
+            "there is no `layout` block — a pane is declared inside the row or column that places it: write `row { pane \"log\" { … } pane \"branch\" { … } }`"
+        );
+    }
+
+    #[test]
+    fn an_unknown_top_level_node_names_the_six() {
+        assert_eq!(
+            container_err("panes {\n    pane \"log\" {\n        command \"date\"\n    }\n}\n"),
+            "unknown node \"panes\" — a dashboard's top level takes gap, row-gap, defaults, pane, row, or column"
         );
     }
 
@@ -1334,29 +1055,6 @@ pane "all" {
             let err = format!("{:#}", parse(text).unwrap_err());
             assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
         }
-    }
-
-    #[test]
-    fn a_container_node_takes_no_properties() {
-        for text in [
-            "pane \"a\" {\n    height 3\n}\nlayout gap=2 {\n    row \"a\"\n}\n",
-            "pane \"a\" {\n    height 3\n}\nlayout {\n    row style=\"x\" \"a\"\n}\n",
-        ] {
-            let err = format!("{:#}", parse(text).unwrap_err());
-            assert!(err.contains("no properties"), "{err}");
-        }
-    }
-
-    /// A per-row gap is a real future request, so `row gap=2` must not
-    /// be quietly ignored — it says where the gap actually lives.
-    #[test]
-    fn a_row_property_says_the_gap_is_the_dashboards() {
-        let err = format!(
-            "{:#}",
-            parse("pane \"a\" {\n    height 3\n}\nlayout {\n    row gap=2 \"a\"\n}\n").unwrap_err()
-        );
-        assert!(err.contains("whole dashboard's"), "{err}");
-        assert!(err.contains("top level"), "{err}");
     }
 
     /// Slashdash is the kdl crate's job, and it does it before the walk
