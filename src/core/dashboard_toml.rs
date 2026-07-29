@@ -4,7 +4,7 @@
 
 use anyhow::{Context, anyhow};
 
-use crate::core::dashboard_file::{DashboardFile, PaneDecl};
+use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
 
 pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
     let file: File = toml::from_str(text).context("reading the dashboard TOML")?;
@@ -23,10 +23,7 @@ pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
             layout
                 .rows
                 .into_iter()
-                .map(|row| match row {
-                    Row::One(name) => vec![name],
-                    Row::Many(names) => names,
-                })
+                .map(|row| cell_to_decl(row, Axis::Row).normalized())
                 .collect()
         }),
     })
@@ -65,14 +62,42 @@ struct Pane {
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Layout {
-    rows: Vec<Row>,
+    rows: Vec<Cell>,
 }
 
+/// TOML spells nesting by ALTERNATION: `rows` is a column of items, an
+/// array inside a row is a column, an array inside a column is a row.
+/// (KDL spells the same tree with explicit row/column blocks.)
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum Row {
+enum Cell {
     One(String),
-    Many(Vec<String>),
+    Many(Vec<Cell>),
+}
+
+/// Which container an array at this depth becomes.
+#[derive(Copy, Clone)]
+enum Axis {
+    Row,
+    Column,
+}
+
+fn cell_to_decl(cell: Cell, axis: Axis) -> LayoutDecl {
+    match (cell, axis) {
+        (Cell::One(name), _) => LayoutDecl::Pane(name),
+        (Cell::Many(cells), Axis::Row) => LayoutDecl::Row(
+            cells
+                .into_iter()
+                .map(|cell| cell_to_decl(cell, Axis::Column))
+                .collect(),
+        ),
+        (Cell::Many(cells), Axis::Column) => LayoutDecl::Column(
+            cells
+                .into_iter()
+                .map(|cell| cell_to_decl(cell, Axis::Row))
+                .collect(),
+        ),
+    }
 }
 
 #[derive(Clone, serde::Deserialize)]

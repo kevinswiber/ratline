@@ -545,3 +545,57 @@ command = ["{bin}", "style", "x"]
         assert_eq!(line.chars().count(), 40, "a 40-cell frame: {line:?}");
     }
 }
+
+/// Nested layout nodes: a row holding a column beside a pane renders
+/// as a grid — the engine's tree was recursive from day one, and the
+/// declaration now reaches it.
+#[test]
+fn a_nested_layout_renders_a_grid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = rat_bin().replace('\\', "\\\\");
+    let file = fixture(
+        dir.path(),
+        "grid.toml",
+        &format!(
+            r#"
+[defaults]
+height = 1
+chrome = false
+border = "none"
+
+[[pane]]
+name = "a"
+command = ["{bin}", "style", "one"]
+
+[[pane]]
+name = "b"
+command = ["{bin}", "style", "two"]
+
+[[pane]]
+name = "c"
+height = 2
+command = ["{bin}", "style", "three"]
+
+[layout]
+rows = [ [ ["a", "b"], "c" ] ]
+"#
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "40")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let rows: Vec<&str> = stdout.trim_end_matches('\n').split('\n').collect();
+    assert_eq!(rows.len(), 2, "a 2-row grid: {stdout:?}");
+    assert!(
+        rows[0].contains("one") && rows[0].contains("three"),
+        "top of the column beside the tall pane: {stdout:?}"
+    );
+    assert!(
+        rows[1].contains("two"),
+        "bottom of the column on the second grid row: {stdout:?}"
+    );
+}

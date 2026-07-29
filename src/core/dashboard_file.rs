@@ -49,9 +49,40 @@ pub struct DashboardFile {
     pub row_gap: Option<usize>,
     pub defaults: PaneDecl,
     pub panes: Vec<PaneDecl>,
-    /// Rows of pane names; absent stacks every pane in declaration
-    /// order.
-    pub layout: Option<Vec<Vec<String>>>,
+    /// The declared layout, by pane NAME (ids resolve at validation);
+    /// absent stacks every pane in declaration order. The top-level
+    /// items compose as a column, exactly as the engine's tree does.
+    pub layout: Option<Vec<LayoutDecl>>,
+}
+
+/// A declared layout node: a pane by name, or a row/column of nested
+/// nodes — the same recursive shape the engine's `LayoutNode` has had
+/// from day one, reached by name instead of id.
+#[derive(Clone, PartialEq, Debug)]
+pub enum LayoutDecl {
+    Pane(String),
+    Row(Vec<LayoutDecl>),
+    Column(Vec<LayoutDecl>),
+}
+
+impl LayoutDecl {
+    /// One-cell rows and columns collapse to their cell, so the two
+    /// grammars' different spellings of "a full-width pane" reach the
+    /// same declaration.
+    pub fn normalized(self) -> LayoutDecl {
+        match self {
+            LayoutDecl::Pane(name) => LayoutDecl::Pane(name),
+            LayoutDecl::Row(cells) | LayoutDecl::Column(cells) if cells.len() == 1 => {
+                cells.into_iter().next().expect("one cell").normalized()
+            }
+            LayoutDecl::Row(cells) => {
+                LayoutDecl::Row(cells.into_iter().map(LayoutDecl::normalized).collect())
+            }
+            LayoutDecl::Column(cells) => {
+                LayoutDecl::Column(cells.into_iter().map(LayoutDecl::normalized).collect())
+            }
+        }
+    }
 }
 
 /// One pane's declaration (or the `[defaults]` block), tokens unparsed.
@@ -266,24 +297,12 @@ fn parse_border(token: &str, name: &str) -> anyhow::Result<BorderPreset> {
     })
 }
 
-/// Rows of pane names become a `Column` of rows. A one-pane row is a
-/// bare `Pane`, matching how the file grammars spell it. Every declared
-/// pane must be placed exactly once: an unplaced pane would run a child
-/// nobody can see.
-fn resolve_layout(rows: Option<&[Vec<String>]>, names: &[String]) -> anyhow::Result<LayoutNode> {
-    let id_of = |wanted: &str| -> anyhow::Result<SourceId> {
-        names
-            .iter()
-            .position(|name| name == wanted)
-            .map(SourceId)
-            .ok_or_else(|| {
-                anyhow!(
-                    "layout names unknown pane {wanted:?}: declared panes are {}",
-                    names.join(", ")
-                )
-            })
-    };
-    let Some(rows) = rows else {
+/// The declared tree becomes the engine's tree: names resolve to ids,
+/// and every declared pane must be placed exactly once at ANY depth —
+/// an unplaced pane would run a child nobody can see; a doubly-placed
+/// one would have two geometries and one output.
+fn resolve_layout(items: Option<&[LayoutDecl]>, names: &[String]) -> anyhow::Result<LayoutNode> {
+    let Some(items) = items else {
         return Ok(LayoutNode::Column(
             (0..names.len())
                 .map(|i| LayoutNode::Pane(SourceId(i)))
@@ -291,21 +310,12 @@ fn resolve_layout(rows: Option<&[Vec<String>]>, names: &[String]) -> anyhow::Res
         ));
     };
     let mut placed = vec![false; names.len()];
-    let mut nodes = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut cells = Vec::with_capacity(row.len());
-        for wanted in row {
-            let id = id_of(wanted)?;
-            if std::mem::replace(&mut placed[id.0], true) {
-                bail!("layout places pane {wanted:?} twice");
-            }
-            cells.push(LayoutNode::Pane(id));
-        }
-        nodes.push(match cells.len() {
-            0 => bail!("layout has an empty row"),
-            1 => cells.remove(0),
-            _ => LayoutNode::Row(cells),
-        });
+    let nodes = items
+        .iter()
+        .map(|item| resolve_node(item, names, &mut placed))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if nodes.is_empty() {
+        bail!("layout is empty: name at least one pane, or omit the layout");
     }
     if let Some(index) = placed.iter().position(|seen| !seen) {
         bail!(
@@ -314,6 +324,53 @@ fn resolve_layout(rows: Option<&[Vec<String>]>, names: &[String]) -> anyhow::Res
         );
     }
     Ok(LayoutNode::Column(nodes))
+}
+
+fn resolve_node(
+    decl: &LayoutDecl,
+    names: &[String],
+    placed: &mut [bool],
+) -> anyhow::Result<LayoutNode> {
+    match decl {
+        LayoutDecl::Pane(wanted) => {
+            let id = names
+                .iter()
+                .position(|name| name == wanted)
+                .map(SourceId)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "layout names unknown pane {wanted:?}: declared panes are {}",
+                        names.join(", ")
+                    )
+                })?;
+            if std::mem::replace(&mut placed[id.0], true) {
+                bail!("layout places pane {wanted:?} twice");
+            }
+            Ok(LayoutNode::Pane(id))
+        }
+        LayoutDecl::Row(cells) => {
+            if cells.is_empty() {
+                bail!("layout has an empty row");
+            }
+            Ok(LayoutNode::Row(
+                cells
+                    .iter()
+                    .map(|cell| resolve_node(cell, names, placed))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            ))
+        }
+        LayoutDecl::Column(cells) => {
+            if cells.is_empty() {
+                bail!("layout has an empty column");
+            }
+            Ok(LayoutNode::Column(
+                cells
+                    .iter()
+                    .map(|cell| resolve_node(cell, names, placed))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            ))
+        }
+    }
 }
 
 /// Read + parse + validate. Format: the flag, else the file extension.
@@ -542,7 +599,10 @@ mod tests {
     fn a_layout_naming_an_unknown_pane_lists_the_declared_names() {
         let decl = DashboardFile {
             panes: vec![pane("git", &["date"]), pane("clock", &["date"])],
-            layout: Some(vec![vec!["git".to_string(), "clok".to_string()]]),
+            layout: Some(vec![LayoutDecl::Row(vec![
+                LayoutDecl::Pane("git".to_string()),
+                LayoutDecl::Pane("clok".to_string()),
+            ])]),
             ..DashboardFile::default()
         };
         let err = err_of(decl);
@@ -624,6 +684,71 @@ mod tests {
             ..DashboardFile::default()
         };
         assert!(ok.into_registry().is_ok());
+    }
+
+    #[test]
+    fn a_nested_layout_resolves_rows_within_rows() {
+        // A row may hold columns and a column rows, to any depth: the
+        // engine's tree was recursive from day one; the declaration
+        // now reaches it.
+        let decl = DashboardFile {
+            panes: vec![
+                pane("a", &["date"]),
+                pane("b", &["date"]),
+                pane("c", &["date"]),
+            ],
+            layout: Some(vec![LayoutDecl::Row(vec![
+                LayoutDecl::Column(vec![
+                    LayoutDecl::Pane("a".to_string()),
+                    LayoutDecl::Pane("b".to_string()),
+                ]),
+                LayoutDecl::Pane("c".to_string()),
+            ])]),
+            ..DashboardFile::default()
+        };
+        let registry = decl.into_registry().expect("registry");
+        let Composition::Panes { layout, .. } = registry.composition() else {
+            panic!("a dashboard composes panes");
+        };
+        assert_eq!(
+            layout,
+            &LayoutNode::Column(vec![LayoutNode::Row(vec![
+                LayoutNode::Column(vec![
+                    LayoutNode::Pane(SourceId(0)),
+                    LayoutNode::Pane(SourceId(1)),
+                ]),
+                LayoutNode::Pane(SourceId(2)),
+            ])])
+        );
+    }
+
+    #[test]
+    fn nested_layout_errors_still_name_the_pane() {
+        // The exactly-once and known-name rules hold at any depth.
+        let dup = DashboardFile {
+            panes: vec![pane("a", &["date"]), pane("b", &["date"])],
+            layout: Some(vec![LayoutDecl::Row(vec![
+                LayoutDecl::Pane("a".to_string()),
+                LayoutDecl::Column(vec![
+                    LayoutDecl::Pane("b".to_string()),
+                    LayoutDecl::Pane("a".to_string()),
+                ]),
+            ])]),
+            ..DashboardFile::default()
+        };
+        let err = format!("{:#}", dup.into_registry().unwrap_err());
+        assert!(err.contains("\"a\"") && err.contains("twice"), "{err}");
+
+        let empty = DashboardFile {
+            panes: vec![pane("a", &["date"])],
+            layout: Some(vec![
+                LayoutDecl::Pane("a".to_string()),
+                LayoutDecl::Column(Vec::new()),
+            ]),
+            ..DashboardFile::default()
+        };
+        let err = format!("{:#}", empty.into_registry().unwrap_err());
+        assert!(err.contains("empty"), "{err}");
     }
 
     #[test]
