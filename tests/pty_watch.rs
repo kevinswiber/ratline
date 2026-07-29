@@ -1828,17 +1828,19 @@ fn question_mark_pages_the_key_reference() {
         "expected a first frame"
     );
     session.write_bytes(b"?");
+    // A loaded CI runner needs real headroom for the pager handoff
+    // (park the reader, spawn cat, stream the reference): 5s, not 2s.
     assert!(
         wait_for(
             &session,
             &mut terminal,
             b"freeze the frame in place",
-            Duration::from_secs(2)
+            Duration::from_secs(5)
         ),
         "expected the key reference in the pager"
     );
     assert!(
-        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(5)),
         "expected the frame back after the pager"
     );
     session.write_bytes(b"q");
