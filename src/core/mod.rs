@@ -7,6 +7,7 @@ pub mod fuzzy;
 pub mod join;
 pub mod measure;
 pub mod pager;
+pub mod registry;
 pub mod schedule;
 pub mod snapshot;
 pub mod spark;
