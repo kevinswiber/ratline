@@ -286,3 +286,64 @@ fn an_unknown_extension_names_the_format_flag() {
         .code(1)
         .stderr(predicates::str::contains("--format"));
 }
+
+/// The failure lives in the failing pane's own box — its text, its
+/// exit badge — and the dashboard around it is untouched. The height
+/// pin is what makes that structural: two 5-row panes compose to
+/// exactly ten rows whether they succeed or fail.
+#[test]
+fn a_failing_pane_shows_its_exit_code_and_the_rest_of_the_dashboard_survives() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let steady = dir.path().join("steady");
+    std::fs::write(&steady, "steady-content").expect("seed");
+    let decl = dir.path().join("dash.toml");
+    std::fs::write(
+        &decl,
+        format!(
+            r#"
+row-gap = 0
+
+[defaults]
+height = 5
+border = "rounded"
+
+[[pane]]
+name = "broken"
+command = ["{rat}", "__exitcode", "3", "boom-from-stderr"]
+
+[[pane]]
+name = "steady"
+command = ["{rat}", "__cat", "{steady}"]
+"#,
+            rat = rat_bin().escape_default(),
+            steady = steady.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", "--once", &decl.display().to_string()])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    // The failing pane's own box carries its stderr and its badge.
+    assert!(stdout.contains("boom-from-stderr"), "{stdout:?}");
+    assert!(stdout.contains(" · exit 3"), "{stdout:?}");
+    // The neighbour rendered normally: a failure never truncates it.
+    assert!(stdout.contains("steady-content"), "{stdout:?}");
+    // Both declared heights intact — the whole point of the pin.
+    assert_eq!(
+        stdout.trim_end_matches('\n').split('\n').count(),
+        10,
+        "declared heights must survive a failure: {stdout:?}"
+    );
+    // Nothing writes outside the frame engine. The failing child's
+    // stderr went into its pane, not to the terminal.
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stderr),
+        "",
+        "a failing pane must not leak to the terminal"
+    );
+}

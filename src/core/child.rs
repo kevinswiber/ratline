@@ -86,9 +86,6 @@ pub struct TickOutcome {
     /// shutdown kill — a defaulted `exit 0` would read as a healthy
     /// source that printed nothing. `rat watch` still ignores it,
     /// exactly as `output()`'s status was ignored.
-    // Read by the pane failure row; the allow comes off with its first
-    // consumer.
-    #[allow(dead_code)]
     pub status: Option<std::process::ExitStatus>,
 }
 
