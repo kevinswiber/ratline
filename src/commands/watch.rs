@@ -2125,6 +2125,9 @@ fn pane_label(registry: &Registry, id: SourceId) -> String {
 
 /// The one-shot end-of-life line for a dead reader. `rat watch` keeps
 /// its shipped sentence byte for byte; a pane names itself first.
+/// Only fifo/fd readers can end, and those are unix-only — on Windows
+/// this has no caller by construction.
+#[cfg_attr(windows, allow(dead_code))]
 fn ended_text(registry: &Registry, id: SourceId, spec: &TriggerSpec) -> String {
     match registry.pane(id) {
         Some(_) => format!("{}: trigger ended: {spec}", registry.spec(id).name),
