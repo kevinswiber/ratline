@@ -66,11 +66,108 @@ pub fn parse_trigger(s: &str) -> anyhow::Result<TriggerSpec> {
     }
 }
 
+/// Collapses trigger fires into one spawn request per window. The
+/// window is ANCHORED at the first unserved fire — later fires inside
+/// it are already covered by the spawn it owes. (A sliding window would
+/// starve under sustained sub-window writes: a busy log written faster
+/// than the window would never repaint.)
+pub struct DebounceGate {
+    window: std::time::Duration,
+    deadline: Option<std::time::Instant>,
+}
+
+impl DebounceGate {
+    pub fn new(window: std::time::Duration) -> DebounceGate {
+        DebounceGate {
+            window,
+            deadline: None,
+        }
+    }
+
+    /// Record a fire. Opens a window only if none is open.
+    pub fn fire(&mut self, now: std::time::Instant) {
+        if self.deadline.is_none() {
+            self.deadline = Some(now + self.window);
+        }
+    }
+
+    /// True exactly once per window, when it closes; clears the window.
+    pub fn due(&mut self, now: std::time::Instant) -> bool {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.deadline = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use super::*;
+
+    const D: Duration = Duration::from_millis(250);
+
+    #[test]
+    fn a_fire_becomes_due_when_the_window_closes() {
+        let t = Instant::now();
+        let mut g = DebounceGate::new(D);
+        assert!(!g.due(t)); // nothing fired yet
+        g.fire(t);
+        assert!(!g.due(t + Duration::from_millis(100))); // window open
+        assert!(g.due(t + D)); // closes
+        assert!(!g.due(t + D)); // exactly once
+    }
+
+    #[test]
+    fn fires_inside_the_window_do_not_move_it() {
+        // ANCHORED, not sliding: the spawn the window owes covers them.
+        let t = Instant::now();
+        let mut g = DebounceGate::new(D);
+        g.fire(t);
+        g.fire(t + Duration::from_millis(200));
+        assert!(g.due(t + D)); // still the FIRST fire's deadline
+    }
+
+    #[test]
+    fn a_fire_after_the_window_closed_opens_a_new_one() {
+        let t = Instant::now();
+        let mut g = DebounceGate::new(D);
+        g.fire(t);
+        assert!(g.due(t + D));
+        g.fire(t + D * 2);
+        assert!(!g.due(t + D * 2));
+        assert!(g.due(t + D * 3));
+    }
+
+    #[test]
+    fn a_zero_window_is_due_at_the_fire_instant() {
+        let t = Instant::now();
+        let mut g = DebounceGate::new(Duration::ZERO);
+        g.fire(t);
+        assert!(g.due(t));
+        assert!(!g.due(t));
+    }
+
+    #[test]
+    fn sustained_sub_window_fires_never_starve_the_spawn() {
+        // The reason the window is anchored: a busy log written every
+        // 50ms must still repaint once per window.
+        let t = Instant::now();
+        let mut g = DebounceGate::new(D);
+        let mut spawns = 0;
+        for i in 0..20 {
+            let now = t + Duration::from_millis(50 * i);
+            g.fire(now);
+            if g.due(now) {
+                spawns += 1;
+            }
+        }
+        assert!(spawns >= 3, "starved: {spawns} spawns over 1s at D=250ms");
+    }
 
     #[test]
     fn specs_parse_by_scheme() {
