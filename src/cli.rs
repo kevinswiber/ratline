@@ -55,6 +55,8 @@ pub enum Command {
     Frame(FrameArgs),
     /// Run a command on an interval and repaint its output flicker-free
     Watch(WatchArgs),
+    /// Run a multi-pane dashboard declared in a file
+    Dashboard(DashboardArgs),
     /// Diagnose terminal capabilities
     Doctor(DoctorArgs),
     /// Pick one or more items from a list
@@ -425,6 +427,37 @@ pub struct WatchArgs {
     /// Command to run each tick (after --)
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+}
+
+#[derive(clap::Args)]
+pub struct DashboardArgs {
+    /// Dashboard declaration file (.toml or .kdl)
+    pub file: std::path::PathBuf,
+    /// Declaration format when the extension does not say
+    #[arg(long, value_enum)]
+    pub format: Option<crate::core::dashboard_file::DeclFormat>,
+    /// Run every pane once and exit
+    #[arg(long)]
+    pub once: bool,
+    /// Clear the screen before the first frame (atomically, inside it)
+    #[arg(long)]
+    pub clear: bool,
+    /// Leave the cursor visible
+    #[arg(long)]
+    pub no_hide_cursor: bool,
+    /// Skip synchronized-output escapes
+    #[arg(long)]
+    pub no_sync: bool,
+    /// Cap the painted height (defaults to terminal height minus two)
+    #[arg(long)]
+    pub max_height: Option<u16>,
+    /// Directory the `S` key writes snapshots into (defaults to the
+    /// current directory)
+    #[arg(long, env = "RAT_SNAPSHOT_DIR", value_name = "DIR")]
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Keep escape sequences in snapshots instead of stripping them
+    #[arg(long)]
+    pub snapshot_ansi: bool,
 }
 
 #[derive(clap::Args)]

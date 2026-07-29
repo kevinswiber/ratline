@@ -2,10 +2,6 @@
 //! mapping to [`DashboardFile`] — no validation lives here (that is
 //! `dashboard_file::into_registry`, the one validation path).
 
-// The parser lands before the subcommand that reads it; the dashboard
-// subcommand is the first real caller and removes this.
-#![allow(dead_code)]
-
 use anyhow::{Context, anyhow};
 
 use crate::core::dashboard_file::{DashboardFile, PaneDecl};

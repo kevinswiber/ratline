@@ -4,10 +4,6 @@
 //! (child slots, schedules, trigger readers) live in the engine, keyed
 //! by [`SourceId`].
 
-// The model lands before the engine that reads it; the dashboard
-// subcommand is the first real caller and removes this.
-#![allow(dead_code)]
-
 use std::time::Duration;
 
 use anyhow::bail;
@@ -211,6 +207,9 @@ impl Registry {
         self.sources.len()
     }
 
+    // Pairs `len` for clippy::len_without_is_empty; no non-test caller
+    // yet, and constructing an empty registry is already unreachable.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
@@ -268,6 +267,14 @@ impl Registry {
         match node {
             LayoutNode::Pane(id) => {
                 if let (Some(pane), Some(geom)) = (self.panes.get(id.0), out.get_mut(id.0)) {
+                    // Cells is exact EVERYWHERE — a fixed-width pane
+                    // keeps its declared cells even when a column hands
+                    // it more; Weight is a share of what the parent
+                    // gave, which in a column is the full width.
+                    let cells = match pane.width {
+                        PaneWidth::Cells(c) => c.max(MIN_PANE_CELLS),
+                        PaneWidth::Weight(_) => cells,
+                    };
                     *geom = PaneGeometry {
                         cells,
                         rows: pane.height,
@@ -632,6 +639,22 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_stacked_fixed_width_pane_keeps_its_declared_cells() {
+        // Cells is exact everywhere, not just inside a row: a declared
+        // width the layout silently overrode would be a lie in the
+        // child's RAT_WIDTH.
+        let registry = Registry::panes(
+            vec![spec("narrow")],
+            vec![pane(7, PaneWidth::Cells(20))],
+            stacked(1),
+            1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(registry.geometry((80, 24))[0].cells, 20);
     }
 
     #[test]

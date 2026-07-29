@@ -2,10 +2,6 @@
 //! same model the TOML constructor builds, with the same rules and no
 //! extra ones. KDL v2 grammar (`#true` / `#false` for booleans).
 
-// The parser lands before the subcommand that reads it; the dashboard
-// subcommand is the first real caller and removes this.
-#![allow(dead_code)]
-
 use anyhow::{Context, anyhow, bail};
 
 use crate::core::dashboard_file::{DashboardFile, PaneDecl};
