@@ -13,37 +13,30 @@
 
 gap 1
 
-defaults {
-    interval "5s"
-    border "rounded"
-    padding "0 1"
-    height 7
-}
+defaults interval="5s" border="rounded" padding="0 1" height=7
 
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
-}
-
-pane "branch" {
-    command "git" "status" "--short" "--branch"
-}
-
-pane "clock" {
-    command "date" "+%H:%M:%S"
-    interval "1s"
-    height 4
-}
-
-pane "nested" {
-    command "rat" "dashboard" "examples/panes.kdl" "--once"
-    height 15
-}
-
-layout {
-    row {
-        column "log" "branch"
-        column "clock"
+row {
+    column {
+        pane "log" {
+            command "git" "log" "--oneline" "-3"
+            interval "15s"
+        }
+        pane "branch" {
+            command "git" "status" "--short" "--branch"
+        }
     }
-    row "nested"
+    column {
+        pane "clock" {
+            command "date" "+%H:%M:%S"
+            interval "1s"
+            height 4
+        }
+    }
+}
+
+row {
+    pane "nested" {
+        command "rat" "dashboard" "examples/panes.kdl" "--once"
+        height 15
+    }
 }

@@ -69,13 +69,7 @@ fn a_pane_child_is_told_its_inner_geometry() {
         "geom.kdl",
         &format!(
             r#"
-defaults {{
-    height 3
-    chrome #false
-    border "none"
-    padding "0"
-    width "20"
-}}
+defaults height=3 chrome=#false border="none" padding="0" width="20"
 
 pane "cols" {{
     command "{bin}" "__env" "RAT_WIDTH"
@@ -488,29 +482,19 @@ fn a_nested_layout_renders_a_grid() {
         "grid.kdl",
         &format!(
             r#"
-defaults {{
-    height 1
-    chrome #false
-    border "none"
-}}
+defaults height=1 chrome=#false border="none"
 
-pane "a" {{
-    command "{bin}" "style" "one"
-}}
-
-pane "b" {{
-    command "{bin}" "style" "two"
-}}
-
-pane "c" {{
-    height 2
-    command "{bin}" "style" "three"
-}}
-
-layout {{
-    row {{
-        column "a" "b"
-        column "c"
+row {{
+    column {{
+        pane "a" {{
+            command "{bin}" "style" "one"
+        }}
+        pane "b" {{
+            command "{bin}" "style" "two"
+        }}
+    }}
+    pane "c" height=2 {{
+        command "{bin}" "style" "three"
     }}
 }}
 "#

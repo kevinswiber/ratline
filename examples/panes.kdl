@@ -2,32 +2,34 @@
 // flicker-free frame. Run from a git repository:
 //
 //   rat dashboard examples/panes.kdl
+//
+// A pane is declared inside the row or column that places it. Every key
+// a pane or defaults block accepts holds exactly one value, so it may be
+// written either as a property or as a child node — author's choice, as
+// `defaults` and the panes below show. `command` and `trigger` hold
+// lists, and a KDL property holds exactly one value, so those two are
+// written as child nodes only. `row` and `column` are not keys: they
+// hold cells, and `gap`/`row-gap` are the whole dashboard's, written
+// once at the top level.
 
 gap 1
 
-defaults {
-    interval "5s"
-    border "rounded"
-    padding "0 1"
-    height 7
+defaults interval="5s" border="rounded" padding="0 1" height=7
+
+row {
+    pane "log" {
+        command "git" "log" "--oneline" "-3"
+        interval "15s"
+    }
+    pane "branch" {
+        command "git" "status" "--short" "--branch"
+    }
 }
 
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
-}
-
-pane "branch" {
-    command "git" "status" "--short" "--branch"
-}
-
-pane "clock" {
-    command "date" "+%H:%M:%S"
-    interval "1s"
-    height 4
-}
-
-layout {
-    row "log" "branch"
-    row "clock"
+row {
+    pane "clock" {
+        command "date" "+%H:%M:%S"
+        interval "1s"
+        height 4
+    }
 }

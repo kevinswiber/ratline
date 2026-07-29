@@ -890,6 +890,103 @@ pane "nested" {
 }
 "#;
 
+    // ---------------------------------------------------------------
+    // CHARACTERIZATION PINS (task 3.1, deleted with the split parser in
+    // 3.2). Each const is an example file's text captured VERBATIM while
+    // it was still the file's text, so editing the file is mechanically
+    // constrained: they were green the moment they were written, and
+    // the port is what puts them at risk. A pin that goes red means the
+    // rewrite changed the dashboard, not just its spelling.
+    // ---------------------------------------------------------------
+
+    const OLD_SPLIT_PANES: &str = r#"
+gap 1
+
+defaults {
+    interval "5s"
+    border "rounded"
+    padding "0 1"
+    height 7
+}
+
+pane "log" {
+    command "git" "log" "--oneline" "-3"
+    interval "15s"
+}
+
+pane "branch" {
+    command "git" "status" "--short" "--branch"
+}
+
+pane "clock" {
+    command "date" "+%H:%M:%S"
+    interval "1s"
+    height 4
+}
+
+layout {
+    row "log" "branch"
+    row "clock"
+}
+"#;
+
+    const OLD_SPLIT_PANES_NESTED: &str = r#"
+gap 1
+
+defaults {
+    interval "5s"
+    border "rounded"
+    padding "0 1"
+    height 7
+}
+
+pane "log" {
+    command "git" "log" "--oneline" "-3"
+    interval "15s"
+}
+
+pane "branch" {
+    command "git" "status" "--short" "--branch"
+}
+
+pane "clock" {
+    command "date" "+%H:%M:%S"
+    interval "1s"
+    height 4
+}
+
+pane "nested" {
+    command "rat" "dashboard" "examples/panes.kdl" "--once"
+    height 15
+}
+
+layout {
+    row {
+        column "log" "branch"
+        column "clock"
+    }
+    row "nested"
+}
+"#;
+
+    #[test]
+    fn the_ported_example_declares_the_dashboard_it_always_did() {
+        // `include_str!` also means an example that stops parsing fails
+        // a test instead of rotting quietly in the repository.
+        assert_eq!(
+            parse(OLD_SPLIT_PANES).expect("the captured text parses"),
+            parse(include_str!("../../examples/panes.kdl")).expect("the example parses")
+        );
+    }
+
+    #[test]
+    fn the_ported_nested_example_declares_the_dashboard_it_always_did() {
+        assert_eq!(
+            parse(OLD_SPLIT_PANES_NESTED).expect("the captured text parses"),
+            parse(include_str!("../../examples/panes-nested.kdl")).expect("the example parses")
+        );
+    }
+
     fn names_of(file: &DashboardFile) -> Vec<&str> {
         file.panes
             .iter()

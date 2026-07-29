@@ -90,12 +90,15 @@ fn panes_row(
     let a_cmd = labeled_counter_cmd(a, a_name);
     let b_cmd = labeled_counter_cmd(b, b_name);
     debug_assert!(!a_cmd.contains('"') && !b_cmd.contains('"'));
+    // `interval` rides in the PROPERTY position here so the dual
+    // spelling gets its coverage through a real pty, not just a parse.
     format!(
         "gap 1\n\n\
          defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n}}\n\n\
-         pane \"{a_name}\" {{\n    interval \"{a_interval}\"\n    command \"{a_cmd}\"\n}}\n\n\
-         pane \"{b_name}\" {{\n    interval \"{b_interval}\"\n    command \"{b_cmd}\"\n}}\n\n\
-         layout {{\n    row \"{a_name}\" \"{b_name}\"\n}}\n"
+         row {{\n    \
+         pane \"{a_name}\" interval=\"{a_interval}\" {{\n        command \"{a_cmd}\"\n    }}\n    \
+         pane \"{b_name}\" interval=\"{b_interval}\" {{\n        command \"{b_cmd}\"\n    }}\n\
+         }}\n"
     )
 }
 
