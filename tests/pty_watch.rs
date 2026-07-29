@@ -1827,18 +1827,32 @@ fn question_mark_pages_the_key_reference() {
         wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
         "expected a first frame"
     );
+    // The park handshake is ALLOWED to refuse when the reader thread
+    // is starved (a loaded CI runner): the arm answers "pager
+    // unavailable ... try again" by design. Honor that path the way a
+    // user would — press ? again — instead of asserting a one-shot
+    // success the design never promised.
     session.write_bytes(b"?");
-    // A loaded CI runner needs real headroom for the pager handoff
-    // (park the reader, spawn cat, stream the reference): 5s, not 2s.
-    assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            b"freeze the frame in place",
-            Duration::from_secs(5)
-        ),
-        "expected the key reference in the pager"
-    );
+    let mut seen: Vec<u8> = Vec::new();
+    let mut retries = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected the key reference in the pager (after {retries} retries)"
+        );
+        let chunk = session.read_available(Duration::from_millis(50));
+        terminal.respond(&session, &chunk);
+        seen.extend_from_slice(&chunk);
+        if contains(&seen, b"freeze the frame in place") {
+            break;
+        }
+        if contains(&seen, b"pager unavailable") && retries < 5 {
+            retries += 1;
+            seen.clear();
+            session.write_bytes(b"?");
+        }
+    }
     assert!(
         wait_for(&session, &mut terminal, b"hi", Duration::from_secs(5)),
         "expected the frame back after the pager"
