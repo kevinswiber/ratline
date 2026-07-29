@@ -1,9 +1,15 @@
-// A small multi-pane dashboard: three commands, three cadences, one
-// flicker-free frame. Run from a git repository:
+// Nesting, both ways at once. Run from a git repository, with this
+// branch's rat on PATH:
 //
-//   rat dashboard examples/panes.kdl
+//   rat dashboard examples/panes-nested.kdl
 //
-// The same declaration in TOML is examples/panes.toml.
+// 1. Nested LAYOUT: rows and columns nest to any depth — here a row
+//    holds two columns, giving a grid in ONE dashboard where every
+//    pane keeps its own cadence.
+// 2. A nested DASHBOARD: a pane may run `rat dashboard … --once` as
+//    its child; the inner one-shot sizes itself to the pane through
+//    the handed-down RAT_WIDTH/RAT_HEIGHT. (A live inner dashboard
+//    needs streaming children — a later chapter.)
 
 gap 1
 
@@ -30,12 +36,14 @@ pane "clock" {
 }
 
 pane "nested" {
-  command "rat" "dashboard" "examples/panes.toml" "--once"
-  height 15
+    command "rat" "dashboard" "examples/panes.toml" "--once"
+    height 15
 }
 
 layout {
-    row "log" "branch"
-    row "clock"
+    row {
+        column "log" "branch"
+        column "clock"
+    }
     row "nested"
 }

@@ -244,9 +244,32 @@ on it. `command` is a string split like a shell word list, an array
 taken verbatim as argv, or a raw script string with `shell = true`.
 
 The layout is a vertical stack of rows; a row is one or more panes side
-by side. Omit it and every pane stacks in declaration order. `gap` is
+by side — and rows and columns nest to any depth, so grids need no
+second mechanism. KDL nests with explicit blocks; TOML nests by
+alternating arrays (an array inside a row is a column, and vice versa):
+
+```kdl
+layout {
+    row {
+        column "log" "branch"
+        column "clock"
+    }
+}
+```
+
+```toml
+[layout]
+rows = [ [ ["log", "branch"], ["clock"] ] ]
+```
+
+Omit the layout and every pane stacks in declaration order. `gap` is
 the columns between panes in a row, `row-gap` the blank rows between
 rows.
+
+A pane may even run `rat dashboard … --once` as its child: the inner
+one-shot sizes itself to the pane through the handed-down `RAT_WIDTH`/
+`RAT_HEIGHT` and renders as a dashboard-in-a-dashboard, re-run at the
+outer pane's cadence.
 
 Per pane, `interval` takes a duration or `"never"` for a pane only a
 trigger moves; `trigger` takes the same `file:` / `fifo:` / `fd:`
@@ -284,7 +307,9 @@ row that comes and goes.
 
 Runnable declarations live at
 [`examples/panes.toml`](examples/panes.toml) and
-[`examples/panes.kdl`](examples/panes.kdl).
+[`examples/panes.kdl`](examples/panes.kdl);
+[`examples/panes-nested.kdl`](examples/panes-nested.kdl) shows nested
+layout blocks and a dashboard-in-a-dashboard pane together.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 
