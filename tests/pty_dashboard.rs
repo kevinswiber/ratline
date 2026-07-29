@@ -206,3 +206,134 @@ fn a_resize_reaches_the_panes_that_were_not_due() {
         "the dashboard should have exited on q"
     );
 }
+
+/// `wait_for_bytes`, but panicking the moment `forbidden` shows up in
+/// the accumulated output. Duplicated from the watch suite's local
+/// helper, never lifted.
+fn wait_for_without(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needle: &[u8],
+    forbidden: &[u8],
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let chunk = session.read_available((deadline - now).min(Duration::from_millis(50)));
+        if chunk.is_empty() {
+            continue;
+        }
+        terminal.respond(session, &chunk);
+        seen.extend_from_slice(&chunk);
+        assert!(
+            !contains(&seen, forbidden),
+            "forbidden needle {:?} appeared",
+            String::from_utf8_lossy(forbidden)
+        );
+        if contains(&seen, needle) {
+            return true;
+        }
+    }
+}
+
+/// The last screen row containing `needle`, carriage returns stripped.
+fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+    bytes
+        .split(|&b| b == b'\n')
+        .map(|row| row.strip_suffix(b"\r").unwrap_or(row))
+        .rfind(|row| contains(row, needle))
+}
+
+/// A pane's marks are computed once per ITS OWN output change, so a
+/// slow pane's change stays marked while a fast pane ticks under it.
+/// The proof is negative on purpose — a dwelling mark writes no bytes,
+/// an unmarked repaint of that row does.
+#[test]
+fn a_slow_panes_change_stays_marked_across_the_fast_panes_ticks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast_count = dir.path().join("fastcount");
+    let slow_value = dir.path().join("slowvalue");
+    std::fs::write(&slow_value, "v0").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+row-gap = 0
+
+[defaults]
+height = 1
+border = "none"
+chrome = false
+shell = true
+
+[[pane]]
+name = "fast"
+interval = "250ms"
+command = "{fast}"
+
+[[pane]]
+name = "slow"
+interval = "300ms"
+command = "printf 'slow-%s' \"$(cat {slow})\""
+"#,
+            fast = labeled_counter_cmd(&fast_count, "fast"),
+            slow = slow_value.display(),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"slow-v0", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"D"); // gutter on, while the slow pane still reads v0
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"  slow-v0",
+            Duration::from_secs(5)
+        ),
+        "the gutter never appeared"
+    );
+
+    std::fs::write(&slow_value, "v1").expect("the slow pane's one change");
+    let bytes = wait_for_bytes(&session, &mut terminal, b"slow-v1", Duration::from_secs(5))
+        .expect("the slow pane never picked up its change");
+    let slow_row = row_containing(&bytes, b"slow-v1").expect("the slow row");
+    assert!(
+        contains(slow_row, "▌".as_bytes()),
+        "the changed pane must be marked: {:?}",
+        String::from_utf8_lossy(slow_row)
+    );
+
+    // Now let the FAST pane tick four more times. If the marks were
+    // recomputed per composed frame, the very next fast tick would
+    // repaint the slow row unmarked — which is exactly the forbidden
+    // needle. Child-side evidence picks the ceiling, not a sleep.
+    let n = std::fs::read_to_string(&fast_count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            format!("fast-{}", n + 4).as_bytes(),
+            b"  slow-v1",
+            Duration::from_secs(5),
+        ),
+        "the fast pane stopped ticking"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
