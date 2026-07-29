@@ -2554,3 +2554,66 @@ fn an_fd_source_ending_shows_one_notice_and_watch_keeps_ticking() {
     );
     session.kill_if_alive(Duration::from_secs(2));
 }
+
+#[test]
+fn question_mark_pages_the_key_reference_before_the_first_frame() {
+    // The reference is static text, so the one window where it used to
+    // be unavailable — before the first frame — is exactly the window a
+    // reader most wants it in. The marker file is child-side evidence
+    // that the first child is running and nothing has been painted yet.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let started = dir.path().join("started");
+    let script = format!(": > {}; /bin/sleep 5; echo hi", started.display());
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "10s", "--shell", "--", &script],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !started.exists() {
+        // Keep answering the startup appearance probe while polling —
+        // the first tick waits behind it.
+        let chunk = session.read_available(Duration::from_millis(20));
+        terminal.respond(&session, &chunk);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never started"
+        );
+    }
+    // The park handshake is ALLOWED to refuse when the reader thread is
+    // starved: the arm answers "pager unavailable … try again" by
+    // design. Honor that the way a user would — press ? again — on a
+    // TIMER, never on the notice text: before the first frame a refusal
+    // has no frame to paint the notice into, so it writes nothing at
+    // all.
+    session.write_bytes(b"?");
+    let mut seen: Vec<u8> = Vec::new();
+    let mut presses = 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut next_retry = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected the key reference before any frame (after {presses} presses)"
+        );
+        let chunk = session.read_available(Duration::from_millis(50));
+        terminal.respond(&session, &chunk);
+        seen.extend_from_slice(&chunk);
+        if contains(&seen, b"freeze the frame in place") {
+            break;
+        }
+        if std::time::Instant::now() >= next_retry && presses < 6 {
+            presses += 1;
+            session.write_bytes(b"?");
+            next_retry = std::time::Instant::now() + Duration::from_secs(2);
+        }
+    }
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
