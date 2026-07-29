@@ -122,5 +122,16 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
                 n => Err(AppError::Child(n)),
             }
         }
+        #[cfg(debug_assertions)]
+        Command::Cat(args) => {
+            use std::io::Write;
+
+            use anyhow::Context as _;
+            let bytes = std::fs::read(&args.file).context("reading")?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(&bytes).context("writing")?;
+            out.flush().context("flushing")?;
+            Ok(())
+        }
     }
 }

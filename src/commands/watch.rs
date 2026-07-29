@@ -14,7 +14,7 @@ use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
-use crate::core::trigger::{TriggerSpec, parse_trigger};
+use crate::core::trigger::{DebounceGate, MtimeWatchSet, TriggerSpec, parse_trigger};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::history::History;
@@ -58,7 +58,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         .map(|spec| parse_trigger(spec))
         .collect::<anyhow::Result<Vec<TriggerSpec>>>()?;
     let interval = resolve_interval(args.interval.as_deref(), !triggers.is_empty())?;
-    let _debounce = parse_interval(&args.trigger_debounce)?;
+    let debounce = parse_interval(&args.trigger_debounce)?;
     let (interrupted, terminated) = register_signals()?;
 
     let stdout = std::io::stdout();
@@ -131,6 +131,21 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     };
 
     let mut schedule = TickSchedule::new(interval);
+    let mut file_watch = MtimeWatchSet::new(
+        triggers
+            .iter()
+            .filter_map(|trigger| match trigger {
+                TriggerSpec::File(path) => Some(path.clone()),
+                #[cfg(unix)]
+                _ => None,
+            })
+            .collect(),
+    );
+    // The baseline exists BEFORE the first spawn: a change landing
+    // between the first child's start and the loop's first check must
+    // be detected, never absorbed into the baseline.
+    file_watch.fired();
+    let mut gate = DebounceGate::new(debounce);
     // The footer label carries the user's own token; a defaulted interval
     // reads as its literal default. Trigger-only mode has no token at all.
     let interval_label = args
@@ -307,6 +322,22 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                 break;
             }
             schedule.completed(Instant::now());
+        }
+        // 3b. External triggers: collapse fires into one respawn
+        // request per debounce window. Sits BEFORE the non-interactive
+        // branch below so a piped watch refreshes on file changes too;
+        // the spawn this requests happens on the next iteration's step
+        // 2, at most one slice away.
+        if !triggers.is_empty() {
+            let now = Instant::now();
+            if file_watch.fired() {
+                gate.fire(now);
+            }
+            if gate.due(now) {
+                // A fired trigger observed a change any in-flight child
+                // predates: a respawn, never a plain request.
+                schedule.request_respawn();
+            }
         }
         // 4. How long we may sleep: never past the next spawn, never
         // past one slice, so a signal, a key, and a completing child
