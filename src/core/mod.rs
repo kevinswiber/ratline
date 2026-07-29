@@ -11,3 +11,4 @@ pub mod schedule;
 pub mod snapshot;
 pub mod spark;
 pub mod table;
+pub mod trigger;
