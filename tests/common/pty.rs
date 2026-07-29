@@ -328,3 +328,65 @@ pub fn wait_for(
         }
     }
 }
+
+/// Create a named pipe — trigger tests drive watch through one.
+pub fn mkfifo_at(path: &std::path::Path) {
+    let cpath =
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes().to_vec()).expect("fifo path");
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+}
+
+/// Open, write, close: one trigger fire.
+pub fn write_fifo(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("fifo write end");
+    writer.write_all(bytes).expect("fifo write");
+}
+
+/// The sh line a counting watch child runs — pty tests are unix-only,
+/// so sh is available (the sh-free rule binds the portable cli suite).
+/// Prints `count-N` so screen assertions have a distinctive needle.
+pub fn counter_cmd(path: &std::path::Path) -> String {
+    format!(
+        "echo run >> {p}; printf 'count-%s' $(wc -l < {p})",
+        p = path.display()
+    )
+}
+
+/// Child-side evidence: wait until the counter file records `n` runs.
+pub fn wait_for_counter(path: &std::path::Path, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let count = std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if count >= n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "counter stuck at {count}, wanted {n}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The count must not move past `n` through one settle window, and must
+/// end there — value-based, never a bare sleep assertion.
+pub fn assert_counter_settled_at(path: &std::path::Path, n: usize) {
+    let deadline = Instant::now() + Duration::from_millis(900);
+    while Instant::now() < deadline {
+        let count = std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert!(count <= n, "counter moved past {n}: {count}");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let count = std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert_eq!(count, n, "counter settled at the wrong value");
+}

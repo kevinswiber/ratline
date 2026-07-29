@@ -2384,3 +2384,153 @@ fn the_flipped_live_row_counts() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn a_fifo_write_forces_a_fresh_run_mid_heartbeat() {
+    use common::pty::{counter_cmd, mkfifo_at, wait_for_counter, write_fifo};
+
+    // -n 1h parks the interval: reaching count 2 without waiting the
+    // hour is the trigger's doing (child-side counter evidence).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo = dir.path().join("t.fifo");
+    mkfifo_at(&fifo);
+    let counter = dir.path().join("count");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "1h",
+            "--trigger",
+            &format!("fifo:{}", fifo.display()),
+            "--trigger-debounce",
+            "0ms",
+            "--shell",
+            "--",
+            &counter_cmd(&counter),
+        ],
+        &[],
+    )
+    .expect("spawn rat watch under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the first tick never painted"
+    );
+    write_fifo(&fifo, b"go\n");
+    assert!(
+        wait_for(&session, &mut terminal, b"count-2", Duration::from_secs(5)),
+        "the fifo write never forced a run"
+    );
+    wait_for_counter(&counter, 2);
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn burst_writes_inside_one_window_coalesce_to_one_run() {
+    use common::pty::{
+        assert_counter_settled_at, counter_cmd, mkfifo_at, wait_for_counter, write_fifo,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo = dir.path().join("t.fifo");
+    mkfifo_at(&fifo);
+    let counter = dir.path().join("count");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "1h",
+            "--trigger",
+            &format!("fifo:{}", fifo.display()),
+            "--trigger-debounce",
+            "400ms",
+            "--shell",
+            "--",
+            &counter_cmd(&counter),
+        ],
+        &[],
+    )
+    .expect("spawn rat watch under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the first tick never painted"
+    );
+    for _ in 0..5 {
+        write_fifo(&fifo, b"x\n"); // five fires, one anchored window
+    }
+    wait_for_counter(&counter, 2);
+    // The pin: the five fires collapse to exactly one extra run —
+    // value-based on the counter file, not timing.
+    assert_counter_settled_at(&counter, 2);
+    session.kill_if_alive(Duration::from_secs(2));
+}
+
+#[test]
+fn an_fd_source_ending_shows_one_notice_and_watch_keeps_ticking() {
+    use common::pty::{counter_cmd, wait_for_counter};
+
+    // Portable across both unix CI legs — macOS libc has NO pipe2, so
+    // plain pipe + FD_CLOEXEC on the WRITE end only: the child inherits
+    // the read end, never the write end, so closing w in the parent IS
+    // the child-side EOF.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (r, w) = (fds[0], fds[1]);
+    assert_ne!(
+        unsafe { libc::fcntl(w, libc::F_SETFD, libc::FD_CLOEXEC) },
+        -1,
+        "cloexec on the write end"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("count");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "2s",
+            "--trigger",
+            &format!("fd:{r}"),
+            "--trigger-debounce",
+            "0ms",
+            "--shell",
+            "--",
+            &counter_cmd(&counter),
+        ],
+        &[],
+    )
+    .expect("spawn rat watch under a pty");
+    // The parent's read-end copy is the child's now.
+    unsafe { libc::close(r) };
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the first tick never painted"
+    );
+    // Closing the last write end is the child-side EOF: the source ends,
+    // the one-shot notice appears, and the heartbeat keeps ticking.
+    unsafe { libc::close(w) };
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"trigger ended: fd:",
+            Duration::from_secs(5)
+        ),
+        "the end-of-life notice never appeared"
+    );
+    let before = std::fs::read_to_string(&counter)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    wait_for_counter(&counter, before + 1); // rat did not exit
+    // One-shot: the frames that follow the notice must not repeat it.
+    let after = drain_for(&session, Duration::from_millis(600));
+    assert!(
+        !contains(&after, b"trigger ended"),
+        "the notice repeated after its one-shot repaint"
+    );
+    session.kill_if_alive(Duration::from_secs(2));
+}
