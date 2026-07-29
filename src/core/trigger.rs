@@ -102,6 +102,69 @@ impl DebounceGate {
     }
 }
 
+/// One `file:` source: a path whose modification is detected by stat,
+/// once per loop slice. A file's fingerprint is its mtime; a
+/// directory's is the max of its own mtime and its immediate entries'
+/// (non-recursive) — a directory's own mtime does not move when an
+/// existing entry is edited in place. An absent path is a stable state:
+/// no fire while absent, one fire on appearance. The first observation
+/// only establishes the baseline.
+pub struct MtimeWatch {
+    path: std::path::PathBuf,
+    last: Option<Fingerprint>,
+}
+
+/// `None` = the path is absent; `Some(t)` = its newest relevant mtime.
+type Fingerprint = Option<std::time::SystemTime>;
+
+impl MtimeWatch {
+    pub fn new(path: std::path::PathBuf) -> MtimeWatch {
+        MtimeWatch { path, last: None }
+    }
+
+    /// Stat the path and report whether it changed since the last call.
+    pub fn fired(&mut self) -> bool {
+        let current = fingerprint(&self.path);
+        let changed = self.last.is_some_and(|last| last != current);
+        self.last = Some(current);
+        changed
+    }
+}
+
+fn fingerprint(path: &std::path::Path) -> Fingerprint {
+    let meta = std::fs::metadata(path).ok()?;
+    let mut newest = meta.modified().ok()?;
+    if meta.is_dir() {
+        // Depth 1 only, unreadable entries skipped: the rule is cheap
+        // and bounded by design — never point it at a source tree.
+        for entry in std::fs::read_dir(path).ok()?.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                newest = newest.max(modified);
+            }
+        }
+    }
+    Some(newest)
+}
+
+/// Every `file:` spec of one watch run; fires when any member fires.
+pub struct MtimeWatchSet(Vec<MtimeWatch>);
+
+impl MtimeWatchSet {
+    pub fn new(paths: Vec<std::path::PathBuf>) -> MtimeWatchSet {
+        MtimeWatchSet(paths.into_iter().map(MtimeWatch::new).collect())
+    }
+
+    /// Poll every member — each baseline must advance even after one
+    /// fires, so there is no short-circuit.
+    pub fn fired(&mut self) -> bool {
+        let mut any = false;
+        for watch in &mut self.0 {
+            any |= watch.fired();
+        }
+        any
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -167,6 +230,92 @@ mod tests {
             }
         }
         assert!(spawns >= 3, "starved: {spawns} spawns over 1s at D=250ms");
+    }
+
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    /// Push a path's mtime forward deterministically — no sleeps, no
+    /// filesystem-granularity dependence.
+    fn touch_at(path: &Path, t: SystemTime) {
+        std::fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_first_observation_is_a_baseline_not_a_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("state.json");
+        std::fs::write(&f, b"x").unwrap();
+        let mut w = MtimeWatch::new(f);
+        assert!(!w.fired()); // baseline
+        assert!(!w.fired()); // unchanged
+    }
+
+    #[test]
+    fn an_mtime_change_fires_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("state.json");
+        std::fs::write(&f, b"x").unwrap();
+        let mut w = MtimeWatch::new(f.clone());
+        w.fired();
+        touch_at(&f, SystemTime::now() + Duration::from_secs(5));
+        assert!(w.fired());
+        assert!(!w.fired());
+    }
+
+    #[test]
+    fn an_absent_path_is_stable_and_fires_on_appearance() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("not-yet");
+        let mut w = MtimeWatch::new(f.clone());
+        assert!(!w.fired()); // absent baseline
+        assert!(!w.fired()); // still absent: stable
+        std::fs::write(&f, b"x").unwrap();
+        assert!(w.fired()); // appearance is a change
+    }
+
+    #[test]
+    fn a_directory_fires_on_an_immediate_entrys_edit() {
+        // The dir-mtime-only reading under-delivers: editing an existing
+        // entry in place does not bump the directory's own mtime.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("finding.md");
+        std::fs::write(&f, b"x").unwrap();
+        let mut w = MtimeWatch::new(dir.path().to_path_buf());
+        w.fired();
+        touch_at(&f, SystemTime::now() + Duration::from_secs(5));
+        assert!(w.fired());
+    }
+
+    #[test]
+    fn a_directory_is_not_recursive() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let deep = sub.join("deep.md");
+        std::fs::write(&deep, b"x").unwrap();
+        let mut w = MtimeWatch::new(dir.path().to_path_buf());
+        w.fired();
+        touch_at(&deep, SystemTime::now() + Duration::from_secs(5));
+        assert!(!w.fired()); // depth-1 only: a nested edit is invisible
+    }
+
+    #[test]
+    fn a_set_fires_when_any_member_fires() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let mut set = MtimeWatchSet::new(vec![a, b.clone()]);
+        set.fired();
+        touch_at(&b, SystemTime::now() + Duration::from_secs(5));
+        assert!(set.fired());
     }
 
     #[test]
