@@ -3,6 +3,10 @@
 //! the process in a shutdown-barred slot, and posting exactly one
 //! outcome.
 //!
+//! The outcome carries its source tag and exit status, because one
+//! loop drains N sources and a pane names the code its command exited
+//! with.
+//!
 //! The slot's protocol is the heart: the worker checks the shutdown
 //! bar and spawns/parks under ONE critical section (the lock spans
 //! the spawn), while `shutdown` takes the same lock — so it either
@@ -12,6 +16,8 @@
 use std::io::Read;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use crate::core::registry::SourceId;
 
 /// The slot the tick in flight parks its child in, plus the shutdown
 /// bar. Cloning shares the slot.
@@ -63,6 +69,11 @@ impl Drop for ShutdownGuard {
 
 /// One finished tick, as it travels from the worker to the loop.
 pub struct TickOutcome {
+    /// Which source finished — the index of every per-source resource.
+    // Read by the drain once the loop generalizes; the allow comes off
+    // with its first consumer.
+    #[allow(dead_code)]
+    pub source: SourceId,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     /// When the child finished — the instant this content became
@@ -73,11 +84,20 @@ pub struct TickOutcome {
     /// is the caller's: frame content while looping, a hard error
     /// under `--once`.
     pub spawn_error: Option<std::io::Error>,
+    /// The child's exit status, for the per-pane failure row. Absent
+    /// when nothing ran: a spawn error, or a child reclaimed by a
+    /// shutdown kill — a defaulted `exit 0` would read as a healthy
+    /// source that printed nothing. `rat watch` still ignores it,
+    /// exactly as `output()`'s status was ignored.
+    // Read by the pane failure row; the allow comes off with its first
+    // consumer.
+    #[allow(dead_code)]
+    pub status: Option<std::process::ExitStatus>,
 }
 
 /// Run one configured child to completion on this thread.
-pub fn run_tick(command: std::process::Command) -> TickOutcome {
-    run_parked(command, &ChildSlot::default())
+pub fn run_tick(command: std::process::Command, source: SourceId) -> TickOutcome {
+    run_parked(command, source, &ChildSlot::default())
 }
 
 /// Run one configured child on a worker thread, which posts exactly
@@ -85,6 +105,7 @@ pub fn run_tick(command: std::process::Command) -> TickOutcome {
 /// ever joins a tick. Err only when the OS refuses a thread.
 pub fn spawn_tick(
     command: std::process::Command,
+    source: SourceId,
     slot: ChildSlot,
     tx: std::sync::mpsc::Sender<TickOutcome>,
 ) -> std::io::Result<()> {
@@ -93,23 +114,27 @@ pub fn spawn_tick(
         .spawn(move || {
             // On a shutdown race the receiver is already gone; the
             // failed send is the no-op it should be.
-            let _ = tx.send(run_parked(command, &slot));
+            let _ = tx.send(run_parked(command, source, &slot));
         })?;
     Ok(())
 }
 
-fn run_parked(mut command: std::process::Command, slot: &ChildSlot) -> TickOutcome {
+fn run_parked(
+    mut command: std::process::Command,
+    source: SourceId,
+    slot: &ChildSlot,
+) -> TickOutcome {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     // The lock spans the spawn: shutdown() takes the same lock, so it
     // either kills a parked child or bars this spawn — no window.
     let (stdout, stderr) = {
         let mut state = slot.lock();
         if state.shutdown {
-            return outcome_err(std::io::ErrorKind::Interrupted.into());
+            return outcome_err(source, std::io::ErrorKind::Interrupted.into());
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
-            Err(err) => return outcome_err(err),
+            Err(err) => return outcome_err(source, err),
         };
         let pipes = (child.stdout.take(), child.stderr.take());
         state.child = Some(child);
@@ -123,25 +148,33 @@ fn run_parked(mut command: std::process::Command, slot: &ChildSlot) -> TickOutco
         .spawn(move || read_all(stderr));
     let out = read_all(stdout);
     let err = err_reader.map_or_else(|_| Vec::new(), |h| h.join().unwrap_or_default());
-    if let Some(mut child) = slot.lock().child.take() {
-        // The exit status is discarded, exactly as `output()`'s was:
-        // a failing child is frame content, not a watch error.
-        let _ = child.wait();
-    }
+    let status = if let Some(mut child) = slot.lock().child.take() {
+        // The status is no longer discarded: a pane names the code its
+        // command exited with. Nobody FAILS on it — a failing child is
+        // still frame content, exactly as `output()`'s status was.
+        child.wait().ok()
+    } else {
+        // Reclaimed by a shutdown kill: there is no status to report.
+        None
+    };
     TickOutcome {
+        source,
         stdout: out,
         stderr: err,
         at: jiff::Timestamp::now(),
         spawn_error: None,
+        status,
     }
 }
 
-fn outcome_err(err: std::io::Error) -> TickOutcome {
+fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
     TickOutcome {
+        source,
         stdout: Vec::new(),
         stderr: Vec::new(),
         at: jiff::Timestamp::now(),
         spawn_error: Some(err),
+        status: None,
     }
 }
 
@@ -218,7 +251,7 @@ mod tests {
         let cmd = script("echo out; echo err >&2");
         #[cfg(windows)]
         let cmd = script("echo out & echo err 1>&2");
-        let outcome = run_tick(cmd);
+        let outcome = run_tick(cmd, SourceId(0));
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout, b"out"));
         assert!(contains(&outcome.stderr, b"err"));
@@ -235,7 +268,7 @@ mod tests {
         let body = format!(
             "i=0; while [ $i -lt 3000 ]; do echo {line}; echo {line} >&2; i=$((i+1)); done"
         );
-        let outcome = run_tick(script(&body));
+        let outcome = run_tick(script(&body), SourceId(0));
         assert!(outcome.spawn_error.is_none());
         assert_eq!(outcome.stdout.len(), 3000 * 101);
         assert_eq!(outcome.stderr.len(), 3000 * 101);
@@ -243,7 +276,10 @@ mod tests {
 
     #[test]
     fn a_command_that_cannot_start_reports_the_error() {
-        let outcome = run_tick(std::process::Command::new("definitely-no-such-binary-xyz"));
+        let outcome = run_tick(
+            std::process::Command::new("definitely-no-such-binary-xyz"),
+            SourceId(0),
+        );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.stdout.is_empty());
         assert!(outcome.stderr.is_empty());
@@ -255,7 +291,7 @@ mod tests {
         let cmd = script("echo hi; exit 3");
         #[cfg(windows)]
         let cmd = script("echo hi & exit 3");
-        let outcome = run_tick(cmd);
+        let outcome = run_tick(cmd, SourceId(0));
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout, b"hi"));
     }
@@ -265,7 +301,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         // The only Sender moves in, so the worker's exit closes the
         // channel: one outcome, then Disconnected — proven together.
-        spawn_tick(script("echo once"), ChildSlot::default(), tx).expect("spawn worker");
+        spawn_tick(script("echo once"), SourceId(0), ChildSlot::default(), tx)
+            .expect("spawn worker");
         let outcome = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("one outcome");
@@ -277,7 +314,7 @@ mod tests {
     fn a_parked_child_can_be_killed_from_another_thread() {
         let slot = ChildSlot::default();
         let (tx, rx) = mpsc::channel();
-        spawn_tick(sleeper(), slot.clone(), tx).expect("spawn worker");
+        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx).expect("spawn worker");
         wait_until_parked(&slot);
         slot.shutdown();
         // The kill closed the pipes, the drains hit EOF, the worker
@@ -297,7 +334,7 @@ mod tests {
         let cmd = script(&format!("type nul > {}", marker.display()));
         let slot = ChildSlot::default();
         slot.shutdown();
-        let outcome = run_parked(cmd, &slot);
+        let outcome = run_parked(cmd, SourceId(0), &slot);
         let err = outcome.spawn_error.expect("barred spawn reports an error");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
         assert!(!marker.exists(), "the child must never have spawned");
@@ -307,12 +344,56 @@ mod tests {
     fn dropping_the_guard_shuts_the_slot_down() {
         let slot = ChildSlot::default();
         let (tx, rx) = mpsc::channel();
-        spawn_tick(sleeper(), slot.clone(), tx).expect("spawn worker");
+        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx).expect("spawn worker");
         wait_until_parked(&slot);
         // The RAII half: a guard going out of scope is the shutdown.
         // (Which is why run() must HOLD its guard in a named binding —
         // a bare `let _ =` drops immediately, as exploited here.)
         drop(slot.guard());
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn an_outcome_carries_its_source_tag() {
+        // The tag every per-source resource is indexed by: it rides the
+        // outcome home, so a drain never has to guess who finished.
+        // Both paths carry it — the inline one and the worker's.
+        let outcome = run_tick(script("echo tagged"), SourceId(2));
+        assert_eq!(outcome.source, SourceId(2));
+
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(script("echo tagged"), SourceId(5), ChildSlot::default(), tx)
+            .expect("spawn worker");
+        let posted = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("one outcome");
+        assert_eq!(posted.source, SourceId(5));
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_reported_in_the_outcome() {
+        // A failing source needs its CODE, not just its output: the code
+        // is what a pane's status row names, and what tells a failure
+        // apart from a command that legitimately prints nothing.
+        #[cfg(unix)]
+        let cmd = script("echo hi; exit 3");
+        #[cfg(windows)]
+        let cmd = script("echo hi & exit 3");
+        let outcome = run_tick(cmd, SourceId(0));
+        assert!(outcome.spawn_error.is_none());
+        assert!(contains(&outcome.stdout, b"hi"));
+        assert_eq!(outcome.status.and_then(|status| status.code()), Some(3));
+    }
+
+    #[test]
+    fn a_spawn_error_still_has_no_status() {
+        // Nothing ran, so nothing exited. A defaulted `exit 0` here would
+        // read as a healthy source that printed nothing.
+        let outcome = run_tick(
+            std::process::Command::new("definitely-no-such-binary-xyz"),
+            SourceId(0),
+        );
+        assert!(outcome.spawn_error.is_some());
+        assert!(outcome.status.is_none());
     }
 }
