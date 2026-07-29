@@ -347,3 +347,120 @@ command = ["{rat}", "__cat", "{steady}"]
         "a failing pane must not leak to the terminal"
     );
 }
+
+/// Stream the piped dashboard's stdout through a channel so waiting for
+/// a frame is bounded: a blocking read cannot swallow the deadline.
+/// Duplicated from the watch suite's local helpers, never lifted — that
+/// file is the byte-identity witness.
+fn stdout_stream(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Drain the stream until the needle appears — a missing frame is a
+/// clean failure, never a hang.
+fn read_until(stream: &std::sync::mpsc::Receiver<Vec<u8>>, seen: &mut String, needle: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if seen.contains(needle) {
+            return;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "never saw {needle:?} in {seen:?}");
+        match stream.recv_timeout(left) {
+            Ok(chunk) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(_) => panic!("never saw {needle:?} in {seen:?}"),
+        }
+    }
+}
+
+/// Reap the dashboard even when an assertion panics: an orphaned child
+/// holds the harness's stdout pipe open and hangs the whole run.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Per-pane triggers: a fire routes to the pane that DECLARED it. The
+/// declarer is deliberately the SECOND source: a wiring that routes
+/// every fire to source 0 (a shared gate, a hardcoded index) re-runs
+/// alpha instead — whose bytes are unchanged, so the gated pipe writes
+/// nothing and v1 never appears.
+#[test]
+fn a_file_trigger_refreshes_only_its_own_pane() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let steady = dir.path().join("steady");
+    let shared = dir.path().join("shared");
+    let untouched = dir.path().join("untouched");
+    std::fs::write(&steady, "a0").expect("seed");
+    std::fs::write(&shared, "v0").expect("seed");
+    std::fs::write(&untouched, "x").expect("seed");
+    let decl = dir.path().join("dash.toml");
+    std::fs::write(
+        &decl,
+        format!(
+            r#"
+row-gap = 0
+
+[defaults]
+height = 1
+border = "none"
+chrome = false
+interval = "never"
+trigger-debounce = "0ms"
+
+[[pane]]
+name = "alpha"
+command = ["{rat}", "__cat", "{steady}"]
+trigger = ["file:{untouched}"]
+
+[[pane]]
+name = "beta"
+command = ["{rat}", "__cat", "{shared}"]
+trigger = ["file:{shared}"]
+"#,
+            rat = rat_bin().escape_default(),
+            steady = steady.display().to_string().escape_default(),
+            shared = shared.display().to_string().escape_default(),
+            untouched = untouched.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &decl.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "v0"); // both panes' first tick
+
+    std::fs::write(&shared, "v1").expect("mtime change");
+    read_until(&stream, &mut seen, "v1"); // beta's trigger-driven frame
+
+    // The panes stack in declaration order: in the refreshed frame,
+    // alpha's retained row still precedes beta's new one.
+    let last_frame = seen.rfind("a0").expect("alpha's retained row");
+    assert!(
+        seen[last_frame..].contains("v1"),
+        "the refreshed frame keeps declaration order: {seen:?}"
+    );
+    // KillOnDrop reaps: kill only SENDS the signal, and an unreaped
+    // child zombies (unix) and races tempdir cleanup.
+}
