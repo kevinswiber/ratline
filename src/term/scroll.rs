@@ -118,11 +118,7 @@ impl LiveScroll {
 
 /// The live-scrolled status row.
 pub fn scrolled_notice(offset: usize, shown: usize, total: usize) -> String {
-    format!(
-        "lines {}-{} of {total} · live · g follows",
-        offset + 1,
-        offset + shown
-    )
+    format!("lines {}-{} of {total} · live", offset + 1, offset + shown)
 }
 
 /// The row that replaces the truncation notice while frozen. `age` is the
@@ -269,10 +265,7 @@ mod tests {
 
     #[test]
     fn the_scrolled_row_names_the_range() {
-        assert_eq!(
-            scrolled_notice(8, 22, 46),
-            "lines 9-30 of 46 · live · g follows"
-        );
+        assert_eq!(scrolled_notice(8, 22, 46), "lines 9-30 of 46 · live");
     }
 
     #[test]

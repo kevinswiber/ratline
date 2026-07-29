@@ -449,7 +449,7 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        "v views all · q quits".as_bytes(),
+        "· ? help".as_bytes(),
         Duration::from_secs(2),
     )
     .expect("expected the live truncation notice");
@@ -500,7 +500,7 @@ fn a_frozen_frame_scrolls_and_esc_restores_the_live_view() {
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        "v views all · q quits".as_bytes(),
+        "· ? help".as_bytes(),
         Duration::from_secs(2),
     )
     .expect("expected the live truncation notice back after Esc");
@@ -707,7 +707,7 @@ fn a_stable_frame_scrolls_live() {
     session.write_bytes(b"g");
     let noop = drain_for(&session, Duration::from_millis(400));
     assert!(
-        !contains(&noop, "· live ·".as_bytes()),
+        !contains(&noop, "· live".as_bytes()),
         "g at the top must not enter live-scroll"
     );
     assert!(
@@ -721,7 +721,7 @@ fn a_stable_frame_scrolls_live() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 46 · live · g follows".as_bytes(),
+            "lines 2-23 of 46 · live".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -774,7 +774,7 @@ fn the_first_scroll_after_launch_scrolls_live() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 30 · live · g follows".as_bytes(),
+            "lines 2-23 of 30 · live".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -815,7 +815,7 @@ fn a_jittering_frame_scrolls_live_without_freezing() {
         wait_for_without(
             &session,
             &mut terminal,
-            "· live · g follows".as_bytes(),
+            "· live".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -858,7 +858,7 @@ fn a_shape_change_while_scrolled_stays_live() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 30 · live · g follows".as_bytes(),
+            "lines 2-23 of 30 · live".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -869,7 +869,7 @@ fn a_shape_change_while_scrolled_stays_live() {
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        "of 31 · live · g follows".as_bytes(),
+        "of 31 · live".as_bytes(),
         Duration::from_secs(8),
     )
     .expect("expected the scrolled row to pick up the new total, still live");
@@ -929,7 +929,7 @@ fn resuming_from_a_live_window_does_not_rerun_the_child() {
         wait_for_without(
             &session,
             &mut terminal,
-            "· live · g follows".as_bytes(),
+            "· live".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -984,7 +984,7 @@ fn a_scroll_on_a_frame_that_fits_is_a_noop() {
     session.write_bytes(b"j");
     let noop = drain_for(&session, Duration::from_millis(400));
     assert!(
-        !contains(&noop, "· live ·".as_bytes()),
+        !contains(&noop, "· live".as_bytes()),
         "a fitting frame has nowhere to scroll"
     );
     assert!(
@@ -1525,7 +1525,7 @@ fn a_key_repaints_while_a_slow_child_runs() {
         wait_for(
             &session,
             &mut terminal,
-            "· live · g follows".as_bytes(),
+            "· live".as_bytes(),
             Duration::from_millis(1500)
         ),
         "expected a live-scroll repaint inside the child's runtime"
@@ -1840,6 +1840,33 @@ fn question_mark_pages_the_key_reference() {
     assert!(
         wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
         "expected the frame back after the pager"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn the_live_row_names_the_interval() {
+    // The cadence rides every live row so the next refresh can be
+    // anticipated, with the ? breadcrumb as the one remaining hint.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· every 50ms · ? help".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the interval and help breadcrumb on the live row"
     );
     session.write_bytes(b"q");
     assert!(

@@ -112,6 +112,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     };
 
     let mut schedule = TickSchedule::new(interval);
+    let live_tail = live_suffix(args.once, &args.interval);
     let slot = ChildSlot::default();
     // Every exit from run() — return, `?`, panic — kills the in-flight
     // child through this guard's Drop. A NAMED binding: `let _ =`
@@ -252,6 +253,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                         pause.as_ref(),
                         live_scroll,
                         &current,
+                        &live_tail,
                         &palette,
                         view,
                         None,
@@ -304,6 +306,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     pause.as_ref(),
                     live_scroll,
                     l,
+                    &live_tail,
                     &palette,
                     view,
                     None,
@@ -419,6 +422,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 pager_notice,
@@ -460,6 +464,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 None,
@@ -488,6 +493,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 None,
@@ -520,6 +526,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 None,
@@ -578,6 +585,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 None,
@@ -619,6 +627,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 None,
@@ -644,6 +653,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 Some(text),
@@ -687,6 +697,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 pause.as_ref(),
                                 live_scroll,
                                 live,
+                                &live_tail,
                                 &palette,
                                 view,
                                 debug_notice,
@@ -989,11 +1000,23 @@ fn help_lines() -> Vec<String> {
     .collect()
 }
 
+/// The run-constant tail of every live row: the refresh cadence (so
+/// the next repaint can be anticipated) and the one discoverability
+/// breadcrumb — everything else the footer used to advertise lives in
+/// the `?` reference now. Empty in once mode: no cadence, no keys.
+fn live_suffix(once: bool, interval: &str) -> String {
+    if once {
+        String::new()
+    } else {
+        format!(" · every {interval} · ? help")
+    }
+}
+
 /// The live status row: the truncation notice when rows are hidden,
 /// carrying the pre-formatted time segment.
 fn live_notice(hidden: usize, time_seg: &str) -> String {
     if hidden > 0 {
-        format!("… {hidden} more lines · {time_seg} · v views all · q quits")
+        format!("… {hidden} more lines · {time_seg}")
     } else {
         time_seg.to_string()
     }
@@ -1008,6 +1031,7 @@ fn repaint(
     pause: Option<&PauseState>,
     live_scroll: Option<LiveScroll>,
     live: &Live,
+    live_tail: &str,
     palette: &Palette,
     view: ViewState,
     notice: Option<String>,
@@ -1056,7 +1080,10 @@ fn repaint(
         }
         .render("▌", profile)
     );
-    let time_live = live_time_segment(view.alt_time, &live.since, age_seconds(live.changed_at));
+    let time_live = format!(
+        "{}{live_tail}",
+        live_time_segment(view.alt_time, &live.since, age_seconds(live.changed_at))
+    );
     let time_paused = pause.map_or_else(
         || age_text(0),
         |p| paused_time_segment(view.alt_time, p.viewed_at, age_seconds(p.viewed_at)),
@@ -1606,8 +1633,16 @@ mod tests {
         assert_eq!(live_notice(0, "since 18:47:53"), "since 18:47:53");
         assert_eq!(
             live_notice(8, "changed 14s ago"),
-            "… 8 more lines · changed 14s ago · v views all · q quits"
+            "… 8 more lines · changed 14s ago"
         );
+    }
+
+    #[test]
+    fn the_live_suffix_names_the_interval_and_help() {
+        assert_eq!(live_suffix(false, "2s"), " · every 2s · ? help");
+        assert_eq!(live_suffix(false, "500ms"), " · every 500ms · ? help");
+        // Once mode has no cadence to anticipate and no keys to learn.
+        assert_eq!(live_suffix(true, "2s"), "");
     }
 
     #[test]

@@ -66,19 +66,21 @@ stopping the command it is running, and `v` (or Enter) opens the full
 untruncated frame in your pager — resolved bat-style from `RAT_PAGER`,
 then `PAGER`, then `less` (with `-R` ensured so colors survive; quit
 the pager and the watch returns to the frame at once). On Windows, when
-`less` isn't installed the stock `more.com` steps in.
+`less` isn't installed the stock `more.com` steps in. `?` pages the
+full key reference the same way.
 
 Every live frame's bottom row names the last time the output actually
-changed: `since 14:03:52`. When output is taller than the screen it
-merges into the truncation line:
-`… 12 more lines · since 14:03:52 · v views all · q quits`.
+changed and the refresh cadence, with `? help` as the one standing
+hint: `since 14:03:52 · every 2s · ? help`. When output is taller than
+the screen it merges into the truncation line:
+`… 12 more lines · since 14:03:52 · every 2s · ? help`.
 
 Scroll with less-style keys: `j`/`k` (or the arrows) move one line,
 `d`/`u` half a window, `f`/`b` (or PgDn/PgUp) a full window, and `g`/`G`
 (or Home/End) jump to the ends. The window moves over the live frame:
 nothing pauses, new output keeps arriving under you, `G` sticks to the
 end, and `g` (or scrolling back to the top) returns to the live view.
-The bottom row names the range: `lines 9-30 of 46 · live · g follows`.
+The bottom row names the range: `lines 9-30 of 46 · live`.
 Scrolled lines render chopped, like a horizontally shifted view. If the
 output changes shape while you're scrolled, the window rides along —
 the row's total updates, a pinned window keeps tracking the end — and
