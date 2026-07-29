@@ -49,6 +49,13 @@ use crate::ui::key::{Key, from_crossterm};
 /// channel, and the schedule — one wait slice.
 const SLICE: Duration = Duration::from_millis(50);
 
+/// The resize arm's settle window: reflow is immediate, but the
+/// respawn-all waits for the drag to go quiet. ANCHORED like every
+/// ratto debounce, so a sustained drag respawns once per window rather
+/// than starving. The reflow is independent of this — the window only
+/// paces the respawn.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// The newest composed frame and everything derived from it. Absent
 /// until the first child completes: the loop is live during that first
 /// run (q quits, keys dispatch), but there is nothing to paint yet.
@@ -304,6 +311,7 @@ pub(crate) fn run_registry(
     // in-scope geometry vector.
     let mut size = crossterm::terminal::size().unwrap_or((80, 24));
     let mut geom = registry.geometry(size);
+    let mut resize_gate = DebounceGate::new(RESIZE_DEBOUNCE);
     let mut previous_key: Option<PaintKey> = None;
     let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
@@ -340,10 +348,13 @@ pub(crate) fn run_registry(
             .filter(|id| runtime[id.0].schedule.poll(now) == Due::Spawn)
             .collect();
         if !due.is_empty() {
-            if !session.resize_respawn {
-                size = crossterm::terminal::size().unwrap_or(size);
-                geom = registry.geometry(size);
-            }
+            refresh_geometry_for_spawn(
+                session.resize_respawn,
+                crossterm::terminal::size().unwrap_or(size),
+                &mut size,
+                &mut geom,
+                &registry,
+            );
             for id in due {
                 // Once mode has no loop to keep responsive: it runs the
                 // tick on this thread and posts it to the channel a
@@ -477,10 +488,13 @@ pub(crate) fn run_registry(
             // is the collect-time measure shipped watch takes — the
             // same single-writer mode the spawn step uses; with one,
             // the arm keeps the pair fresh every iteration.
-            if !session.resize_respawn {
-                size = crossterm::terminal::size().unwrap_or(size);
-                geom = registry.geometry(size);
-            }
+            refresh_geometry_for_spawn(
+                session.resize_respawn,
+                crossterm::terminal::size().unwrap_or(size),
+                &mut size,
+                &mut geom,
+                &registry,
+            );
             // Composed once, above the repaint gate: the newest frame
             // is tracked on every completion, so paging always acts on
             // the newest content. Combining the single source's output
@@ -633,6 +647,68 @@ pub(crate) fn run_registry(
                     profile,
                     &history,
                 )?);
+            }
+        }
+        // 3c. Resize: reflow NOW from retained outputs, respawn once
+        // the size settles. This arm is the geometry pair's ONLY
+        // writer in this mode (the spawn step's re-measure is gated
+        // off), so a spawn coinciding with a resize can never consume
+        // the new size first and blind this detection. Placement:
+        // before the non-interactive branch, like the triggers.
+        if session.resize_respawn {
+            let measured = crossterm::terminal::size().unwrap_or(size);
+            let step = detect_resize(measured, &mut size, &mut geom, &registry);
+            if step.geom_moved {
+                resize_gate.fire(Instant::now());
+            }
+            if step.size_moved
+                && is_tty
+                && let Some(l) = live.as_mut()
+            {
+                if step.geom_moved {
+                    // Re-composed, never re-dated: the change key
+                    // is output-derived and history records only
+                    // collect-step compositions, so nothing here
+                    // records and the stamps are untouched.
+                    l.lines = compose_sources(&registry, &runtime, &geom, &palette, profile).lines;
+                }
+                // A frozen frame re-clamps only — it is a literal
+                // copy and is never re-laid-out; a live window
+                // reanchors.
+                let window = usize::from(window_rows(session.max_height, size.1));
+                if let Some(p) = pause.as_mut() {
+                    p.scroll = p.scroll.clamp(p.frozen.len(), window);
+                }
+                if let Some(ls) = live_scroll {
+                    let re = ls.reanchor(l.lines.len(), window);
+                    live_scroll = (!re.at_top()).then_some(re);
+                }
+                // The notice-row pattern: paint in place and take
+                // the key the paint returned, so the gate cannot be
+                // left behind. The gate itself cannot serve here —
+                // the content key is output-derived, so a pure
+                // reflow leaves it equal.
+                previous_key = Some(repaint(
+                    &mut renderer,
+                    pause.as_ref(),
+                    live_scroll,
+                    l,
+                    &live_tail,
+                    &palette,
+                    view,
+                    None,
+                    size,
+                    session.max_height,
+                    &faint,
+                    profile,
+                    &history,
+                )?);
+            }
+            if resize_gate.due(Instant::now()) {
+                // Every in-flight child was started under the
+                // superseded geometry and cannot satisfy this — the
+                // theme arm's argument. A respawn, not a plain request.
+                request_respawn_all(&mut runtime);
             }
         }
         // 4. How long we may sleep: never past the SOONEST deadline,
@@ -1886,6 +1962,55 @@ fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     true
 }
 
+/// The plain-watch spawn-step re-measure. A NO-OP when a resize arm is
+/// running: that arm is the geometry pair's only writer then — a
+/// spawn-step write would consume a coincident resize first and blind
+/// the arm's change detection (no reflow, no debounce fire, every
+/// not-due pane stranded at the superseded geometry).
+fn refresh_geometry_for_spawn(
+    resize_respawn: bool,
+    measured: (u16, u16),
+    size: &mut (u16, u16),
+    geom: &mut Vec<PaneGeometry>,
+    registry: &Registry,
+) {
+    if resize_respawn {
+        return;
+    }
+    *size = measured;
+    *geom = registry.geometry(measured);
+}
+
+/// What one resize detection observed.
+struct ResizeStep {
+    size_moved: bool,
+    geom_moved: bool,
+}
+
+/// The resize arm's detection: advance the geometry pair from a fresh
+/// measure and report what moved. The arm's reflow keys off
+/// `size_moved`; the respawn is owed only when a pane's INNER geometry
+/// moved — that is the child's environment, and a terminal that only
+/// grew rows changes the window, not any child's world.
+fn detect_resize(
+    measured: (u16, u16),
+    size: &mut (u16, u16),
+    geom: &mut Vec<PaneGeometry>,
+    registry: &Registry,
+) -> ResizeStep {
+    let size_moved = measured != *size;
+    *size = measured;
+    let next = registry.geometry(measured);
+    let geom_moved = next != *geom;
+    if geom_moved {
+        *geom = next;
+    }
+    ResizeStep {
+        size_moved,
+        geom_moved,
+    }
+}
+
 /// A pane's error prefix: empty for plain watch (whose messages are
 /// byte-frozen), the pane's name under a declared layout — at N the
 /// question "whose trigger/whose error?" has an answer.
@@ -2916,6 +3041,116 @@ mod tests {
             Due::Wait,
             "its neighbour stays parked"
         );
+    }
+
+    // The engine itself never names these two types (they live behind
+    // the registry contract), so the test module imports them
+    // explicitly — `use super::*` cannot supply them.
+    fn two_weighted_panes() -> Registry {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let spec = |name: &str| SourceSpec {
+            name: name.to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval: Some(Duration::from_secs(3600)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+        };
+        let pane = || PaneBox {
+            height: 5,
+            width: PaneWidth::Weight(1),
+            overflow: Overflow::KeepTop,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: true,
+        };
+        Registry::panes(
+            vec![spec("left"), spec("right")],
+            vec![pane(), pane()],
+            LayoutNode::Column(vec![LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ])]),
+            1,
+            0,
+        )
+        .expect("a valid two-pane registry")
+    }
+
+    #[test]
+    fn resizes_inside_one_window_collapse_to_one_respawn() {
+        // The gate is ANCHORED, not sliding: a burst of size changes
+        // inside one window owes ONE respawn, and the window does not
+        // move for the later fires.
+        let t = Instant::now();
+        let mut gate = DebounceGate::new(RESIZE_DEBOUNCE);
+        gate.fire(t);
+        gate.fire(t + Duration::from_millis(100));
+        gate.fire(t + Duration::from_millis(200));
+        assert!(
+            !gate.due(t + Duration::from_millis(200)),
+            "window still open"
+        );
+        assert!(gate.due(t + RESIZE_DEBOUNCE), "the window closes once");
+        assert!(!gate.due(t + RESIZE_DEBOUNCE), "and only once");
+    }
+
+    #[test]
+    fn a_respawn_request_reaches_every_source() {
+        // A debounced resize respawns ALL sources, because every
+        // in-flight child was started under the superseded geometry.
+        let t = Instant::now();
+        let mut schedules = [
+            TickSchedule::new(Some(Duration::from_secs(3600))),
+            TickSchedule::new(Some(Duration::from_secs(3600))),
+        ];
+        for s in &mut schedules {
+            assert_eq!(s.poll(t), Due::Spawn);
+            s.completed(t);
+            assert_eq!(s.poll(t), Due::Wait, "parked for an hour");
+        }
+        for s in &mut schedules {
+            s.request_respawn();
+        }
+        for s in &mut schedules {
+            assert_eq!(s.poll(t), Due::Spawn);
+        }
+    }
+
+    #[test]
+    fn a_coincident_spawn_does_not_blind_the_resize_arm() {
+        // The race, deterministically: ONE iteration in which a source
+        // is due AND the terminal has already moved. With a resize arm
+        // present the spawn step's writer is a no-op, so the arm still
+        // observes the change and owes the respawn-all.
+        let registry = two_weighted_panes();
+        let mut size = (80, 24);
+        let mut geom = registry.geometry(size);
+        let before = geom.clone();
+        refresh_geometry_for_spawn(true, (120, 24), &mut size, &mut geom, &registry);
+        assert_eq!(size, (80, 24), "the spawn step wrote nothing under panes");
+        assert_eq!(geom, before);
+        let step = detect_resize((120, 24), &mut size, &mut geom, &registry);
+        assert!(step.size_moved, "detection survived the coincident spawn");
+        assert!(
+            step.geom_moved,
+            "the inner widths moved, so a respawn is owed"
+        );
+        assert_ne!(geom, before, "the pair advanced exactly once, in the arm");
+    }
+
+    #[test]
+    fn plain_mode_still_measures_at_spawn() {
+        // The other half of the one-writer rule: without a resize arm
+        // the spawn-step writer is live, the shipped watch cadence.
+        let registry = two_weighted_panes();
+        let mut size = (80, 24);
+        let mut geom = registry.geometry(size);
+        refresh_geometry_for_spawn(false, (120, 24), &mut size, &mut geom, &registry);
+        assert_eq!(size, (120, 24), "plain re-measures when something spawns");
+        assert_eq!(geom, registry.geometry((120, 24)));
     }
 
     fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
