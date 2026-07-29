@@ -34,6 +34,9 @@ nucleo-matcher = "0.3.1"
 shell-words = "1.1"
 terminal-colorsaurus = "1.0"
 xterm-color = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.4"
+kdl = "6.7.1"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"

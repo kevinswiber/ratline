@@ -308,6 +308,19 @@ fn resolve_layout(rows: Option<&[Vec<String>]>, names: &[String]) -> anyhow::Res
     Ok(LayoutNode::Column(nodes))
 }
 
+/// Read + parse + validate. Format: the flag, else the file extension.
+pub fn load(path: &std::path::Path, format: Option<DeclFormat>) -> anyhow::Result<Registry> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let file = match format_for(path, format)? {
+        DeclFormat::Toml => crate::core::dashboard_toml::parse(&text),
+        DeclFormat::Kdl => crate::core::dashboard_kdl::parse(&text),
+    }
+    .with_context(|| format!("in {}", path.display()))?;
+    file.into_registry()
+        .with_context(|| format!("in {}", path.display()))
+}
+
 /// Which grammar a file is written in: the `--format` flag when given,
 /// otherwise the extension. `load` itself arrives with the two `parse`
 /// functions.
