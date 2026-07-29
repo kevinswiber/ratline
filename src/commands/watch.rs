@@ -583,7 +583,11 @@ pub(crate) fn run_registry(
                     current.panes.as_ref().map_or(&[][..], |p| &p.ages),
                 ),
             );
-            if previous_key != Some(key) {
+            // Once mode emits exactly ONE complete frame: a partial
+            // wave (some panes still running) composes and records but
+            // must not reach the terminal or the pipe.
+            let once_ready = !session.once || runtime.iter().all(|r| r.posted);
+            if once_ready && previous_key != Some(key) {
                 previous_key = Some(key);
                 if is_tty {
                     repaint(

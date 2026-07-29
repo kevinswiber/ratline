@@ -132,13 +132,25 @@ fn at(name: &str) -> String {
 }
 
 fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Result<SourceSpec> {
+    let shell = decl.shell.or(defaults.shell).unwrap_or(false);
+    // A command string is word-split (or kept verbatim) at PARSE time,
+    // under the shell mode in force where it was written. A pane that
+    // inherits the defaults' command while flipping `shell` would
+    // execute a wrongly-shaped argv — fail with the fix instead.
+    if decl.command.is_none() && shell != defaults.shell.unwrap_or(false) {
+        bail!(
+            "{}: inherits `command` from [defaults] but overrides `shell` — \
+             the inherited command was read under the defaults' shell mode; \
+             declare the pane's own `command`",
+            at(name)
+        );
+    }
     let command = decl
         .command
         .clone()
         .or_else(|| defaults.command.clone())
         .filter(|words| !words.is_empty())
         .ok_or_else(|| anyhow!("{}: needs a `command`", at(name)))?;
-    let shell = decl.shell.or(defaults.shell).unwrap_or(false);
 
     let triggers = decl
         .trigger
@@ -552,6 +564,66 @@ mod tests {
         let spec = registry.spec(SourceId(0));
         assert!(spec.shell);
         assert_eq!(spec.command, vec![script.to_string()]);
+    }
+
+    #[test]
+    fn an_inherited_command_with_an_overridden_shell_is_rejected() {
+        // The defaults' command string was word-split (or kept verbatim)
+        // under the DEFAULTS' shell mode at parse time; a pane that
+        // flips `shell` while inheriting it would execute a
+        // wrongly-shaped argv. Both directions error, teaching the fix.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(true),
+                command: Some(vec!["printf inherited".to_string()]),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                name: Some("plain".to_string()),
+                shell: Some(false),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let err = format!("{:#}", decl.into_registry().unwrap_err());
+        assert!(err.contains("plain"), "{err}");
+        assert!(err.contains("shell"), "{err}");
+        assert!(err.contains("command"), "{err}");
+
+        let reverse = DashboardFile {
+            defaults: PaneDecl {
+                command: Some(vec!["git".to_string(), "status".to_string()]),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                name: Some("shelly".to_string()),
+                shell: Some(true),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        assert!(reverse.into_registry().is_err());
+
+        // Matching modes inherit fine.
+        let ok = DashboardFile {
+            defaults: PaneDecl {
+                command: Some(vec!["date".to_string()]),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![
+                pane("fine", &["unused"]),
+                PaneDecl {
+                    name: Some("inheriting".to_string()),
+                    command: None,
+                    ..pane("inheriting", &["unused"])
+                },
+            ],
+            ..DashboardFile::default()
+        };
+        assert!(ok.into_registry().is_ok());
     }
 
     #[test]

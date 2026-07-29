@@ -464,3 +464,50 @@ trigger = ["file:{shared}"]
     // KillOnDrop reaps: kill only SENDS the signal, and an unreaped
     // child zombies (unix) and races tempdir cleanup.
 }
+
+/// `--once` prints ONE complete frame: a staggered pane must not make
+/// the partial composition reach the pipe first.
+#[test]
+fn once_emits_exactly_one_complete_frame() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = rat_bin().replace('\\', "\\\\");
+    let file = fixture(
+        dir.path(),
+        "staggered.toml",
+        &format!(
+            r#"
+row-gap = 0
+
+[defaults]
+height = 1
+chrome = false
+border = "none"
+
+[[pane]]
+name = "quick"
+command = ["{bin}", "style", "one"]
+
+[[pane]]
+name = "slow"
+command = ["{bin}", "__sleep", "300", "two"]
+"#
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert_eq!(
+        stdout.trim_end_matches('\n').split('\n').count(),
+        2,
+        "one frame, both panes: {stdout:?}"
+    );
+    assert_eq!(
+        stdout.matches("one").count(),
+        1,
+        "the quick pane printed once: {stdout:?}"
+    );
+    assert!(stdout.contains("two"), "the slow pane arrived: {stdout:?}");
+}

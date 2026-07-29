@@ -188,7 +188,7 @@ impl Registry {
                      already take {frame}: give it at least {}",
                     source.name,
                     pane.height,
-                    frame + 1
+                    frame.saturating_add(1)
                 );
             }
         }
@@ -655,6 +655,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(registry.geometry((80, 24))[0].cells, 20);
+    }
+
+    #[test]
+    fn an_unpayable_padding_is_an_error_not_a_panic() {
+        // Saturating arithmetic end to end: a padding that consumes
+        // more than u16 can hold must come back as the validation
+        // error, never an overflow panic.
+        let bloated = PaneBox {
+            padding: Sides {
+                top: usize::MAX,
+                right: 1,
+                bottom: usize::MAX,
+                left: 1,
+            },
+            ..pane(u16::MAX, PaneWidth::Weight(1))
+        };
+        let err = Registry::panes(vec![spec("pad")], vec![bloated], stacked(1), 1, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pad"), "names the pane: {err}");
     }
 
     #[test]
