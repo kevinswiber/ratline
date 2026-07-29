@@ -237,6 +237,7 @@ pub(crate) fn run_registry(
             output: None,
             hash: 0,
             changed_at: jiff::Timestamp::UNIX_EPOCH,
+            failure: None,
             posted: false,
         })
         .collect();
@@ -373,37 +374,65 @@ pub(crate) fn run_registry(
         let mut piped_stderr: Vec<u8> = Vec::new();
         while let Ok(outcome) = rx.try_recv() {
             let id = outcome.source;
-            let (stdout, stderr) = match outcome.spawn_error {
-                // Once mode fails loudly, before any paint; loop mode
-                // renders the failure as content so a transient error
-                // does not tear down the dashboard.
-                Some(err) if session.once => {
-                    return Err(anyhow!("running {:?}: {err}", registry.spec(id).command[0]).into());
-                }
-                Some(err) => (
-                    format!("watch: {:?}: {err}", registry.spec(id).command[0]).into_bytes(),
-                    Vec::new(),
-                ),
-                None => (outcome.stdout, outcome.stderr),
-            };
-            let mut combined = stdout.clone();
-            combined.extend_from_slice(&stderr);
-            let hash = signature(&combined);
-            let r = &mut runtime[id.0];
-            // A source's own rendered lines. Without panes this IS the
-            // whole frame — the shipped composer, shipped arguments,
-            // shipped bytes.
-            r.output = Some(match registry.composition() {
+            let hash = match registry.composition() {
                 Composition::Plain { .. } => {
-                    compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty)
+                    let (stdout, stderr) = match outcome.spawn_error {
+                        // Once mode fails loudly, before any paint; loop
+                        // mode renders the failure as content so a
+                        // transient error does not tear down the
+                        // dashboard. Plain-only: under panes a spawn
+                        // error is pane content, never an exit — a
+                        // dashboard with one broken pane must still
+                        // paint the others.
+                        Some(err) if session.once => {
+                            return Err(anyhow!(
+                                "running {:?}: {err}",
+                                registry.spec(id).command[0]
+                            )
+                            .into());
+                        }
+                        Some(err) => (
+                            spawn_error_text("watch", &registry.spec(id).command[0], &err)
+                                .into_bytes(),
+                            Vec::new(),
+                        ),
+                        None => (outcome.stdout, outcome.stderr),
+                    };
+                    let mut combined = stdout.clone();
+                    combined.extend_from_slice(&stderr);
+                    let hash = signature(&combined);
+                    // The single source's rendered lines ARE the frame —
+                    // the shipped composer, shipped arguments, shipped
+                    // bytes.
+                    runtime[id.0].output =
+                        Some(compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty));
+                    piped_stderr = stderr;
+                    hash
                 }
-                // A pane's stderr is already inside its own box, stdout
-                // then stderr — what the tty shows and what the pipe
-                // gets, so "whose stderr" never needs an answer and
-                // nothing writes to the terminal outside the frame
-                // engine.
-                Composition::Panes { .. } => output_lines(&stdout, &stderr),
-            });
+                Composition::Panes { .. } => {
+                    // A pane's failure fails inside its own box: the
+                    // spawn-error text as the body, the exit badge on
+                    // the chrome row — and the badge joins the pane's
+                    // hash, because a pane can print identical bytes
+                    // and START failing, and that is a displayed
+                    // change.
+                    let spec = registry.spec(id);
+                    let program = spec.command.first().map_or("", String::as_str);
+                    let lines = pane_body(
+                        &outcome.stdout,
+                        &outcome.stderr,
+                        outcome.spawn_error.as_ref(),
+                        &spec.name,
+                        program,
+                    );
+                    let r = &mut runtime[id.0];
+                    r.failure = exit_badge(outcome.status);
+                    let hash = body_signature(&lines, r.failure.as_deref());
+                    r.output = Some(lines);
+                    hash
+                }
+            };
+            let r = &mut runtime[id.0];
             // One clock per tick, stamped at COMPLETION on the worker:
             // the absolute stamp, the counting form, and the history
             // entry a scrub later shows all name the instant the
@@ -415,7 +444,6 @@ pub(crate) fn run_registry(
             r.hash = hash;
             r.changed_at = outcome.at;
             r.posted = true;
-            piped_stderr = stderr;
             drained.push(id);
         }
         if !drained.is_empty() {
@@ -1843,6 +1871,58 @@ fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     true
 }
 
+/// The looping spawn-error wording. `rat watch` passes `"watch"` and
+/// reproduces its shipped line byte for byte; a pane passes its own
+/// name, so the failure names itself inside its box.
+fn spawn_error_text(label: &str, program: &str, err: &std::io::Error) -> String {
+    format!("{label}: {program:?}: {err}")
+}
+
+/// One pane's body lines for one outcome: the spawn-error text when the
+/// command never started, otherwise the child's stdout FOLLOWED BY its
+/// stderr — that order is the rule, the generalization of shipped
+/// watch, which shows both regardless of exit. Trailing newlines are
+/// trimmed per stream, exactly as `compose_frame` does.
+fn pane_body(
+    stdout: &[u8],
+    stderr: &[u8],
+    spawn_error: Option<&std::io::Error>,
+    label: &str,
+    program: &str,
+) -> Vec<String> {
+    if let Some(err) = spawn_error {
+        return vec![spawn_error_text(label, program, err)];
+    }
+    output_lines(stdout, stderr)
+}
+
+/// The chrome row's failure badge: a nonzero exit, and nothing else. A
+/// spawn error's text IS the body, so it carries no badge; a successful
+/// tick returns `None`, which is how the badge clears.
+fn exit_badge(status: Option<std::process::ExitStatus>) -> Option<String> {
+    let status = status?;
+    (!status.success()).then(|| match status.code() {
+        Some(code) => format!("exit {code}"),
+        // A signalled child has no code; name the signal's absence
+        // rather than inventing one.
+        None => "killed".to_string(),
+    })
+}
+
+/// One pane's change signature: its body AND its failure badge, which
+/// is part of what the pane displays. A pane can print byte-identical
+/// output and start failing — without the badge in the pane's own hash,
+/// the composition would carry a badge nothing ever paints. The
+/// combining key stays outcome-derived and geometry-free.
+fn body_signature(lines: &[String], failure: Option<&str>) -> u64 {
+    let mut bytes = lines.join("\n").into_bytes();
+    if let Some(failure) = failure {
+        bytes.push(b'\n');
+        bytes.extend_from_slice(failure.as_bytes());
+    }
+    signature(&bytes)
+}
+
 /// The `Composition::Panes` compose step — ONE named function, because
 /// it has exactly three re-entrants: the collect step, the resize
 /// arm's reflow, and the counting-refresh path. Renders every source
@@ -1883,7 +1963,7 @@ fn compose_sources(
                 title: pane.title.as_deref().unwrap_or(&spec.name),
                 cadence: &cadence,
                 stamp: &stamp,
-                failure: None,
+                failure: source.failure.as_deref(),
             };
             render_pane(
                 source.output.as_deref().unwrap_or(&[]),
@@ -1963,6 +2043,8 @@ struct SourceRuntime {
     output: Option<Vec<String>>,
     hash: u64,
     changed_at: jiff::Timestamp,
+    /// The chrome row's failure badge ("exit 3"), derived per outcome.
+    failure: Option<String>,
     /// Whether this source has completed at least once — the once-mode
     /// exit condition at N sources.
     posted: bool,
@@ -2564,6 +2646,7 @@ mod tests {
             output: None,
             hash,
             changed_at: stamp(0),
+            failure: None,
             posted: false,
         }
     }
@@ -2691,6 +2774,68 @@ mod tests {
         let bare = help_lines("rat watch — keys", &[]);
         assert!(!bare.iter().any(|line| line.contains("trigger")));
         assert_eq!(lines[..bare.len()], bare[..]);
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::os::windows::process::ExitStatusExt::from_raw(code as u32)
+    }
+
+    #[test]
+    fn a_spawn_error_becomes_the_panes_body_and_carries_no_exit_badge() {
+        // A spawn error renders AS the error text. There is no exit
+        // code to badge — the child never started.
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            pane_body(&[], &[], Some(&err), "plan", "no-such-binary"),
+            vec![format!("plan: {:?}: {err}", "no-such-binary")]
+        );
+        assert_eq!(exit_badge(None), None);
+    }
+
+    #[test]
+    fn the_shipped_watch_wording_is_what_the_plain_label_produces() {
+        // `rat watch`'s looping spawn-error line is byte-frozen. The
+        // label is the only thing a pane changes.
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            spawn_error_text("watch", "no-such-binary", &err),
+            format!("watch: {:?}: {err}", "no-such-binary")
+        );
+    }
+
+    #[test]
+    fn a_nonzero_exit_shows_stdout_then_stderr_and_badges_the_code() {
+        // The direct generalization of shipped watch, which shows
+        // output and stderr regardless of exit — plus the badge.
+        assert_eq!(
+            pane_body(b"out-line\n", b"err-line\n", None, "plan", "prog"),
+            vec!["out-line".to_string(), "err-line".to_string()]
+        );
+        assert_eq!(exit_badge(Some(exit_status(3))).as_deref(), Some("exit 3"));
+    }
+
+    #[test]
+    fn a_successful_tick_clears_the_previous_failure() {
+        // The badge is derived per outcome, never accumulated: the tick
+        // after a failure carries None and the chrome row loses its
+        // badge.
+        assert_eq!(exit_badge(Some(exit_status(0))), None);
+    }
+
+    #[test]
+    fn a_badge_that_appears_without_a_body_change_still_moves_the_hash() {
+        // Same bytes, now failing: without the badge in the pane's hash
+        // the composition would carry a badge nothing ever paints.
+        let body = vec!["steady".to_string()];
+        assert_ne!(
+            body_signature(&body, None),
+            body_signature(&body, Some("exit 3"))
+        );
     }
 
     fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
