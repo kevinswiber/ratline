@@ -206,13 +206,26 @@ pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
     // `defaults` node anywhere in the document still supplies the
     // `shell` the command split depends on.
     let mut panes: Vec<(kdl::KdlNode, String)> = Vec::new();
+    let mut pane_index = 0usize;
     for node in doc.nodes() {
         match node.name().value() {
             "gap" => file.gap = Some(usize_field(node, "gap")?),
             "row-gap" => file.row_gap = Some(usize_field(node, "row-gap")?),
-            "defaults" => file.defaults = pane_block(node, None, false)?,
-            "pane" => panes.push((node.clone(), first_string(node)?)),
-            "layout" => file.layout = Some(layout_rows(node)?),
+            "defaults" => {
+                if !positional(node).is_empty() {
+                    bail!("defaults takes no name — it holds the keys every pane inherits");
+                }
+                file.defaults = pane_block(node, None, false)?;
+            }
+            "pane" => {
+                pane_index += 1;
+                let name = one_name(node, &format!("pane #{pane_index}"))?;
+                panes.push((node.clone(), name));
+            }
+            "layout" => {
+                refuse_container_properties(node, "layout", "a layout")?;
+                file.layout = Some(layout_rows(node)?);
+            }
             other => {
                 bail!("unknown node {other:?}: expected gap, row-gap, defaults, pane, or layout")
             }
@@ -256,6 +269,12 @@ fn pane_block(
             continue; // positional: the pane's own name
         };
         let prop = prop.value();
+        if let Some(ty) = entry.ty() {
+            bail!(
+                "{at}: the ({}) type annotation on `{prop}` has no meaning here — remove it",
+                ty.value()
+            );
+        }
         let Some(k) = key(prop) else {
             bail!(
                 "{at}: unknown property {prop:?} — a pane's keys with a property spelling are {}",
@@ -387,15 +406,72 @@ fn layout_rows(node: &kdl::KdlNode) -> anyhow::Result<Vec<LayoutDecl>> {
     children
         .nodes()
         .iter()
-        .map(|child| Ok(layout_node(child)?.normalized()))
+        .enumerate()
+        .map(|(index, child)| Ok(layout_node(child, index + 1)?.normalized()))
         .collect()
 }
 
-fn layout_node(node: &kdl::KdlNode) -> anyhow::Result<LayoutDecl> {
+/// The container's own name — `a row` / `a column` — for the errors that
+/// say what it holds.
+fn container_kind(node: &kdl::KdlNode) -> &'static str {
+    match node.name().value() {
+        "column" => "a column",
+        _ => "a row",
+    }
+}
+
+/// A container holds cells, never keys. `gap` gets its own answer
+/// because asking a row for a gap is a reasonable thing to try, and a
+/// per-row gap is a decision nobody has made yet.
+fn refuse_container_properties(node: &kdl::KdlNode, label: &str, kind: &str) -> anyhow::Result<()> {
+    let Some(entry) = node.entries().iter().find(|entry| entry.name().is_some()) else {
+        return Ok(());
+    };
+    let prop = entry.name().expect("filtered to properties").value();
+    if kind == "a layout" {
+        bail!("{label} takes no properties — a layout holds `row` and `column` blocks");
+    }
+    if prop == "gap" || prop == "row-gap" {
+        bail!(
+            "{label}: {kind} takes no properties — `{prop}` is the whole dashboard's, declared once at the top level as `{prop} 1`"
+        );
+    }
+    bail!(
+        "{label}: {kind} takes no properties, but {prop:?} is set — {kind} holds only `pane`, `row`, and `column` blocks"
+    )
+}
+
+/// A pane's name: exactly one string, unannotated. It is not an
+/// internal handle — it renders as the box title and reaches the child
+/// as `RAT_PANE` — so a second name or a number cannot be dropped.
+fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
+    if let Some(ty) = node.ty() {
+        bail!(
+            "{label}: the ({}) type annotation on a pane has no meaning here — remove it",
+            ty.value()
+        );
+    }
+    let values = positional(node);
+    match values.as_slice() {
+        [value] => value.as_string().map(str::to_string).ok_or_else(|| {
+            anyhow!("{label}: a pane's name is a string — write `pane \"log\" {{ … }}`")
+        }),
+        [first, second, ..] => bail!(
+            "{label}: a pane takes ONE name, but {} follows {}",
+            second.to_string().trim(),
+            first.to_string().trim()
+        ),
+        [] => bail!("{label}: this pane needs a name — write `pane \"log\" {{ … }}`"),
+    }
+}
+
+fn layout_node(node: &kdl::KdlNode, position: usize) -> anyhow::Result<LayoutDecl> {
+    let label = format!("{} #{position}", node.name().value());
+    refuse_container_properties(node, &label, container_kind(node))?;
     let mut cells: Vec<LayoutDecl> = strings(node)?.into_iter().map(LayoutDecl::Pane).collect();
     if let Some(children) = node.children() {
-        for child in children.nodes() {
-            cells.push(layout_node(child)?);
+        for (index, child) in children.nodes().iter().enumerate() {
+            cells.push(layout_node(child, index + 1)?);
         }
     }
     match node.name().value() {
@@ -422,26 +498,22 @@ fn strings(node: &kdl::KdlNode) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-fn first_string(node: &kdl::KdlNode) -> anyhow::Result<String> {
-    strings(node)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("{}: expected a value", node.name().value()))
-}
-
-fn first_int(node: &kdl::KdlNode) -> anyhow::Result<i128> {
-    node.entries()
-        .iter()
-        .find(|entry| entry.name().is_none())
-        .and_then(|entry| entry.value().as_integer())
-        .ok_or_else(|| anyhow!("{}: expected an integer", node.name().value()))
-}
-
 /// Checked, field-named conversion: a negative value must FAIL LOUDLY,
 /// never wrap — `as usize` would turn `gap -1` into a repeat count near
 /// usize::MAX, which `" ".repeat(gap)` would try to allocate.
 fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
-    usize::try_from(first_int(node)?).map_err(|_| anyhow!("{name} must be a non-negative integer"))
+    // A document setting's own two answers: it is a node, not a key, so
+    // it has no property spelling to offer.
+    if node.entries().iter().any(|entry| entry.name().is_some()) {
+        bail!("{name} takes no properties — write `{name} 1`");
+    }
+    let cells = match positional(node).as_slice() {
+        [value] => value
+            .as_integer()
+            .ok_or_else(|| anyhow!("{name} takes one integer — write `{name} 1`"))?,
+        _ => bail!("{name} takes one integer — write `{name} 1`"),
+    };
+    usize::try_from(cells).map_err(|_| anyhow!("{name} must be a non-negative integer"))
 }
 
 #[cfg(test)]
@@ -582,6 +654,111 @@ pane "all" {
         assert_eq!(pane.padding.as_deref(), Some("0 1"));
         assert_eq!(pane.title.as_deref(), Some("Recent commits"));
         assert_eq!(pane.chrome, Some(false));
+    }
+
+    /// I-52 at the pane's keys: a value of the wrong shape, or too many
+    /// of them, is refused rather than half-read.
+    #[test]
+    fn a_pane_key_takes_exactly_the_values_its_shape_allows() {
+        for (text, wanted) in [
+            (
+                "pane \"log\" {\n    command \"date\"\n    interval \"5s\" \"10s\"\n}\n",
+                "one string",
+            ),
+            (
+                "pane \"log\" {\n    command \"date\"\n    height \"7\"\n}\n",
+                "one integer",
+            ),
+            (
+                "pane \"log\" {\n    command \"date\"\n    chrome \"yes\"\n}\n",
+                "#true or #false",
+            ),
+            ("pane \"log\" {\n    command\n}\n", "one or more strings"),
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn gap_takes_one_integer_and_nothing_else() {
+        for (text, wanted) in [
+            ("gap x=1\n", "no properties"),
+            ("gap 1 2\n", "one integer"),
+            ("gap \"1\"\n", "one integer"),
+            ("gap -1\n", "non-negative"),
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn defaults_takes_no_name() {
+        let err = format!(
+            "{:#}",
+            parse("defaults \"x\" {\n    height 3\n}\n").unwrap_err()
+        );
+        assert!(err.contains("no name"), "{err}");
+    }
+
+    /// The top-level pane name was read with a first-one-wins helper, so
+    /// a second name or a non-string was silently dropped.
+    #[test]
+    fn a_top_level_pane_takes_exactly_one_string_name() {
+        for (text, wanted) in [
+            ("pane \"a\" \"b\" {\n    height 3\n}\n", "ONE name"),
+            ("pane 3 {\n    height 3\n}\n", "is a string"),
+            ("(u8)pane \"a\" {\n    height 3\n}\n", "type annotation"),
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn a_container_node_takes_no_properties() {
+        for text in [
+            "pane \"a\" {\n    height 3\n}\nlayout gap=2 {\n    row \"a\"\n}\n",
+            "pane \"a\" {\n    height 3\n}\nlayout {\n    row style=\"x\" \"a\"\n}\n",
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains("no properties"), "{err}");
+        }
+    }
+
+    /// A per-row gap is a real future request, so `row gap=2` must not
+    /// be quietly ignored — it says where the gap actually lives.
+    #[test]
+    fn a_row_property_says_the_gap_is_the_dashboards() {
+        let err = format!(
+            "{:#}",
+            parse("pane \"a\" {\n    height 3\n}\nlayout {\n    row gap=2 \"a\"\n}\n").unwrap_err()
+        );
+        assert!(err.contains("whole dashboard's"), "{err}");
+        assert!(err.contains("top level"), "{err}");
+    }
+
+    /// Slashdash is the kdl crate's job, and it does it before the walk
+    /// reaches us — commenting a key out must keep working.
+    #[test]
+    fn a_commented_out_key_is_not_a_declaration() {
+        let file = parse(
+            "pane \"log\" /-interval=\"15s\" {\n    command \"date\"\n    /-command \"old\"\n}\n",
+        )
+        .expect("parses");
+        assert_eq!(file.panes[0].interval, None);
+        assert_eq!(file.panes[0].command, Some(vec!["date".to_string()]));
+    }
+
+    #[test]
+    fn a_kdl_type_annotation_is_refused() {
+        let err = format!(
+            "{:#}",
+            parse("pane \"log\" height=(i64)7 {\n    command \"date\"\n}\n").unwrap_err()
+        );
+        assert!(err.contains("type annotation"), "{err}");
+        assert!(err.contains("(i64)"), "{err}");
     }
 
     /// The C equivalence proof: a scalar key means the same thing on
