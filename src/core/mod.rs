@@ -5,6 +5,7 @@ pub mod datetime;
 pub mod duration;
 pub mod fuzzy;
 pub mod join;
+pub mod layout;
 pub mod measure;
 pub mod pager;
 pub mod registry;
