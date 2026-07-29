@@ -1,6 +1,7 @@
 pub mod bar;
 pub mod box_model;
 pub mod child;
+pub mod dashboard_file;
 pub mod datetime;
 pub mod duration;
 pub mod fuzzy;
