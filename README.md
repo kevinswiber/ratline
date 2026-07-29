@@ -52,6 +52,37 @@ readable. The interval is the quiet time between runs: a command slower
 than its interval never overlaps itself — the next run simply waits its
 turn.
 
+Beside (or instead of) the interval, `--trigger` refreshes on an
+external event. The sweet spot is two speeds — a slow heartbeat for what
+only polling can see, a fast lane for what a file can announce:
+
+```sh
+# Refresh within a blink when state.json changes; poll the slow stuff
+# (network checks, git state) once a minute.
+rat watch -n 60s --trigger file:./state.json --trigger-debounce 1s -- ./render.sh
+
+# Event-driven only: omit -n and nothing runs until something fires.
+rat watch --trigger fifo:/tmp/rat.t -- ./render.sh   # echo go > /tmp/rat.t
+```
+
+Three sources, all repeatable: `file:PATH` stat-polls a file's mtime —
+or a directory's, taken together with its immediate entries — and works
+everywhere, including piped and on Windows; `fifo:PATH` reads a named
+pipe you create with `mkfifo` (any write fires it, writers may come and
+go); `fd:N` watches an inherited descriptor, composing with process
+substitution (`--trigger fd:3 3< <(producer)`) and firing one last
+notice when the descriptor ends. `fifo:` and `fd:` need an interactive
+unix terminal; `file:` is the portable form.
+
+Bursts collapse: `--trigger-debounce` (default `250ms`) turns any storm
+of fires inside the window into one refresh, scheduled from the first
+fire — an editor's multi-write save costs one run, and a file written
+continuously still repaints once per window. A fire landing while a run
+is already in flight never kills it; the fresh run starts the moment the
+stale one finishes. With a trigger configured the bottom row reads
+`every 60s or on trigger` (or just `on trigger`), and `?` lists the
+configured sources.
+
 Every tick, the child runs with `RAT_WIDTH` and `RAT_HEIGHT` set to the
 current terminal size, so scripts can adapt their layout (branch on width,
 or just pass `--fit` to `rat join`) and re-adapt live on resize. The child
