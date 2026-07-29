@@ -4,7 +4,7 @@
 
 use anyhow::{Context, anyhow, bail};
 
-use crate::core::dashboard_file::{DashboardFile, PaneDecl};
+use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
 
 /// Every node name a pane or `defaults` block accepts, in the order the
 /// teaching error lists them.
@@ -113,19 +113,34 @@ fn pane_block(
     Ok(decl)
 }
 
-/// `layout { row "a"; row "b" "c" }` → rows of pane names.
-fn layout_rows(node: &kdl::KdlNode) -> anyhow::Result<Vec<Vec<String>>> {
+/// `layout { row "a"; row "b" "c"; row { column "d" "e" } }` — a
+/// node's string arguments are pane leaves, its children are nested
+/// row/column blocks, appended after the arguments in source order.
+fn layout_rows(node: &kdl::KdlNode) -> anyhow::Result<Vec<LayoutDecl>> {
     let Some(children) = node.children() else {
         return Ok(Vec::new());
     };
     children
         .nodes()
         .iter()
-        .map(|row| match row.name().value() {
-            "row" => strings(row),
-            other => Err(anyhow!("unknown node {other:?} in layout: expected row")),
-        })
+        .map(|child| Ok(layout_node(child)?.normalized()))
         .collect()
+}
+
+fn layout_node(node: &kdl::KdlNode) -> anyhow::Result<LayoutDecl> {
+    let mut cells: Vec<LayoutDecl> = strings(node)?.into_iter().map(LayoutDecl::Pane).collect();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            cells.push(layout_node(child)?);
+        }
+    }
+    match node.name().value() {
+        "row" => Ok(LayoutDecl::Row(cells)),
+        "column" => Ok(LayoutDecl::Column(cells)),
+        other => Err(anyhow!(
+            "unknown node {other:?} in layout: expected row or column"
+        )),
+    }
 }
 
 /// Every positional argument of a node, as strings.
@@ -269,12 +284,44 @@ layout {
             ])
         );
         assert_eq!(from_kdl.defaults.height, Some(7));
+        use crate::core::dashboard_file::LayoutDecl;
         assert_eq!(
             from_kdl.layout,
             Some(vec![
-                vec!["clock".to_string()],
-                vec!["branch".to_string(), "notes".to_string()],
+                LayoutDecl::Pane("clock".to_string()),
+                LayoutDecl::Row(vec![
+                    LayoutDecl::Pane("branch".to_string()),
+                    LayoutDecl::Pane("notes".to_string()),
+                ]),
             ])
+        );
+    }
+
+    #[test]
+    fn nested_layout_blocks_match_the_toml_alternation() {
+        // KDL nests explicitly (row/column blocks); TOML nests by
+        // alternating arrays (rows hold columns hold rows...). Both
+        // must reach the same declaration or the grammars have
+        // diverged.
+        let toml = crate::core::dashboard_toml::parse(
+            "[[pane]]\nname = \"a\"\nheight = 3\ncommand = \"date\"\n\n[[pane]]\nname = \"b\"\nheight = 3\ncommand = \"date\"\n\n[[pane]]\nname = \"c\"\nheight = 3\ncommand = \"date\"\n\n[layout]\nrows = [ [ [\"a\", \"b\"], \"c\" ] ]\n",
+        )
+        .expect("toml parses");
+        let kdl = parse(
+            "pane \"a\" {\n    height 3\n    command \"date\"\n}\npane \"b\" {\n    height 3\n    command \"date\"\n}\npane \"c\" {\n    height 3\n    command \"date\"\n}\nlayout {\n    row {\n        column \"a\" \"b\"\n        column \"c\"\n    }\n}\n",
+        )
+        .expect("kdl parses");
+        assert_eq!(toml.layout, kdl.layout);
+        use crate::core::dashboard_file::LayoutDecl;
+        assert_eq!(
+            kdl.layout,
+            Some(vec![LayoutDecl::Row(vec![
+                LayoutDecl::Column(vec![
+                    LayoutDecl::Pane("a".to_string()),
+                    LayoutDecl::Pane("b".to_string()),
+                ]),
+                LayoutDecl::Pane("c".to_string()),
+            ])])
         );
     }
 
