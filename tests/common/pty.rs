@@ -118,6 +118,24 @@ impl PtySession {
         })
     }
 
+    /// Change the pty's window size mid-run — the resize the session
+    /// under test observes on its next terminal-size read. The one
+    /// addition dashboards needed here; everything else is shared with
+    /// the watch suite unchanged.
+    pub fn set_winsize(&self, rows: u16, cols: u16) {
+        let winsize = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: master_fd is a live pty master for self's lifetime;
+        // the winsize is a stack local the call copies from.
+        unsafe {
+            libc::ioctl(self.master_fd, libc::TIOCSWINSZ as _, &winsize);
+        }
+    }
+
     pub fn write_bytes(&self, bytes: &[u8]) {
         unsafe {
             libc::write(self.master_fd, bytes.as_ptr().cast(), bytes.len());
