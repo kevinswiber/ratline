@@ -66,6 +66,17 @@ struct Live {
     changed_at: jiff::Timestamp,
     /// `changed_at` as local HH:MM:SS, formatted once per change.
     since: String,
+    /// The pane surface, when this frame was composed from declared
+    /// boxes: the marks already in composed coordinates and each
+    /// chrome-bearing pane's last-change time. `None` under a plain
+    /// watch, forever.
+    panes: Option<PaneLive>,
+}
+
+/// A composed frame's retained pane surface.
+struct PaneLive {
+    marks: Vec<LineMark>,
+    ages: Vec<jiff::Timestamp>,
 }
 
 /// Everything the loop needs that is not per-source: paint knobs, mode
@@ -261,6 +272,8 @@ pub(crate) fn run_registry(
                 output: None,
                 hash: 0,
                 changed_at: jiff::Timestamp::UNIX_EPOCH,
+                previous: None,
+                marks: Vec::new(),
                 failure: None,
                 posted: false,
                 gate: DebounceGate::new(spec.debounce),
@@ -396,7 +409,7 @@ pub(crate) fn run_registry(
         let mut piped_stderr: Vec<u8> = Vec::new();
         while let Ok(outcome) = rx.try_recv() {
             let id = outcome.source;
-            let hash = match registry.composition() {
+            let changed_now = match registry.composition() {
                 Composition::Plain { .. } => {
                     let (stdout, stderr) = match outcome.spawn_error {
                         // Once mode fails loudly, before any paint; loop
@@ -423,13 +436,16 @@ pub(crate) fn run_registry(
                     let mut combined = stdout.clone();
                     combined.extend_from_slice(&stderr);
                     let hash = signature(&combined);
+                    let r = &mut runtime[id.0];
+                    let changed_now = hash != r.hash || !r.posted;
                     // The single source's rendered lines ARE the frame —
                     // the shipped composer, shipped arguments, shipped
                     // bytes.
-                    runtime[id.0].output =
-                        Some(compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty));
+                    r.output = Some(compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty));
+                    r.hash = hash;
+                    r.changed_at = outcome.at;
                     piped_stderr = stderr;
-                    hash
+                    changed_now
                 }
                 Composition::Panes { .. } => {
                     // A pane's failure fails inside its own box: the
@@ -437,7 +453,8 @@ pub(crate) fn run_registry(
                     // the chrome row — and the badge joins the pane's
                     // hash, because a pane can print identical bytes
                     // and START failing, and that is a displayed
-                    // change.
+                    // change. The comparand, marks, and last-change
+                    // stamp move only on a distinct output.
                     let spec = registry.spec(id);
                     let program = spec.command.first().map_or("", String::as_str);
                     let lines = pane_body(
@@ -448,10 +465,11 @@ pub(crate) fn run_registry(
                         program,
                     );
                     let r = &mut runtime[id.0];
+                    let old_hash = r.hash;
+                    let was_posted = r.posted;
                     r.failure = exit_badge(outcome.status);
-                    let hash = body_signature(&lines, r.failure.as_deref());
-                    r.output = Some(lines);
-                    hash
+                    record_output(r, lines, outcome.at);
+                    r.hash != old_hash || !was_posted
                 }
             };
             let r = &mut runtime[id.0];
@@ -461,10 +479,10 @@ pub(crate) fn run_registry(
             // content became current — even when the completion waited
             // (behind a pager, say) to be collected. Only a source
             // whose OWN content changed may re-date the frame.
-            changed = fold_changed_at(changed, hash != r.hash, outcome.at);
+            // Each branch settled its own hash and stamp; the fold only
+            // needs to know whether THIS source's content moved.
+            changed = fold_changed_at(changed, changed_now, outcome.at);
             newest = newest.max(outcome.at);
-            r.hash = hash;
-            r.changed_at = outcome.at;
             r.posted = true;
             drained.push(id);
         }
@@ -499,10 +517,24 @@ pub(crate) fn run_registry(
             // is tracked on every completion, so paging always acts on
             // the newest content. Combining the single source's output
             // is the identity — the bytes cannot drift.
-            let lines: Vec<String> = match registry.composition() {
-                Composition::Plain { .. } => runtime[0].output.clone().unwrap_or_default(),
+            let (lines, panes) = match registry.composition() {
+                Composition::Plain { .. } => (runtime[0].output.clone().unwrap_or_default(), None),
                 Composition::Panes { .. } => {
-                    compose_sources(&registry, &runtime, &geom, &palette, profile).lines
+                    let block = compose_sources(
+                        &registry,
+                        &runtime,
+                        &geom,
+                        view.alt_time,
+                        &palette,
+                        profile,
+                    );
+                    (
+                        block.lines,
+                        Some(PaneLive {
+                            marks: block.marks,
+                            ages: chrome_ages(&registry, &runtime),
+                        }),
+                    )
                 }
             };
             let current = Live {
@@ -510,6 +542,7 @@ pub(crate) fn run_registry(
                 hash: content,
                 changed_at,
                 since,
+                panes,
             };
             if is_tty {
                 // Every distinct frame is retained (byte-capped,
@@ -542,11 +575,12 @@ pub(crate) fn run_registry(
                 palette.appearance,
                 size,
                 view,
-                displayed_age(
+                displayed_age_key(
                     pause.as_ref(),
                     live_scroll,
                     view.alt_time,
                     current.changed_at,
+                    current.panes.as_ref().map_or(&[][..], |p| &p.ages),
                 ),
             );
             if previous_key != Some(key) {
@@ -670,7 +704,19 @@ pub(crate) fn run_registry(
                     // is output-derived and history records only
                     // collect-step compositions, so nothing here
                     // records and the stamps are untouched.
-                    l.lines = compose_sources(&registry, &runtime, &geom, &palette, profile).lines;
+                    let block = compose_sources(
+                        &registry,
+                        &runtime,
+                        &geom,
+                        view.alt_time,
+                        &palette,
+                        profile,
+                    );
+                    l.lines = block.lines;
+                    l.panes = Some(PaneLive {
+                        marks: block.marks,
+                        ages: chrome_ages(&registry, &runtime),
+                    });
                 }
                 // A frozen frame re-clamps only — it is a literal
                 // copy and is never re-laid-out; a live window
@@ -731,9 +777,31 @@ pub(crate) fn run_registry(
         // visible delta is the status row, so the repaint is bounded
         // to status-row bytes (and to none at all while the text
         // holds). Under the default stamps nothing here ever fires.
-        if let (Some(prev), Some(l)) = (previous_key, live.as_ref()) {
-            let want_age = displayed_age(pause.as_ref(), live_scroll, view.alt_time, l.changed_at);
+        if let Some(prev) = previous_key
+            && let Some(l) = live.as_ref()
+        {
+            let want_age = displayed_age_key(
+                pause.as_ref(),
+                live_scroll,
+                view.alt_time,
+                l.changed_at,
+                l.panes.as_ref().map_or(&[][..], |p| &p.ages),
+            );
             if prev.age_secs != want_age {
+                // A pane's counting stamp lives inside the composed
+                // lines, so the refresh recomposes before it repaints;
+                // under the default absolute style the key is 0 and
+                // none of this ever runs.
+                recompose_live(
+                    &mut live,
+                    &registry,
+                    &runtime,
+                    &geom,
+                    view.alt_time,
+                    &palette,
+                    profile,
+                );
+                let l = live.as_ref().expect("checked above");
                 previous_key = Some(repaint(
                     &mut renderer,
                     pause.as_ref(),
@@ -1051,7 +1119,9 @@ pub(crate) fn run_registry(
                         | WatchAction::ToggleGutter
                         | WatchAction::ToggleHighlight
                         | WatchAction::ToggleTime) => {
-                            let Some(live) = live.as_ref() else { continue };
+                            if live.is_none() {
+                                continue;
+                            }
                             // View state, not scrollback state: applies to
                             // live and frozen frames alike, never freezes
                             // the tail, repaints in place. Right shift is
@@ -1070,6 +1140,23 @@ pub(crate) fn run_registry(
                                 }
                                 _ => view.hshift += HSHIFT_STEP,
                             }
+                            if action == WatchAction::ToggleTime {
+                                // One style across the whole surface:
+                                // the footer's row is built at paint
+                                // time, but a pane's chrome row is
+                                // composed INTO the frame, so the flip
+                                // has to reach the composition.
+                                recompose_live(
+                                    &mut live,
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    view.alt_time,
+                                    &palette,
+                                    profile,
+                                );
+                            }
+                            let Some(live) = live.as_ref() else { continue };
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
                                 &mut renderer,
@@ -1543,7 +1630,13 @@ fn repaint(
     profile: ColorProfile,
     history: &History,
 ) -> anyhow::Result<PaintKey> {
-    let age_secs = displayed_age(pause, live_scroll, view.alt_time, live.changed_at);
+    let age_secs = displayed_age_key(
+        pause,
+        live_scroll,
+        view.alt_time,
+        live.changed_at,
+        live.panes.as_ref().map_or(&[][..], |p| &p.ages),
+    );
     let key = paint_key(
         pause,
         live_scroll,
@@ -1558,9 +1651,12 @@ fn repaint(
         (None, Some(ls)) => (live.lines.as_slice(), ls.offset(), FrameMode::LiveScrolled),
         (None, None) => (live.lines.as_slice(), 0, FrameMode::Live),
     };
-    // Marks compare the viewed frame against the previous DISTINCT
-    // frame — the pause's anchored entry (re-resolved through `nearest`
-    // when evicted), else the newest. No predecessor means no marks.
+    // Marks: a live pane surface shows the per-pane marks already
+    // composed into frame coordinates; a paused or scrubbed frame — and
+    // every plain-watch frame — compares the viewed composition against
+    // the previous DISTINCT frame: the pause's anchored entry
+    // (re-resolved through `nearest` when evicted), else the newest. No
+    // predecessor means no marks.
     let marks: Option<Vec<LineMark>> = (view.gutter || view.highlight).then(|| {
         let anchor = match pause {
             Some(p) => p
@@ -1569,7 +1665,13 @@ fn repaint(
             None => history.newest_seq(),
         };
         let prev = anchor.and_then(|seq| history.prev(seq));
-        changed_marks(prev.map(|e| e.frame.as_slice()), source)
+        paint_marks(
+            live.panes.is_some(),
+            mode,
+            live.panes.as_ref().map_or(&[][..], |p| &p.marks),
+            source,
+            prev.map(|e| e.frame.as_slice()),
+        )
     });
     // The accent rides the live theme system, so the cell is built at
     // paint time from the current palette, never cached.
@@ -2082,6 +2184,112 @@ fn body_signature(lines: &[String], failure: Option<&str>) -> u64 {
     signature(&bytes)
 }
 
+/// Record one source's fresh body. The comparand and the marks move
+/// ONLY on a distinct output — that is what makes a slow pane's mark
+/// outlive a fast pane's ticks — and so does the last-CHANGE stamp the
+/// chrome row shows. Marks are computed here, unconditionally, not
+/// lazily at paint time: they must already exist when the gutter is
+/// switched on, and per-pane diffs are strictly less work than the
+/// composed diff they replace.
+fn record_output(r: &mut SourceRuntime, lines: Vec<String>, at: jiff::Timestamp) {
+    // The failure badge is part of what the pane displays, so it joins
+    // this pane's hash: a badge that cannot repaint is invisible.
+    let hash = body_signature(&lines, r.failure.as_deref());
+    if r.output.is_none() || r.hash != hash {
+        r.previous = r.output.take();
+        r.marks = changed_marks(r.previous.as_deref(), &lines);
+        r.hash = hash;
+        r.changed_at = at;
+        r.output = Some(lines);
+    }
+}
+
+/// Which marks a paint uses. Under panes, a LIVE or LIVE-SCROLLED
+/// surface shows the per-pane marks already composed into frame
+/// coordinates; a PAUSED or SCRUBBED frame — and every plain-watch
+/// frame — diffs the viewed composition against its history
+/// predecessor, the only comparand a past composition has.
+fn paint_marks(
+    panes: bool,
+    mode: FrameMode,
+    live_marks: &[LineMark],
+    viewed: &[String],
+    prev: Option<&[String]>,
+) -> Vec<LineMark> {
+    if panes && mode != FrameMode::Paused {
+        return live_marks.to_vec();
+    }
+    changed_marks(prev, viewed)
+}
+
+/// Whole seconds every counting row is showing, folded into one gate
+/// value: today's number for a plain watch, a hash of (footer age,
+/// each pane's age) for a dashboard with `t` flipped — 0 under the
+/// default absolute style either way, which is what keeps a parked
+/// dashboard byte-silent.
+fn displayed_age_key(
+    pause: Option<&PauseState>,
+    live_scroll: Option<LiveScroll>,
+    alt_time: bool,
+    changed_at: jiff::Timestamp,
+    pane_changed_at: &[jiff::Timestamp],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let footer = displayed_age(pause, live_scroll, alt_time, changed_at);
+    // A frozen frame's pane chrome is frozen BYTES — a literal copy is
+    // never re-laid-out — so only the paused row can count while
+    // parked, and that is exactly today's number.
+    if !alt_time || pause.is_some() || pane_changed_at.is_empty() {
+        return footer;
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    footer.hash(&mut hasher);
+    for at in pane_changed_at {
+        age_seconds(*at).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Each chrome-bearing pane's last-change time, in registry order.
+/// Empty under a plain watch and under a dashboard whose panes all
+/// declare `chrome = false`: nothing on screen is counting.
+fn chrome_ages(registry: &Registry, runtime: &[SourceRuntime]) -> Vec<jiff::Timestamp> {
+    registry
+        .ids()
+        .filter(|id| registry.pane(*id).is_some_and(|p| p.chrome))
+        .map(|id| runtime[id.0].changed_at)
+        .collect()
+}
+
+/// Recompose the live frame in place from the retained outputs — the
+/// resize reflow, the `t` flip, and the 1 Hz counting refresh all
+/// re-enter the compose through here. Nothing is re-dated and nothing
+/// is recorded: history takes only collect-step compositions.
+#[allow(clippy::too_many_arguments)]
+fn recompose_live(
+    live: &mut Option<Live>,
+    registry: &Registry,
+    runtime: &[SourceRuntime],
+    geom: &[PaneGeometry],
+    alt_time: bool,
+    palette: &Palette,
+    profile: ColorProfile,
+) {
+    let Some(l) = live.as_mut() else {
+        return;
+    };
+    if matches!(registry.composition(), Composition::Plain { .. }) {
+        return;
+    }
+    let block = compose_sources(registry, runtime, geom, alt_time, palette, profile);
+    l.lines = block.lines;
+    l.panes = Some(PaneLive {
+        marks: block.marks,
+        ages: chrome_ages(registry, runtime),
+    });
+}
+
 /// The `Composition::Panes` compose step — ONE named function, because
 /// it has exactly three re-entrants: the collect step, the resize
 /// arm's reflow, and the counting-refresh path. Renders every source
@@ -2090,6 +2298,7 @@ fn compose_sources(
     registry: &Registry,
     runtime: &[SourceRuntime],
     geom: &[PaneGeometry],
+    alt_time: bool,
     palette: &Palette,
     profile: ColorProfile,
 ) -> PaneBlock {
@@ -2112,11 +2321,15 @@ fn compose_sources(
             let cadence = cadence_label(spec);
             // The last-CHANGE stamp, never last-produced: a produced-at
             // stamp would repaint every tick and cost byte-silence. A
-            // pane that has not run yet has no instant to name.
-            let stamp = if source.posted {
-                local_hms(source.changed_at)
-            } else {
+            // pane that has not run yet has no instant to name. `t`
+            // flips this row with the footer — one style across the
+            // whole surface.
+            let stamp = if !source.posted {
                 "…".to_string()
+            } else if alt_time {
+                age_text(age_seconds(source.changed_at))
+            } else {
+                local_hms(source.changed_at)
             };
             let chrome = PaneChrome {
                 title: pane.title.as_deref().unwrap_or(&spec.name),
@@ -2126,7 +2339,7 @@ fn compose_sources(
             };
             render_pane(
                 source.output.as_deref().unwrap_or(&[]),
-                &[],
+                &source.marks,
                 pane,
                 geom[id.0],
                 &chrome,
@@ -2202,6 +2415,13 @@ struct SourceRuntime {
     output: Option<Vec<String>>,
     hash: u64,
     changed_at: jiff::Timestamp,
+    /// The previous DISTINCT output — the mark comparand and nothing
+    /// else, which is what makes a slow pane's mark outlive a fast
+    /// pane's ticks.
+    previous: Option<Vec<String>>,
+    /// This source's marks against `previous`, in its own output
+    /// coordinates; recomputed only when the output changes.
+    marks: Vec<LineMark>,
     /// The chrome row's failure badge ("exit 3"), derived per outcome.
     failure: Option<String>,
     /// Whether this source has completed at least once — the once-mode
@@ -2813,6 +3033,8 @@ mod tests {
             output: None,
             hash,
             changed_at: stamp(0),
+            previous: None,
+            marks: Vec::new(),
             failure: None,
             posted: false,
             gate: DebounceGate::new(Duration::ZERO),
@@ -3151,6 +3373,114 @@ mod tests {
         refresh_geometry_for_spawn(false, (120, 24), &mut size, &mut geom, &registry);
         assert_eq!(size, (120, 24), "plain re-measures when something spawns");
         assert_eq!(geom, registry.geometry((120, 24)));
+    }
+
+    /// A timestamp `secs` in the past, without timestamp arithmetic.
+    fn ago(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() - secs)
+            .expect("timestamp in range")
+    }
+
+    impl SourceRuntime {
+        /// Enough runtime to drive the pure per-source state rules: no
+        /// interval, an empty slot, and a channel whose receiver is
+        /// dropped (nothing here ever sends).
+        fn for_test() -> SourceRuntime {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            SourceRuntime {
+                schedule: TickSchedule::new(None),
+                slot: ChildSlot::default(),
+                tx,
+                output: None,
+                hash: 0,
+                previous: None,
+                marks: Vec::new(),
+                changed_at: jiff::Timestamp::now(),
+                failure: None,
+                posted: false,
+                gate: DebounceGate::new(Duration::ZERO),
+                files: MtimeWatchSet::new(Vec::new()),
+                #[cfg(unix)]
+                readers: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    // A one-range vec like `vec![0..1]` is exactly what a single marked
+    // run looks like — not a mistyped `(0..1).collect()`.
+    #[allow(clippy::single_range_in_vec_init)]
+    fn a_paused_frame_marks_against_history_not_pane_outputs() {
+        // A past composition's only comparand is its history
+        // predecessor, so the per-pane vector must be ignored.
+        let prev = vec!["a".to_string(), "b".to_string()];
+        let viewed = vec!["a".to_string(), "B".to_string()];
+        // Deliberately wrong per-pane marks: a paused paint must not
+        // use them.
+        let stale = vec![
+            LineMark {
+                changed: true,
+                cells: vec![0..1],
+            },
+            LineMark::default(),
+        ];
+        let paused = paint_marks(true, FrameMode::Paused, &stale, &viewed, Some(&prev));
+        assert_eq!(paused, changed_marks(Some(&prev), &viewed));
+        assert!(!paused[0].changed, "row 0 did not change");
+        assert!(paused[1].changed, "row 1 did");
+        // Live and live-scrolled take the composed per-pane marks
+        // verbatim.
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(paint_marks(true, mode, &stale, &viewed, Some(&prev)), stale);
+        }
+        // Plain is unchanged in kind: always the composed-history diff.
+        assert_eq!(
+            paint_marks(false, FrameMode::Live, &stale, &viewed, Some(&prev)),
+            changed_marks(Some(&prev), &viewed)
+        );
+    }
+
+    #[test]
+    fn a_panes_comparand_moves_only_on_its_own_change() {
+        // The dwell rule as pure state: an identical tick moves nothing
+        // — not the comparand, not the marks, not the last-change
+        // stamp.
+        let t0 = ago(60);
+        let t1 = ago(30);
+        let mut r = SourceRuntime::for_test();
+        record_output(&mut r, vec!["one".to_string()], t0);
+        record_output(&mut r, vec!["two".to_string()], t1);
+        assert_eq!(r.previous.as_deref(), Some(&["one".to_string()][..]));
+        assert!(r.marks[0].changed);
+        assert_eq!(r.changed_at, t1);
+        // An identical re-run: nothing moves (the chrome stamp is
+        // last-CHANGE, never last-produced).
+        record_output(&mut r, vec!["two".to_string()], ago(0));
+        assert_eq!(r.changed_at, t1);
+        assert!(r.marks[0].changed, "the mark dwells past an unchanged tick");
+    }
+
+    #[test]
+    fn absolute_stamps_keep_the_age_key_zero() {
+        // The default style has no counting row anywhere, so the gate
+        // value is 0 and a parked dashboard stays byte-silent —
+        // whatever the panes' ages are.
+        let footer = ago(600);
+        let panes = [ago(600), ago(630)];
+        assert_eq!(displayed_age_key(None, None, false, footer, &panes), 0);
+        assert_eq!(displayed_age_key(None, None, false, footer, &[]), 0);
+        // Flipped, each pane's age is folded in — otherwise the refresh
+        // could never reach a pane's chrome row.
+        let older = [ago(600), ago(720)];
+        assert_ne!(
+            displayed_age_key(None, None, true, footer, &panes),
+            displayed_age_key(None, None, true, footer, &older)
+        );
+        // Plain keeps today's number exactly.
+        assert_eq!(
+            displayed_age_key(None, None, true, footer, &[]),
+            displayed_age(None, None, true, footer)
+        );
     }
 
     fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
