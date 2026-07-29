@@ -183,21 +183,21 @@ rat dashboard panes.kdl --once   # render one frame and exit
 ```
 
 The declaration file names each pane's command and cadence, shared
-defaults, and the layout, in KDL:
+defaults, and where each pane sits, in KDL:
 
 ```kdl
 gap 1
 
-defaults {
-    interval "5s"
-    border "rounded"
-    padding "0 1"
-    height 7
-}
+defaults interval="5s" border="rounded" padding="0 1" height=7
 
-pane "log" {
-    command "git" "log" "--oneline" "-3"
-    interval "15s"
+row {
+    pane "log" {
+        command "git" "log" "--oneline" "-3"
+        interval "15s"
+    }
+    pane "branch" {
+        command "git" "status" "--short" "--branch"
+    }
 }
 
 pane "clock" {
@@ -205,36 +205,39 @@ pane "clock" {
     interval "1s"
     height 4
 }
-
-layout {
-    row "log"
-    row "clock"
-}
 ```
 
-`[defaults]` supplies anything a pane omits. `name` is the pane's
-identity — its default title, and the value of `RAT_PANE` in the
-child's environment, so one script can serve every pane by dispatching
-on it. `command` is a string split like a shell word list, multiple
-arguments taken verbatim as argv, or a raw script string with
+A pane is declared inside the row or column that places it, so its name
+is written once. `defaults` supplies anything a pane omits. A pane's
+name is its identity — its default title, and the value of `RAT_PANE`
+in the child's environment, so one script can serve every pane by
+dispatching on it. `command` is a string split like a shell word list,
+multiple arguments taken verbatim as argv, or a raw script string with
 `shell #true`.
 
-The layout is a vertical stack of rows; a row is one or more panes side
-by side — and rows and columns nest to any depth, so grids need no
-second mechanism:
+Every key a `pane` or `defaults` block accepts holds exactly one value,
+so it may be written either as a property or as a child node —
+`interval="5s"` and `interval "5s"` mean the same thing, and the
+`defaults` line above is the property form of the same four keys.
+`command` and `trigger` hold lists, and a KDL property holds exactly
+one value, so those two are written as child nodes only.
+
+Panes at the top level stack; a `row` puts them side by side. Rows and
+columns nest to any depth, so grids need no second mechanism:
 
 ```kdl
-layout {
-    row {
-        column "log" "branch"
-        column "clock"
+row {
+    column {
+        pane "log" { … }
+        pane "branch" { … }
     }
+    pane "clock" { … }
 }
 ```
 
-Omit the layout and every pane stacks in declaration order. `gap` is
-the columns between panes in a row, `row-gap` the blank rows between
-rows.
+`gap` is the columns between panes in a row, `row-gap` the blank rows
+between rows; both belong to the whole dashboard and are written once
+at the top level.
 
 A pane may even run `rat dashboard … --once` as its child: the inner
 one-shot sizes itself to the pane through the handed-down `RAT_WIDTH`/
@@ -278,7 +281,7 @@ row that comes and goes.
 A runnable declaration lives at
 [`examples/panes.kdl`](examples/panes.kdl);
 [`examples/panes-nested.kdl`](examples/panes-nested.kdl) shows nested
-layout blocks and a dashboard-in-a-dashboard pane together.
+rows and columns and a dashboard-in-a-dashboard pane together.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 

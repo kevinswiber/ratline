@@ -1,6 +1,21 @@
 //! The KDL constructor. A `KdlDocument` walk to [`DashboardFile`] —
 //! parsing only; every rule lives once, in `into_registry`. KDL v2
 //! grammar (`#true` / `#false` for booleans).
+//!
+//! # The rule
+//!
+//! Every key a `pane` or `defaults` block accepts holds exactly one
+//! value, so it may be written as a property or as a child node,
+//! author's choice. `command`'s argv and `trigger`'s specs hold LISTS
+//! and have no property spelling, because a KDL property holds exactly
+//! one value. `row`, `column`, `gap` and `row-gap` are not keys —
+//! containers hold only cells, and `gap`/`row-gap` are the dashboard's,
+//! written once at the top level.
+//!
+//! It is written here, and in `examples/panes.kdl`'s header, because a
+//! rule that is real, uniform and mechanically enforced still reads as
+//! arbitrary to someone who has only ever met it as an error message
+//! (zellij shipped this exact seam undocumented — their #3629).
 
 use anyhow::{Context, anyhow, bail};
 
