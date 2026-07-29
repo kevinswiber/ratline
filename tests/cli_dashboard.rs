@@ -511,3 +511,37 @@ command = ["{bin}", "__sleep", "300", "two"]
     );
     assert!(stdout.contains("two"), "the slow pane arrived: {stdout:?}");
 }
+
+/// Piped mode honors the handed-down geometry: a nested one-shot
+/// dashboard sizes itself to its pane instead of a hardcoded 80
+/// columns.
+#[test]
+fn a_piped_dashboard_sizes_from_rat_width() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = rat_bin().replace('\\', "\\\\");
+    let file = fixture(
+        dir.path(),
+        "sized.toml",
+        &format!(
+            r#"
+[[pane]]
+name = "wide"
+height = 2
+chrome = false
+border = "none"
+command = ["{bin}", "style", "x"]
+"#
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "40")
+        .env("RAT_HEIGHT", "20")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    for line in stdout.trim_end_matches('\n').split('\n') {
+        assert_eq!(line.chars().count(), 40, "a 40-cell frame: {line:?}");
+    }
+}

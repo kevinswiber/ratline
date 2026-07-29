@@ -322,7 +322,7 @@ pub(crate) fn run_registry(
     // outlives the spawn branch — a completion can arrive in an
     // iteration with no new spawn, and the composer still needs an
     // in-scope geometry vector.
-    let mut size = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut size = measure_size(is_tty, (80, 24));
     let mut geom = registry.geometry(size);
     let mut resize_gate = DebounceGate::new(RESIZE_DEBOUNCE);
     let mut previous_key: Option<PaintKey> = None;
@@ -363,7 +363,7 @@ pub(crate) fn run_registry(
         if !due.is_empty() {
             refresh_geometry_for_spawn(
                 session.resize_respawn,
-                crossterm::terminal::size().unwrap_or(size),
+                measure_size(is_tty, size),
                 &mut size,
                 &mut geom,
                 &registry,
@@ -508,7 +508,7 @@ pub(crate) fn run_registry(
             // the arm keeps the pair fresh every iteration.
             refresh_geometry_for_spawn(
                 session.resize_respawn,
-                crossterm::terminal::size().unwrap_or(size),
+                measure_size(is_tty, size),
                 &mut size,
                 &mut geom,
                 &registry,
@@ -694,7 +694,7 @@ pub(crate) fn run_registry(
         // the new size first and blind this detection. Placement:
         // before the non-interactive branch, like the triggers.
         if session.resize_respawn {
-            let measured = crossterm::terminal::size().unwrap_or(size);
+            let measured = measure_size(is_tty, size);
             let step = detect_resize(measured, &mut size, &mut geom, &registry);
             if step.geom_moved {
                 resize_gate.fire(Instant::now());
@@ -2066,6 +2066,40 @@ fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     }
     *palette = Palette::builtin(reported, AppearanceSource::Notification);
     true
+}
+
+/// Where a frame's geometry comes from when the terminal cannot be
+/// measured: the RAT_WIDTH/RAT_HEIGHT a parent handed down, then the
+/// fallback. This is what lets a piped `rat dashboard --once` nested
+/// inside another dashboard's pane size itself to that pane instead of
+/// a hardcoded 80x24. Unparsable values fall through, not fail.
+fn size_fallback(
+    env_cols: Option<&str>,
+    env_rows: Option<&str>,
+    fallback: (u16, u16),
+) -> (u16, u16) {
+    let parse = |v: Option<&str>| v.and_then(|v| v.parse::<u16>().ok());
+    (
+        parse(env_cols).unwrap_or(fallback.0),
+        parse(env_rows).unwrap_or(fallback.1),
+    )
+}
+
+/// One measure of the frame's geometry. Interactive mode asks the
+/// terminal. Piped mode asks the CONSUMER first: the frame is being
+/// composed for whoever reads the pipe, and RAT_WIDTH/RAT_HEIGHT is
+/// that consumer saying how wide it is — the controlling terminal
+/// (still reachable through /dev/tty even when stdout is a pipe) is
+/// the wrong authority there.
+fn measure_size(is_tty: bool, fallback: (u16, u16)) -> (u16, u16) {
+    let measured = crossterm::terminal::size().ok();
+    if is_tty {
+        return measured.unwrap_or(fallback);
+    }
+    let base = measured.unwrap_or(fallback);
+    let cols = std::env::var("RAT_WIDTH").ok();
+    let rows = std::env::var("RAT_HEIGHT").ok();
+    size_fallback(cols.as_deref(), rows.as_deref(), base)
 }
 
 /// The plain-watch spawn-step re-measure. A NO-OP when a resize arm is
@@ -3488,6 +3522,21 @@ mod tests {
             displayed_age_key(None, None, true, footer, &[]),
             displayed_age(None, None, true, footer)
         );
+    }
+
+    #[test]
+    fn a_piped_frame_sizes_from_the_handed_down_geometry() {
+        // A piped dashboard cannot measure a terminal; before falling
+        // back to 80x24 it honors the RAT_WIDTH/RAT_HEIGHT its parent
+        // handed down — which is what lets a nested `rat dashboard
+        // --once` fill its pane instead of rendering at 80 columns and
+        // getting chopped.
+        assert_eq!(size_fallback(Some("60"), Some("20"), (80, 24)), (60, 20));
+        assert_eq!(size_fallback(Some("60"), None, (80, 24)), (60, 24));
+        assert_eq!(size_fallback(None, Some("20"), (80, 24)), (80, 20));
+        assert_eq!(size_fallback(None, None, (80, 24)), (80, 24));
+        // Garbage is ignored, not fatal: the fallback stands.
+        assert_eq!(size_fallback(Some("wide"), Some("-3"), (80, 24)), (80, 24));
     }
 
     fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
