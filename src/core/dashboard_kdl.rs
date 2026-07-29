@@ -310,7 +310,7 @@ fn parse_inline(doc: &kdl::KdlDocument) -> anyhow::Result<DashboardFile> {
     let mut panes = Vec::new();
     let mut items = Vec::with_capacity(tree.len());
     for (index, node) in tree.iter().enumerate() {
-        let label = format!("{} #{}", node.name().value(), index + 1);
+        let label = cell_label(None, node, index);
         items.push(inline_node(node, &label, default_shell, &mut panes)?.normalized());
     }
     file.panes = panes;
@@ -322,9 +322,20 @@ fn parse_inline(doc: &kdl::KdlDocument) -> anyhow::Result<DashboardFile> {
     Ok(file)
 }
 
+/// Where a cell sits, as a breadcrumb — `row #1 > pane #2`. Position is
+/// all a container knows about its cells, and often all a teaching error
+/// has to point with, since a pane may not have named itself yet.
+fn cell_label(inside: Option<&str>, node: &kdl::KdlNode, index: usize) -> String {
+    let here = format!("{} #{}", node.name().value(), index + 1);
+    match inside {
+        Some(path) => format!("{path} > {here}"),
+        None => here,
+    }
+}
+
 /// One node of the inline tree, lifting every pane it meets into
-/// `panes`. `label` is the node's position in the tree — the only handle
-/// a teaching error has on a pane that has not named itself yet.
+/// `panes`. Its name has already been screened as a cell — by the
+/// top-level match in `parse_inline`, or by the container below.
 fn inline_node(
     node: &kdl::KdlNode,
     label: &str,
@@ -339,9 +350,6 @@ fn inline_node(
         panes.push(pane_block(node, Some(name.clone()), default_shell)?);
         return Ok(LayoutDecl::Pane(name));
     }
-    if kind != "row" && kind != "column" {
-        bail!("{label}: unknown node {kind:?}: expected pane, row, or column");
-    }
     refuse_container_properties(node, label, container_kind(node))?;
     // A bare name here would be the old spelling leaking in: this row's
     // cells ARE the panes, and accepting a name would put one pane's
@@ -349,7 +357,7 @@ fn inline_node(
     if !positional(node).is_empty() {
         bail!(
             "{label}: a {kind} holds `pane` blocks, not pane names — \
-             declare the pane where it sits"
+             declare the pane where it sits, like `{kind} {{ pane \"log\" {{ … }} }}`"
         );
     }
     let cells = node
@@ -361,12 +369,23 @@ fn inline_node(
     }
     let mut decls = Vec::with_capacity(cells.len());
     for (index, cell) in cells.iter().enumerate() {
-        let inner = format!("{label} > {} #{}", cell.name().value(), index + 1);
+        let inner = cell_label(Some(label), cell, index);
+        // What may be a cell is the CONTAINER's rule, so the container
+        // is what the error names — `defaults` lands here too, since it
+        // is the document's settings and has no position in the geometry.
+        let cell_kind = cell.name().value();
+        if !matches!(cell_kind, "pane" | "row" | "column") {
+            bail!(
+                "{inner}: unknown node {cell_kind:?} — {} holds `pane`, `row`, and `column` blocks",
+                container_kind(node)
+            );
+        }
         decls.push(inline_node(cell, &inner, default_shell, panes)?);
     }
-    Ok(match kind {
-        "row" => LayoutDecl::Row(decls),
-        _ => LayoutDecl::Column(decls),
+    Ok(if kind == "row" {
+        LayoutDecl::Row(decls)
+    } else {
+        LayoutDecl::Column(decls)
     })
 }
 
@@ -572,6 +591,17 @@ fn refuse_container_properties(node: &kdl::KdlNode, label: &str, kind: &str) -> 
     )
 }
 
+/// A user's token, quoted the way the rest of the catalog quotes them.
+/// KDL v2 lets a string be written bare, and `KdlValue`'s own rendering
+/// takes that shortest form — which turns `pane "a" "b"` into an error
+/// about `b`, a token the file does not contain.
+fn as_written(value: &kdl::KdlValue) -> String {
+    match value.as_string() {
+        Some(text) => format!("{text:?}"),
+        None => value.to_string().trim().to_string(),
+    }
+}
+
 /// A pane's name: exactly one string, unannotated. It is not an
 /// internal handle — it renders as the box title and reaches the child
 /// as `RAT_PANE` — so a second name or a number cannot be dropped.
@@ -589,8 +619,8 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
         }),
         [first, second, ..] => bail!(
             "{label}: a pane takes ONE name, but {} follows {}",
-            second.to_string().trim(),
-            first.to_string().trim()
+            as_written(second),
+            as_written(first)
         ),
         [] => bail!("{label}: this pane needs a name — write `pane \"log\" {{ … }}`"),
     }
@@ -996,6 +1026,97 @@ pane "nested" {
             &implicit
                 .into_registry()
                 .expect("the implicit column validates"),
+        );
+    }
+
+    /// A cell that is not a cell is located by tree position, because
+    /// position is all a container knows about it — and often all the
+    /// pane has, since it may not have named itself yet. These assert
+    /// the WHOLE message: a teaching error that drifts a clause stops
+    /// teaching, and there is no second copy of the text to compare to.
+    fn container_err(text: &str) -> String {
+        format!("{:#}", parse(text).unwrap_err())
+    }
+
+    #[test]
+    fn an_inline_pane_needs_a_name_and_the_error_names_its_cell() {
+        assert_eq!(
+            container_err(
+                "row {\n    pane \"log\" {\n        command \"date\"\n    }\n    pane {\n        command \"date\"\n    }\n}\n"
+            ),
+            "row #1 > pane #2: this pane needs a name — write `pane \"log\" { … }`"
+        );
+    }
+
+    #[test]
+    fn a_pane_takes_one_name() {
+        assert_eq!(
+            container_err("row {\n    pane \"a\" \"b\" {\n        command \"date\"\n    }\n}\n"),
+            "row #1 > pane #1: a pane takes ONE name, but \"b\" follows \"a\""
+        );
+        assert_eq!(
+            container_err("row {\n    pane 3 {\n        command \"date\"\n    }\n}\n"),
+            "row #1 > pane #1: a pane's name is a string — write `pane \"log\" { … }`"
+        );
+    }
+
+    /// With the flat list gone a bare name refers to nothing, so the
+    /// error is a migration teacher: it shows the one spelling (D-3).
+    #[test]
+    fn a_row_holds_pane_blocks_not_pane_names() {
+        assert_eq!(
+            container_err("row \"log\"\n"),
+            "row #1: a row holds `pane` blocks, not pane names — declare the pane where it sits, like `row { pane \"log\" { … } }`"
+        );
+    }
+
+    #[test]
+    fn an_empty_container_says_to_put_a_pane_in_it() {
+        assert_eq!(
+            container_err("row {\n}\n"),
+            "row #1: this row is empty — put at least one pane in it"
+        );
+        assert_eq!(
+            container_err(
+                "row {\n    pane \"a\" {\n        command \"date\"\n    }\n    column {\n    }\n}\n"
+            ),
+            "row #1 > column #2: this column is empty — put at least one pane in it"
+        );
+    }
+
+    /// D-5: a per-row gap is a real future request, so `row gap=2` gets
+    /// its own answer rather than a generic refusal — the feature stays
+    /// an open decision instead of becoming a shipped lie.
+    #[test]
+    fn a_row_takes_no_properties() {
+        assert_eq!(
+            container_err(
+                "row style=\"x\" {\n    pane \"a\" {\n        command \"date\"\n    }\n}\n"
+            ),
+            "row #1: a row takes no properties, but \"style\" is set — a row holds only `pane`, `row`, and `column` blocks"
+        );
+        assert_eq!(
+            container_err("row gap=2 {\n    pane \"a\" {\n        command \"date\"\n    }\n}\n"),
+            "row #1: a row takes no properties — `gap` is the whole dashboard's, declared once at the top level as `gap 1`"
+        );
+    }
+
+    #[test]
+    fn an_unknown_node_in_a_row_names_the_three_it_holds() {
+        assert_eq!(
+            container_err("row {\n    panel {\n        command \"date\"\n    }\n}\n"),
+            "row #1 > panel #1: unknown node \"panel\" — a row holds `pane`, `row`, and `column` blocks"
+        );
+    }
+
+    /// D-1: `defaults` has no position in the geometry, so it lives at
+    /// the top level beside the tree — inside a container it is just an
+    /// unknown node.
+    #[test]
+    fn a_defaults_block_belongs_at_the_top_level() {
+        assert_eq!(
+            container_err("row {\n    defaults {\n        height 3\n    }\n}\n"),
+            "row #1 > defaults #1: unknown node \"defaults\" — a row holds `pane`, `row`, and `column` blocks"
         );
     }
 
