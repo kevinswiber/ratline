@@ -185,11 +185,14 @@ pub fn decode_ss3(final_byte: u8) -> Option<Key> {
 #[cfg(unix)]
 const READ_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Bounded wait for the reader to confirm it has parked: two slices plus
-/// slack. Past that the reader is unresponsive and the caller must not
-/// hand the terminal to a foreign reader.
+/// Bounded wait for the reader to confirm it has parked. This bounds
+/// only the FAILURE path — the common case returns the moment the
+/// parked flag flips (one read slice plus scheduling). Sized for a
+/// starved scheduler (a loaded CI runner missed 150ms repeatedly);
+/// past it the reader is treated as unresponsive and the caller must
+/// not hand the terminal to a foreign reader.
 #[cfg(unix)]
-const PARK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+const PARK_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(unix)]
 #[derive(Default)]

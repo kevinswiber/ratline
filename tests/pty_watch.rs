@@ -1834,12 +1834,13 @@ fn question_mark_pages_the_key_reference() {
     // success the design never promised.
     session.write_bytes(b"?");
     let mut seen: Vec<u8> = Vec::new();
-    let mut retries = 0;
+    let mut presses = 1;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut next_retry = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "expected the key reference in the pager (after {retries} retries)"
+            "expected the key reference in the pager (after {presses} presses)"
         );
         let chunk = session.read_available(Duration::from_millis(50));
         terminal.respond(&session, &chunk);
@@ -1847,10 +1848,13 @@ fn question_mark_pages_the_key_reference() {
         if contains(&seen, b"freeze the frame in place") {
             break;
         }
-        if contains(&seen, b"pager unavailable") && retries < 5 {
-            retries += 1;
-            seen.clear();
+        // A REPEATED refusal repaints an identical frame — zero bytes
+        // through the differ — so the retry rides a timer, never the
+        // notice text.
+        if std::time::Instant::now() >= next_retry && presses < 6 {
+            presses += 1;
             session.write_bytes(b"?");
+            next_retry = std::time::Instant::now() + Duration::from_secs(2);
         }
     }
     assert!(
