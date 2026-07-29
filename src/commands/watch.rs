@@ -111,7 +111,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         ..StyleSpec::default()
     };
 
-    let mut schedule = TickSchedule::new(interval);
+    let mut schedule = TickSchedule::new(Some(interval));
     let live_tail = live_suffix(args.once, &args.interval);
     let slot = ChildSlot::default();
     // Every exit from run() — return, `?`, panic — kills the in-flight
