@@ -337,3 +337,421 @@ command = "printf 'slow-%s' \"$(cat {slow})\""
         "the dashboard should have exited on q"
     );
 }
+
+/// Accumulate everything the session writes within `total` — unlike
+/// `read_available`, which returns at the first chunk. Duplicated from
+/// the watch suite's local helper, never lifted.
+fn drain_for(session: &PtySession, total: std::time::Duration) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + total;
+    let mut out = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return out;
+        }
+        out.extend(session.read_available(deadline - now));
+    }
+}
+
+/// Every `v`-prefixed six-digit counter value in the byte stream — the
+/// scrub fixture prints `v%06d`, monotonic and fixed-width, so ordering
+/// assertions are exact. Duplicated from the watch suite's local
+/// helper, never lifted.
+fn counter_values(bytes: &[u8]) -> Vec<u64> {
+    let mut vals = Vec::new();
+    let mut i = 0;
+    while i + 7 <= bytes.len() {
+        if bytes[i] == b'v' && bytes[i + 1..i + 7].iter().all(u8::is_ascii_digit) {
+            let s = std::str::from_utf8(&bytes[i + 1..i + 7]).expect("digits");
+            vals.push(s.parse().expect("six digits"));
+            i += 7;
+        } else {
+            i += 1;
+        }
+    }
+    vals
+}
+
+/// A stacked declaration: shared defaults plus (name, interval,
+/// command) panes in declaration order. With `panes_row` above, the
+/// only other place format-specific text lives — the format pick's
+/// deletion commit rewrites these builders together.
+fn board(defaults: &str, panes: &[(&str, &str, &str)]) -> String {
+    let mut body = format!("row-gap = 0\n\n[defaults]\n{defaults}\n");
+    for (name, interval, command) in panes {
+        body.push_str(&format!(
+            "\n[[pane]]\nname = \"{name}\"\ninterval = \"{interval}\"\ncommand = \"{command}\"\n"
+        ));
+    }
+    body
+}
+
+const STACKED: &str = "height = 5\nborder = \"none\"\nchrome = false\nshell = true";
+
+/// Per-source schedules and the min-nap: a 50ms pane and a 2s pane run
+/// at their own cadences instead of one shared clock.
+#[test]
+fn two_panes_tick_at_their_own_cadences() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fast = dir.path().join("fast");
+    let slow = dir.path().join("slow");
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            STACKED,
+            &[
+                ("fast", "50ms", &labeled_counter_cmd(&fast, "fast")),
+                ("slow", "2s", &labeled_counter_cmd(&slow, "slow")),
+            ],
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // ONE accumulated wait: the slow pane's first row appears exactly
+    // once (the differ never rewrites an unchanged row), so a second
+    // wait that starts fresh would miss it. The fast pane's presence
+    // rides the same bytes.
+    let first = wait_for_bytes(&session, &mut terminal, b"slow-1", Duration::from_secs(5))
+        .expect("the slow pane never painted");
+    assert!(contains(&first, b"fast-"), "the fast pane never painted");
+    // Child-side evidence across ~4s of real cadence — DRAINING the
+    // pty while waiting: a fast pane repaints continuously, and an
+    // undrained master fills its kernel buffer and blocks the loop's
+    // writer, stalling every schedule. A real terminal always reads;
+    // the harness must too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let _ = session.read_available(Duration::from_millis(50));
+        let n = std::fs::read_to_string(&slow)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if n >= 3 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "slow pane stalled at {n}"
+        );
+    }
+    let fast_runs = std::fs::read_to_string(&fast)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    let slow_runs = std::fs::read_to_string(&slow)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    // Declared ratio 40:1; a 4x floor tolerates ten-fold starvation
+    // while still failing loudly if the panes share one schedule.
+    assert!(slow_runs >= 3, "slow pane stalled at {slow_runs}");
+    assert!(
+        fast_runs >= 4 * slow_runs,
+        "the cadences collapsed: fast {fast_runs}, slow {slow_runs}"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// N independent slots behind one Vec of guards: q kills BOTH in-flight
+/// children (neither reaches its last act) and stops further spawns.
+#[test]
+fn q_shuts_down_every_pane_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count_a = dir.path().join("count-a");
+    let count_b = dir.path().join("count-b");
+    let fin_a = dir.path().join("fin-a");
+    let fin_b = dir.path().join("fin-b");
+    let child = |count: &std::path::Path, fin: &std::path::Path| {
+        // The counter line lands BEFORE the sleep; the finish touch is
+        // the child's last act, and a killed interpreter never reaches
+        // it.
+        format!(
+            "echo run >> {c}; /bin/sleep 1; : > {f}",
+            c = count.display(),
+            f = fin.display()
+        )
+    };
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            STACKED,
+            &[
+                ("a", "10s", &child(&count_a, &fin_a)),
+                ("b", "10s", &child(&count_b, &fin_b)),
+            ],
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // Answer the appearance probe while both children start.
+    let _ = wait_for(
+        &session,
+        &mut terminal,
+        b"never-painted",
+        Duration::from_millis(200),
+    );
+    wait_for_counter(&count_a, 1);
+    wait_for_counter(&count_b, 1);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+    // Neither slot leaked: no further spawns, and neither sleeping
+    // child survived to its last act.
+    assert_counter_settled_at(&count_a, 1);
+    assert_counter_settled_at(&count_b, 1);
+    assert!(!fin_a.exists(), "pane a's child outlived the shutdown");
+    assert!(!fin_b.exists(), "pane b's child outlived the shutdown");
+}
+
+/// A freeze is whole-dashboard: the frozen frame is byte-silent while
+/// BOTH children keep ticking behind it.
+#[test]
+fn p_freezes_the_whole_dashboard_while_children_keep_ticking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            STACKED,
+            &[
+                ("fast", "50ms", &labeled_counter_cmd(&a, "fast")),
+                ("slow", "120ms", &labeled_counter_cmd(&b, "slow")),
+            ],
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // ONE accumulated wait — see two_panes_tick_at_their_own_cadences.
+    let first = wait_for_bytes(&session, &mut terminal, b"slow-1", Duration::from_secs(5))
+        .expect("the slow pane never painted");
+    assert!(contains(&first, b"fast-"), "the fast pane never painted");
+    session.write_bytes(b"p");
+    assert!(
+        wait_for_bytes(
+            &session,
+            &mut terminal,
+            "paused ·".as_bytes(),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "p never froze the frame"
+    );
+    // Flush the freeze paint, then the pin: the frozen frame must be
+    // byte-silent — the default absolute stamps keep the chrome rows
+    // from counting, so a repaint here means a pane painted through
+    // the freeze.
+    let _ = drain_for(&session, Duration::from_millis(300));
+    let before_a = std::fs::read_to_string(&a)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    let before_b = std::fs::read_to_string(&b)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    let leaked = session.read_available(Duration::from_millis(400));
+    assert!(
+        leaked.is_empty(),
+        "a pane painted through the freeze: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
+    // …while both children kept running behind it.
+    wait_for_counter(&a, before_a + 2);
+    wait_for_counter(&b, before_b + 2);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// Esc resumes the WHOLE dashboard: both parked panes re-run exactly
+/// once. Only provable against parked panes — a fast pane's counter
+/// advances whether or not the resume requested anything.
+#[test]
+fn esc_resumes_and_reruns_every_pane_at_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            STACKED,
+            &[
+                ("a", "1h", &labeled_counter_cmd(&a, "a")),
+                ("b", "1h", &labeled_counter_cmd(&b, "b")),
+            ],
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"b-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    wait_for_counter(&a, 1);
+    wait_for_counter(&b, 1);
+    session.write_bytes(b"p");
+    assert!(
+        wait_for_bytes(
+            &session,
+            &mut terminal,
+            "paused ·".as_bytes(),
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "p never froze the frame"
+    );
+    session.write_bytes(b"\x1b");
+    // Both 1h panes can only run again if the resume requested every
+    // source; a resume that requested only the first hangs here.
+    wait_for_counter(&a, 2);
+    wait_for_counter(&b, 2);
+    // …and exactly once: no double-fire.
+    assert_counter_settled_at(&a, 2);
+    assert_counter_settled_at(&b, 2);
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// S writes the DISPLAYED mixed-age composition: the parked pane's
+/// stale row beside the fast pane's fresh one, at the declared row
+/// total, escapes stripped.
+#[test]
+fn s_snapshots_the_mixed_age_composition() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snaps = dir.path().join("snaps");
+    std::fs::create_dir(&snaps).expect("snapshot dir");
+    let fast = dir.path().join("fast");
+    let slow = dir.path().join("slow");
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            STACKED,
+            &[
+                ("fast", "50ms", &labeled_counter_cmd(&fast, "fast")),
+                ("slow", "1h", &labeled_counter_cmd(&slow, "slow")),
+            ],
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_SNAPSHOT_DIR", &snaps.display().to_string())],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // ONE accumulated wait — see two_panes_tick_at_their_own_cadences.
+    let first = wait_for_bytes(&session, &mut terminal, b"slow-1", Duration::from_secs(5))
+        .expect("the parked pane never painted");
+    assert!(contains(&first, b"fast-"), "the fast pane never painted");
+    session.write_bytes(b"S");
+    assert!(
+        wait_for(&session, &mut terminal, b"snapshot", Duration::from_secs(5)),
+        "expected the snapshot notice"
+    );
+    let entries: Vec<_> = std::fs::read_dir(&snaps)
+        .expect("read the snapshot dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one snapshot: {entries:?}");
+    let name = entries[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    // The shipped prefix, deliberately pinned: a dashboard session
+    // files a rat-watch-*.txt today — the alarm if that ever changes.
+    assert!(name.starts_with("rat-watch-"), "{name}");
+    assert!(name.ends_with(".txt"), "{name}");
+    let contents = std::fs::read_to_string(&entries[0]).expect("snapshot body");
+    assert!(
+        contents.contains("slow-1"),
+        "the stale pane composed: {contents:?}"
+    );
+    assert!(
+        contents.contains("fast-"),
+        "the fresh pane composed: {contents:?}"
+    );
+    assert_eq!(
+        contents.trim_end_matches('\n').split('\n').count(),
+        10,
+        "the declared row total survives: {contents:?}"
+    );
+    assert!(!contents.contains('\x1b'), "escapes stripped by default");
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// A scrub replays a DISPLAYED composition verbatim: a strictly older
+/// counter value, with the parked pane's row still in it.
+#[test]
+fn scrub_steps_distinct_composed_frames() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let slow = dir.path().join("slow");
+    let ticker = format!(
+        "echo x >> {c}; n=$(wc -l < {c}); printf 'v%06d' $n",
+        c = count.display()
+    );
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            "height = 1\nborder = \"none\"\nchrome = false\nshell = true",
+            &[
+                ("ticker", "50ms", &ticker),
+                ("slow", "1h", &labeled_counter_cmd(&slow, "slow")),
+            ],
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"v000001", Duration::from_secs(5)),
+        "the ticker never painted"
+    );
+    // Let history accrue distinct compositions.
+    let _ = drain_for(&session, Duration::from_millis(400));
+    session.write_bytes(b"<");
+    let scrub = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "paused ·".as_bytes(),
+        Duration::from_secs(5),
+    )
+    .expect("the scrub never parked");
+    let scrubbed = *counter_values(&scrub).last().expect("a scrubbed value");
+    assert!(
+        contains(&scrub, b"slow-1"),
+        "the replay carries the WHOLE composition: {:?}",
+        String::from_utf8_lossy(&scrub)
+    );
+    session.write_bytes(b"\x1b");
+    let live = drain_for(&session, Duration::from_millis(600));
+    let newest = counter_values(&live)
+        .into_iter()
+        .max()
+        .expect("a live value");
+    assert!(
+        scrubbed < newest,
+        "the scrubbed frame must be strictly older: {scrubbed} vs {newest}"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "the dashboard should have exited on q"
+    );
+}
