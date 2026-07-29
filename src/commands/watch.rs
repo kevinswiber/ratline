@@ -358,8 +358,18 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             renderer.finish().context("restoring terminal")?;
                             return Ok(());
                         }
-                        WatchAction::Page => {
+                        action @ (WatchAction::Page | WatchAction::Help) => {
                             let Some(live) = live.as_ref() else { continue };
+                            // ? pages the key reference through the same
+                            // ritual v pages the frame — one handoff path,
+                            // and search over the bindings comes free.
+                            let help;
+                            let content: &[String] = if action == WatchAction::Help {
+                                help = help_lines();
+                                &help
+                            } else {
+                                pause.as_ref().map_or(&live.lines, |p| &p.frozen)
+                            };
                             // The pager reads the same terminal. Stop the
                             // pushes first, then park our reader, so a report
                             // can never land in a foreign reader's input.
@@ -376,10 +386,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             #[cfg(windows)]
                             let handed_off = true;
                             let pager_notice = if handed_off {
-                                page_frame(
-                                    pause.as_ref().map_or(&live.lines, |p| &p.frozen),
-                                    &mut renderer,
-                                )
+                                page_frame(content, &mut renderer)
                             } else {
                                 Some(
                                     "pager unavailable: the input reader did not yield; try again"
@@ -731,6 +738,7 @@ enum WatchAction {
     Abort,
     Quit,
     Page,
+    Help,
     Snapshot,
     Resume,
     Freeze,
@@ -755,6 +763,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::CtrlC => WatchAction::Abort,
         Key::Char('q') => WatchAction::Quit,
         Key::Char('v') | Key::Enter => WatchAction::Page,
+        Key::Char('?') => WatchAction::Help,
         Key::Char('S') => WatchAction::Snapshot,
         Key::Char('j') | Key::Down => WatchAction::Scroll(ScrollStep::LineDown),
         Key::Char('k') | Key::Up => WatchAction::Scroll(ScrollStep::LineUp),
@@ -945,6 +954,39 @@ fn local_hms(t: jiff::Timestamp) -> String {
     t.to_zoned(jiff::tz::TimeZone::system())
         .strftime("%H:%M:%S")
         .to_string()
+}
+
+/// The key reference `?` pages: plain text, grouped the way the keys
+/// are learned. Content only — the pager owns presentation.
+fn help_lines() -> Vec<String> {
+    [
+        "rat watch — keys",
+        "",
+        "  q                  quit",
+        "  v, Enter           view the full frame in the pager",
+        "  ?                  this key reference",
+        "  S                  snapshot the viewed frame to a file",
+        "",
+        "  j/k, Up/Down       scroll one line (opens a live window)",
+        "  d/u                scroll half a window",
+        "  f/b, PgDn/PgUp     scroll a full window",
+        "  g, Home            top — and back to the live view",
+        "  G, End             bottom — stick to the tail",
+        "",
+        "  p                  freeze the frame in place (the command keeps running)",
+        "  Esc, F             resume the live tail",
+        "  <, ,               step back through distinct frames",
+        "  >, .               step forward again",
+        "",
+        "  w                  wrap or chop long lines",
+        "  h/l, Left/Right    shift the view horizontally",
+        "  D                  toggle the change gutter",
+        "  c                  toggle the change highlights",
+        "  t                  time style: wall-clock stamps or counting ages",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// The live status row: the truncation notice when rows are hidden,
@@ -1889,6 +1931,33 @@ mod tests {
         let cmd = build_command(&args, false, Appearance::Dark, (80, 24));
         assert_eq!(program_of(&cmd), "some-tool");
         assert_eq!(argv_of(&cmd), ["--flag", "value"]);
+    }
+
+    #[test]
+    fn question_mark_pages_the_key_help() {
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('?'), mode), WatchAction::Help);
+        }
+    }
+
+    #[test]
+    fn the_help_names_the_key_families() {
+        let text = help_lines().join("\n");
+        for needle in [
+            "quit",
+            "pager",
+            "snapshot",
+            "freeze the frame in place",
+            "resume the live tail",
+            "step back",
+            "wrap",
+            "gutter",
+            "highlights",
+            "counting ages",
+            "key reference",
+        ] {
+            assert!(text.contains(needle), "help must mention {needle:?}");
+        }
     }
 
     #[test]

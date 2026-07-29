@@ -150,6 +150,10 @@ mod tests {
             Some(Key::Char('D'))
         );
         assert_eq!(
+            from_crossterm(press(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            Some(Key::Char('?'))
+        );
+        assert_eq!(
             from_crossterm(press(KeyCode::Char('F'), KeyModifiers::SHIFT)),
             Some(Key::Char('F'))
         );

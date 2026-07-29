@@ -1811,6 +1811,43 @@ fn resuming_while_a_child_is_in_flight_collapses_at_once_and_never_doubles() {
     );
 }
 
+#[test]
+fn question_mark_pages_the_key_reference() {
+    // ? pages a plain-text key reference through the same pager path v
+    // uses — which also means search over the bindings comes free.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "50ms", "--", &rat_bin(), "style", "hi"],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected a first frame"
+    );
+    session.write_bytes(b"?");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"freeze the frame in place",
+            Duration::from_secs(2)
+        ),
+        "expected the key reference in the pager"
+    );
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected the frame back after the pager"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
 /// The last complete \r\n-delimited row containing `needle`.
 fn row_containing<'a>(bytes: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
     bytes
