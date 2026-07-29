@@ -24,6 +24,19 @@ pub enum TriggerSpec {
     Fd(i32),
 }
 
+impl std::fmt::Display for TriggerSpec {
+    /// The scheme-prefixed form the user wrote — what `?` lists.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(unix)]
+            TriggerSpec::Fifo(path) => write!(f, "fifo:{}", path.display()),
+            TriggerSpec::File(path) => write!(f, "file:{}", path.display()),
+            #[cfg(unix)]
+            TriggerSpec::Fd(n) => write!(f, "fd:{n}"),
+        }
+    }
+}
+
 /// `select(2)`'s hard ceiling: `FD_SET` on a descriptor at or past it
 /// writes out of bounds, so the guard lives at parse time.
 #[cfg(unix)]

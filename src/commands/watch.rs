@@ -131,7 +131,13 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     };
 
     let mut schedule = TickSchedule::new(interval);
-    let live_tail = live_suffix(args.once, args.interval.as_deref().unwrap_or("2s"));
+    // The footer label carries the user's own token; a defaulted interval
+    // reads as its literal default. Trigger-only mode has no token at all.
+    let interval_label = args
+        .interval
+        .as_deref()
+        .or(triggers.is_empty().then_some("2s"));
+    let live_tail = live_suffix(args.once, interval_label, !triggers.is_empty());
     let slot = ChildSlot::default();
     // Every exit from run() — return, `?`, panic — kills the in-flight
     // child through this guard's Drop. A NAMED binding: `let _ =`
@@ -387,7 +393,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             // and search over the bindings comes free.
                             let help;
                             let content: &[String] = if action == WatchAction::Help {
-                                help = help_lines();
+                                help = help_lines(&triggers);
                                 &help
                             } else {
                                 pause.as_ref().map_or(&live.lines, |p| &p.frozen)
@@ -998,9 +1004,10 @@ fn local_hms(t: jiff::Timestamp) -> String {
 }
 
 /// The key reference `?` pages: plain text, grouped the way the keys
-/// are learned. Content only — the pager owns presentation.
-fn help_lines() -> Vec<String> {
-    [
+/// are learned, plus the configured trigger sources when any exist.
+/// Content only — the pager owns presentation.
+fn help_lines(triggers: &[TriggerSpec]) -> Vec<String> {
+    let mut lines: Vec<String> = [
         "rat watch — keys",
         "",
         "  q                  quit",
@@ -1027,18 +1034,36 @@ fn help_lines() -> Vec<String> {
     ]
     .into_iter()
     .map(str::to_string)
-    .collect()
+    .collect();
+    if !triggers.is_empty() {
+        lines.push(String::new());
+        lines.push("  refresh triggers:".to_string());
+        for spec in triggers {
+            lines.push(format!("    {spec}"));
+        }
+    }
+    lines
 }
 
-/// The run-constant tail of every live row: the refresh cadence (so
-/// the next repaint can be anticipated) and the one discoverability
+/// The run-constant tail of every live row: the refresh mode (so the
+/// next repaint can be anticipated) and the one discoverability
 /// breadcrumb — everything else the footer used to advertise lives in
-/// the `?` reference now. Empty in once mode: no cadence, no keys.
-fn live_suffix(once: bool, interval: &str) -> String {
+/// the `?` reference now, including the trigger sources themselves.
+/// Empty in once mode: no cadence, no keys. Run-constant BY DESIGN: a
+/// countdown or fire counter would defeat the repaint gate.
+fn live_suffix(once: bool, interval: Option<&str>, triggered: bool) -> String {
     if once {
-        String::new()
-    } else {
-        format!(" · every {interval} · ? help")
+        return String::new();
+    }
+    match (interval, triggered) {
+        (Some(interval), false) => format!(" · every {interval} · ? help"),
+        (Some(interval), true) => format!(" · every {interval} or on trigger · ? help"),
+        (None, true) => " · on trigger · ? help".to_string(),
+        (None, false) => {
+            // Unrepresentable by the resolve_interval rule.
+            debug_assert!(false, "no interval and no trigger");
+            String::new()
+        }
     }
 }
 
@@ -1682,10 +1707,44 @@ mod tests {
 
     #[test]
     fn the_live_suffix_names_the_interval_and_help() {
-        assert_eq!(live_suffix(false, "2s"), " · every 2s · ? help");
-        assert_eq!(live_suffix(false, "500ms"), " · every 500ms · ? help");
+        // Today's bytes exactly, when no trigger exists.
+        assert_eq!(
+            live_suffix(false, Some("2s"), false),
+            " · every 2s · ? help"
+        );
+        assert_eq!(
+            live_suffix(false, Some("500ms"), false),
+            " · every 500ms · ? help"
+        );
         // Once mode has no cadence to anticipate and no keys to learn.
-        assert_eq!(live_suffix(true, "2s"), "");
+        assert_eq!(live_suffix(true, Some("2s"), false), "");
+    }
+
+    #[test]
+    fn the_live_suffix_names_the_trigger_modes() {
+        assert_eq!(
+            live_suffix(false, Some("60s"), true),
+            " · every 60s or on trigger · ? help"
+        );
+        assert_eq!(live_suffix(false, None, true), " · on trigger · ? help");
+        assert_eq!(live_suffix(true, None, true), ""); // once still empties it
+    }
+
+    #[test]
+    fn the_help_reference_names_the_trigger_sources() {
+        let specs = vec![TriggerSpec::File("/tmp/state.json".into())];
+        let lines = help_lines(&specs);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("file:/tmp/state.json")),
+            "{lines:?}"
+        );
+        // And stays clean when none are configured.
+        assert!(
+            !help_lines(&[]).iter().any(|line| line.contains("trigger")),
+            "the untriggered reference must not mention triggers"
+        );
     }
 
     #[test]
@@ -2022,7 +2081,7 @@ mod tests {
 
     #[test]
     fn the_help_names_the_key_families() {
-        let text = help_lines().join("\n");
+        let text = help_lines(&[]).join("\n");
         for needle in [
             "quit",
             "pager",
