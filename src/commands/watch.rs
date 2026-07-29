@@ -14,6 +14,7 @@ use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
+use crate::core::trigger::{TriggerSpec, parse_trigger};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::history::History;
@@ -51,7 +52,13 @@ struct Live {
 // reports; elsewhere it stays the startup verdict for the whole run.
 #[cfg_attr(windows, allow(unused_mut))]
 pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppResult {
-    let interval = parse_interval(&args.interval)?;
+    let triggers = args
+        .trigger
+        .iter()
+        .map(|spec| parse_trigger(spec))
+        .collect::<anyhow::Result<Vec<TriggerSpec>>>()?;
+    let interval = resolve_interval(args.interval.as_deref(), !triggers.is_empty())?;
+    let _debounce = parse_interval(&args.trigger_debounce)?;
     let (interrupted, terminated) = register_signals()?;
 
     let stdout = std::io::stdout();
@@ -66,6 +73,18 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     // The looping tty mode reads keys (q quits, v pages the full frame), so
     // it owns the terminal input; children must not compete for it.
     let interactive = is_tty && !args.once;
+    // The event-wait routes need a terminal to wake; only the stat-poll
+    // works piped, so the other schemes refuse early, before any
+    // terminal state changes.
+    if !interactive
+        && triggers
+            .iter()
+            .any(|trigger| !matches!(trigger, TriggerSpec::File(_)))
+    {
+        return Err(
+            anyhow!("fifo:/fd: triggers need an interactive terminal; use file:PATH").into(),
+        );
+    }
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -111,8 +130,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         ..StyleSpec::default()
     };
 
-    let mut schedule = TickSchedule::new(Some(interval));
-    let live_tail = live_suffix(args.once, &args.interval);
+    let mut schedule = TickSchedule::new(interval);
+    let live_tail = live_suffix(args.once, args.interval.as_deref().unwrap_or("2s"));
     let slot = ChildSlot::default();
     // Every exit from run() — return, `?`, panic — kills the in-flight
     // child through this guard's Drop. A NAMED binding: `let _ =`
@@ -960,6 +979,17 @@ fn paused_time_segment(alt_time: bool, viewed_at: jiff::Timestamp, age_secs: u64
     }
 }
 
+/// The one home of the interval's meaning beside triggers: the user's
+/// token always wins; no token means today's 2s default — unless a
+/// trigger exists, which makes polling opt-in (`None` = trigger-only).
+fn resolve_interval(user: Option<&str>, triggered: bool) -> anyhow::Result<Option<Duration>> {
+    match (user, triggered) {
+        (Some(token), _) => Ok(Some(parse_interval(token)?)),
+        (None, false) => Ok(Some(Duration::from_secs(2))),
+        (None, true) => Ok(None),
+    }
+}
+
 /// `t` as local wall-clock HH:MM:SS — the `since` stamp's format.
 fn local_hms(t: jiff::Timestamp) -> String {
     t.to_zoned(jiff::tz::TimeZone::system())
@@ -1470,6 +1500,19 @@ mod tests {
     const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
 
     #[test]
+    fn the_interval_resolves_by_the_trigger_rule() {
+        // (user token, has triggers) -> resolved. The user's token always
+        // wins; no token means today's 2s default — unless a trigger
+        // exists, which makes polling opt-in.
+        let secs = |n| Some(Duration::from_secs(n));
+        assert_eq!(resolve_interval(Some("5s"), false).unwrap(), secs(5));
+        assert_eq!(resolve_interval(Some("5s"), true).unwrap(), secs(5));
+        assert_eq!(resolve_interval(None, false).unwrap(), secs(2));
+        assert_eq!(resolve_interval(None, true).unwrap(), None); // trigger-only
+        assert!(resolve_interval(Some("bogus"), false).is_err());
+    }
+
+    #[test]
     fn todays_keys_mean_the_same_thing_in_every_mode() {
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::CtrlC, mode), WatchAction::Abort);
@@ -1912,7 +1955,9 @@ mod tests {
 
     fn watch_args(command: &[&str], shell: bool) -> WatchArgs {
         WatchArgs {
-            interval: "2s".to_string(),
+            interval: Some("2s".to_string()),
+            trigger: Vec::new(),
+            trigger_debounce: "250ms".to_string(),
             once: false,
             clear: false,
             no_hide_cursor: false,

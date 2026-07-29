@@ -347,3 +347,55 @@ fn a_signal_ends_a_piped_watch_during_a_slow_child() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+#[test]
+fn a_trigger_conflicts_with_once() {
+    rat()
+        .args([
+            "watch",
+            "--once",
+            "--trigger",
+            "file:/tmp/x",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--once"));
+}
+
+#[test]
+fn a_trigger_debounce_requires_a_trigger() {
+    rat()
+        .args([
+            "watch",
+            "--trigger-debounce",
+            "1s",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--trigger <SPEC>"));
+}
+
+#[test]
+fn a_bare_path_trigger_spec_teaches_the_schemes() {
+    rat()
+        .args([
+            "watch",
+            "--trigger",
+            "/tmp/x",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("file:"));
+}
