@@ -399,3 +399,85 @@ fn a_bare_path_trigger_spec_teaches_the_schemes() {
         .failure()
         .stderr(predicates::str::contains("file:"));
 }
+
+/// Stream the piped watch's stdout through a channel so waiting for a
+/// frame is bounded: a blocking read cannot swallow the deadline.
+fn stdout_stream(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Drain the stream until the needle appears — a missing frame is a
+/// clean failure, never a hang.
+fn read_until(stream: &std::sync::mpsc::Receiver<Vec<u8>>, seen: &mut String, needle: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if seen.contains(needle) {
+            return;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "never saw {needle:?} in {seen:?}");
+        match stream.recv_timeout(left) {
+            Ok(chunk) => seen.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(_) => panic!("never saw {needle:?} in {seen:?}"),
+        }
+    }
+}
+
+/// Reap the watch even when an assertion panics: an orphaned watch
+/// holds the harness's stdout pipe open and hangs the whole run.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The portable trigger proof: a file change refreshes a PIPED watch —
+/// the stat-poll runs before the non-interactive sleep, so event-driven
+/// append-to-a-log works without a terminal, on every platform.
+#[test]
+fn a_file_trigger_refreshes_a_piped_watch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let watched = dir.path().join("state");
+    std::fs::write(&watched, "v0").expect("seed");
+    // -n 1h parks the heartbeat out of the way: any second frame is the
+    // trigger's doing, not the interval's.
+    let watch = std::process::Command::new(rat_bin())
+        .args([
+            "watch",
+            "-n",
+            "1h",
+            "--trigger",
+            &format!("file:{}", watched.display()),
+            "--trigger-debounce",
+            "0ms",
+            "--",
+            &rat_bin(),
+            "__cat",
+            &watched.display().to_string(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat watch piped");
+    let mut watch = KillOnDrop(watch);
+    let stream = stdout_stream(watch.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "v0"); // the immediate first tick
+    std::fs::write(&watched, "v1").expect("mtime change");
+    read_until(&stream, &mut seen, "v1"); // the trigger-driven frame
+    // The guard's Drop kills and reaps — kill only SENDS the signal, and
+    // an unreaped child would zombie (unix) and race tempdir cleanup.
+}

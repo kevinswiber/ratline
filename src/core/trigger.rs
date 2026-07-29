@@ -4,10 +4,6 @@
 //! what can be tested without a terminal — the scheme grammar and its
 //! teaching errors.
 
-// The watch CLI surface consumes this module in the commits that follow;
-// the allow comes off with that wiring.
-#![allow(dead_code)]
-
 use anyhow::{anyhow, bail};
 
 /// One parsed `--trigger` source.

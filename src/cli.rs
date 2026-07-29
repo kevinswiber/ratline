@@ -77,6 +77,17 @@ pub enum Command {
     #[cfg(debug_assertions)]
     #[command(name = "__env", hide = true)]
     Env(EnvArgs),
+    /// Test harness: print a file's bytes — a portable cat for watch
+    /// children whose output must track a file's content.
+    #[cfg(debug_assertions)]
+    #[command(name = "__cat", hide = true)]
+    Cat(CatArgs),
+}
+
+#[cfg(debug_assertions)]
+#[derive(clap::Args)]
+pub struct CatArgs {
+    pub file: std::path::PathBuf,
 }
 
 #[cfg(debug_assertions)]
