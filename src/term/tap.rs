@@ -210,8 +210,6 @@ pub enum TapChunk {
     /// Raw bytes from the terminal device.
     Tty(Vec<u8>),
     /// A trigger reader's wake.
-    // The trigger reader lands in the next commit; the allow goes with it.
-    #[allow(dead_code)]
     Trigger,
 }
 
@@ -225,8 +223,6 @@ pub struct TtyTap {
     rx: std::sync::mpsc::Receiver<TapChunk>,
     /// A handle for foreign wakers (`sender()`); the terminal reader
     /// holds its own clone.
-    // The trigger reader lands in the next commit; the allow goes with it.
-    #[allow(dead_code)]
     tx: std::sync::mpsc::Sender<TapChunk>,
     control: std::sync::Arc<TapControl>,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -254,8 +250,6 @@ impl TtyTap {
     }
 
     /// A sender foreign wakers may post `TapChunk::Trigger` through.
-    // The trigger reader lands in the next commit; the allow goes with it.
-    #[allow(dead_code)]
     pub fn sender(&self) -> std::sync::mpsc::Sender<TapChunk> {
         self.tx.clone()
     }
@@ -585,5 +579,282 @@ mod tests {
     fn decode_key_has_no_verdict_for_escape_or_delete() {
         assert_eq!(decode_key(0x1b), None);
         assert_eq!(decode_key(0x7f), None);
+    }
+}
+
+/// A reader thread for one fifo/fd trigger source. Its outputs are
+/// exactly: the `fired` flag (rising-edge) and at most one
+/// `TapChunk::Trigger` wake per rising edge — it never touches the
+/// terminal, loop state, or the schedule. `ended` reports EOF or a
+/// terminal error; a fifo source never ends, because the reader's own
+/// dummy write end holds the pipe open by design — external writers
+/// may come and go and each later write keeps working.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct TriggerReader {
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl TriggerReader {
+    /// Open a fifo/fd source and start its reader. `wake` (the tap's
+    /// `sender()`) buys an immediate wake of the event wait; without it
+    /// (a failed tap spawn, or a unit test) the fired flag alone
+    /// signals, read once per loop slice.
+    pub fn open(
+        spec: &crate::core::trigger::TriggerSpec,
+        wake: Option<std::sync::mpsc::Sender<TapChunk>>,
+    ) -> anyhow::Result<TriggerReader> {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
+
+        use anyhow::{anyhow, bail};
+
+        use crate::core::trigger::TriggerSpec;
+
+        // The fds the loop selects and reads; files are moved into the
+        // thread so their descriptors outlive the setup.
+        let (fd, keep_alive) = match spec {
+            TriggerSpec::Fifo(path) => {
+                let read_end = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)
+                    .map_err(|err| match err.kind() {
+                        std::io::ErrorKind::NotFound => anyhow!(
+                            "trigger fifo {} does not exist; create it with: mkfifo {}",
+                            path.display(),
+                            path.display()
+                        ),
+                        _ => anyhow!("opening trigger fifo {}: {err}", path.display()),
+                    })?;
+                if !read_end.metadata()?.file_type().is_fifo() {
+                    bail!(
+                        "fifo:{} is not a named pipe; use file:{} for plain paths",
+                        path.display(),
+                        path.display()
+                    );
+                }
+                // The EOF-spin fix: a fifo with no writer reports
+                // readable and reads 0 forever. Holding our own
+                // non-blocking write end (legal exactly because we are
+                // already a reader) keeps EOF away for the whole run.
+                let write_end = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(path)?;
+                (read_end.as_raw_fd(), vec![read_end, write_end])
+            }
+            TriggerSpec::Fd(fd) => {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*fd, &mut stat) } != 0 {
+                    bail!("fd:{fd} is not an open descriptor");
+                }
+                if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+                    bail!(
+                        "fd:{fd} is a regular file, which select(2) always reports \
+                         ready; use file:PATH to watch a file"
+                    );
+                }
+                (*fd, Vec::new())
+            }
+            TriggerSpec::File(_) => bail!("file: triggers are polled, not read"),
+        };
+
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_fired = std::sync::Arc::clone(&fired);
+        let thread_ended = std::sync::Arc::clone(&ended);
+        let thread_shutdown = std::sync::Arc::clone(&shutdown);
+        let reader = std::thread::Builder::new()
+            .name("rat-trigger".to_string())
+            .spawn(move || {
+                let _keep_alive = keep_alive;
+                trigger_read_loop(fd, &thread_fired, &thread_ended, &thread_shutdown, wake);
+            })?;
+        Ok(TriggerReader {
+            fired,
+            ended,
+            shutdown,
+            reader: Some(reader),
+        })
+    }
+
+    pub fn fired(&self) -> &std::sync::atomic::AtomicBool {
+        &self.fired
+    }
+
+    pub fn ended(&self) -> &std::sync::atomic::AtomicBool {
+        &self.ended
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TriggerReader {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(reader) = self.reader.take() {
+            // Bounded by one slice: the reader never blocks on a read
+            // it has not selected for first.
+            let _ = reader.join();
+        }
+    }
+}
+
+/// The reader's loop: select with a bounded slice, drain, raise the
+/// flag on the rising edge. End discipline: EOF (`read == 0`) or any
+/// terminal select/read error sets `ended` and exits — a dead source
+/// must never spin silently; transient EINTR/EAGAIN are retried.
+#[cfg(unix)]
+fn trigger_read_loop(
+    fd: i32,
+    fired: &std::sync::atomic::AtomicBool,
+    ended: &std::sync::atomic::AtomicBool,
+    shutdown: &std::sync::atomic::AtomicBool,
+    wake: Option<std::sync::mpsc::Sender<TapChunk>>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut buf = [0u8; 256];
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut read_set: libc::fd_set = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::FD_ZERO(&mut read_set);
+            libc::FD_SET(fd, &mut read_set);
+        }
+        let mut timeout = libc::timeval {
+            tv_sec: 0,
+            tv_usec: READ_SLICE.subsec_micros() as libc::suseconds_t,
+        };
+        let ready = unsafe {
+            libc::select(
+                fd + 1,
+                &mut read_set,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut timeout,
+            )
+        };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            ended.store(true, Ordering::SeqCst);
+            return;
+        }
+        if ready == 0 {
+            continue;
+        }
+        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if read == 0 {
+            ended.store(true, Ordering::SeqCst);
+            return; // EOF: every write end is gone (fd: sources only).
+        }
+        if read < 0 {
+            let err = std::io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            ended.store(true, Ordering::SeqCst);
+            return;
+        }
+        if !fired.swap(true, Ordering::SeqCst)
+            && let Some(wake) = wake.as_ref()
+        {
+            let _ = wake.send(TapChunk::Trigger);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod trigger_reader_tests {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::core::trigger::TriggerSpec;
+
+    fn mkfifo(path: &std::path::Path) {
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes().to_vec()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_fifo_write_raises_the_fired_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.fifo");
+        mkfifo(&path);
+        let reader = TriggerReader::open(&TriggerSpec::Fifo(path.clone()), None).unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"x").unwrap();
+        assert!(
+            wait_until(|| reader.fired().swap(false, Ordering::SeqCst)),
+            "the write never raised the flag"
+        );
+    }
+
+    #[test]
+    fn a_writerless_fifo_does_not_spin_or_end() {
+        // The dummy write end keeps EOF away while no writer exists.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.fifo");
+        mkfifo(&path);
+        let reader = TriggerReader::open(&TriggerSpec::Fifo(path), None).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!reader.ended().load(Ordering::SeqCst));
+        assert!(!reader.fired().load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_regular_file_fd_is_rejected_at_open_with_the_teaching_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("reg");
+        std::fs::write(&f, b"x").unwrap();
+        let file = std::fs::File::open(&f).unwrap();
+        let err = TriggerReader::open(&TriggerSpec::Fd(file.as_raw_fd()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file:"), "{err}"); // S_ISREG teaches file:
+    }
+
+    #[test]
+    fn fd_eof_sets_ended_and_the_thread_exits() {
+        // An fd: source whose write side closes ends cleanly — this is
+        // fd:-only territory; a fifo never reaches it past the dummy
+        // writer.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (r, w) = (fds[0], fds[1]);
+        let reader = TriggerReader::open(&TriggerSpec::Fd(r), None).unwrap();
+        unsafe { libc::close(w) };
+        assert!(
+            wait_until(|| reader.ended().load(Ordering::SeqCst)),
+            "EOF never set ended"
+        );
     }
 }

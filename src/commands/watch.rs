@@ -25,7 +25,7 @@ use crate::term::scroll::{
 };
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
-use crate::term::tap::{TapChunk, TapScanner, TtyTap};
+use crate::term::tap::{TapChunk, TapScanner, TriggerReader, TtyTap};
 #[cfg(unix)]
 use crate::term::theme_notify::{OscColorKind, ThemeNotifyGuard, classify_colors, may_subscribe};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
@@ -146,6 +146,33 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     // be detected, never absorbed into the baseline.
     file_watch.fired();
     let mut gate = DebounceGate::new(debounce);
+    // The fifo/fd reader threads: NAMED and long-lived — dropping this
+    // vec joins every reader, so `let _ = …` would kill them here and
+    // now. Each slot carries its own end-of-life state for the one-shot
+    // notice.
+    #[cfg(unix)]
+    let mut trigger_readers: Vec<ReaderSlot> = {
+        let wake = tap.as_ref().map(TtyTap::sender);
+        let mut readers = Vec::new();
+        for spec in &triggers {
+            if matches!(spec, TriggerSpec::File(_)) {
+                continue; // polled in the loop, no thread
+            }
+            if let TriggerSpec::Fd(0) = spec {
+                return Err(anyhow!(
+                    "fd:0 is the terminal's own input while watch reads keys; \
+                     use another descriptor"
+                )
+                .into());
+            }
+            readers.push(ReaderSlot {
+                reader: TriggerReader::open(spec, wake.clone())?,
+                spec: spec.clone(),
+                ended_seen: false,
+            });
+        }
+        readers
+    };
     // The footer label carries the user's own token; a defaulted interval
     // reads as its literal default. Trigger-only mode has no token at all.
     let interval_label = args
@@ -330,6 +357,18 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         // 2, at most one slice away.
         if !triggers.is_empty() {
             let now = Instant::now();
+            #[cfg(unix)]
+            let mut ended_notices: Vec<String> = Vec::new();
+            #[cfg(unix)]
+            for slot in &mut trigger_readers {
+                if slot.reader.fired().swap(false, Ordering::SeqCst) {
+                    gate.fire(now);
+                }
+                if !slot.ended_seen && slot.reader.ended().load(Ordering::SeqCst) {
+                    slot.ended_seen = true; // rising edge, per reader
+                    ended_notices.push(format!("trigger ended: {}", slot.spec));
+                }
+            }
             if file_watch.fired() {
                 gate.fire(now);
             }
@@ -337,6 +376,28 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                 // A fired trigger observed a change any in-flight child
                 // predates: a respawn, never a plain request.
                 schedule.request_respawn();
+            }
+            // Every source that ended this iteration is named in ONE
+            // one-shot notice row; with no frame yet the batch drops.
+            #[cfg(unix)]
+            if let (false, Some(l)) = (ended_notices.is_empty(), live.as_ref()) {
+                let notice = ended_notices.join(" · ");
+                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                previous_key = Some(repaint(
+                    &mut renderer,
+                    pause.as_ref(),
+                    live_scroll,
+                    l,
+                    &live_tail,
+                    &palette,
+                    view,
+                    Some(notice),
+                    size,
+                    args.max_height,
+                    &faint,
+                    profile,
+                    &history,
+                )?);
             }
         }
         // 4. How long we may sleep: never past the next spawn, never
@@ -784,6 +845,16 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     }
     renderer.finish().context("restoring terminal")?;
     Ok(())
+}
+
+/// One fifo/fd trigger source as the loop tracks it: the reader (whose
+/// Drop joins the thread), the spec for the end-of-life notice, and the
+/// rising-edge latch that keeps that notice one-shot.
+#[cfg(unix)]
+struct ReaderSlot {
+    reader: TriggerReader,
+    spec: TriggerSpec,
+    ended_seen: bool,
 }
 
 /// Which surface the loop is showing. `pause` and (later) a live window
