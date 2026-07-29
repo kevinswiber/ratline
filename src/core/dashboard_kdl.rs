@@ -34,6 +34,15 @@ struct Key {
     set: Set,
 }
 
+impl Key {
+    /// KDL writes a property as `key=value`, so the one example serves
+    /// both positions. (List keys have no property spelling and never
+    /// reach here.)
+    fn property_example(&self) -> String {
+        self.example.replacen(' ', "=", 1)
+    }
+}
+
 const PANE_KEYS: &[Key] = &[
     Key {
         name: "command",
@@ -148,13 +157,46 @@ fn key_list(property_position: bool) -> String {
 /// Every shape error is generated from the key's own example, so there
 /// is no per-key error text to keep in step with the table.
 fn shape_err(k: &Key, at: &str) -> anyhow::Error {
-    let takes = match k.set {
+    anyhow!(
+        "{at}: `{}` takes {} — write `{}`",
+        k.name,
+        takes(k),
+        k.example
+    )
+}
+
+/// The same complaint against the property spelling, so the fix it
+/// shows is the one the user was reaching for.
+fn prop_shape_err(k: &Key, at: &str) -> anyhow::Error {
+    anyhow!(
+        "{at}: `{}` takes {} — write `{}`",
+        k.name,
+        takes(k),
+        k.property_example()
+    )
+}
+
+fn takes(k: &Key) -> &'static str {
+    match k.set {
         Set::Text(_) => "one string",
         Set::Count(_) => "one integer",
         Set::Flag(_) => "#true or #false",
         Set::List(_) => "one or more strings",
-    };
-    anyhow!("{at}: `{}` takes {takes} — write `{}`", k.name, k.example)
+    }
+}
+
+/// One key, one place, once: a key written twice on the same block —
+/// two properties, two child nodes, or one of each — is an error.
+/// Last-wins is invisible to a reader scanning a long pane block.
+fn record(seen: &mut Vec<&'static str>, k: &'static Key, at: &str) -> anyhow::Result<()> {
+    if seen.contains(&k.name) {
+        bail!(
+            "{at}: `{}` is declared twice — declare it once, as a property or a child node",
+            k.name
+        );
+    }
+    seen.push(k.name);
+    Ok(())
 }
 
 pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
@@ -192,15 +234,11 @@ fn pane_block(
     name: Option<String>,
     default_shell: bool,
 ) -> anyhow::Result<PaneDecl> {
-    let children = node.children();
     let at = match name.as_deref() {
         Some(name) => format!("pane {name:?}"),
         None => "defaults".to_string(),
     };
-    let shell = children
-        .and_then(|doc| doc.get("shell"))
-        .map(|child| one_flag(child, key("shell").expect("`shell` is a pane key"), &at))
-        .transpose()?;
+    let shell = peek_shell(node, &at)?;
     let ctx = Ctx {
         at: &at,
         shell: shell.unwrap_or(default_shell),
@@ -209,10 +247,39 @@ fn pane_block(
         name,
         ..PaneDecl::default()
     };
-    let Some(children) = children else {
-        return Ok(decl);
-    };
-    for child in children.nodes() {
+    let mut seen: Vec<&'static str> = Vec::new();
+
+    // Properties first, and NOT behind the children lookup: a braceless
+    // `pane "a" height=3` has no children at all.
+    for entry in node.entries() {
+        let Some(prop) = entry.name() else {
+            continue; // positional: the pane's own name
+        };
+        let prop = prop.value();
+        let Some(k) = key(prop) else {
+            bail!(
+                "{at}: unknown property {prop:?} — a pane's keys with a property spelling are {}",
+                key_list(true)
+            );
+        };
+        record(&mut seen, k, &at)?;
+        match k.set {
+            Set::List(_) => bail!(
+                "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
+                k.name,
+                k.example
+            ),
+            Set::Text(set) => set(&mut decl, prop_text(entry.value(), k, &at)?),
+            Set::Count(set) => set(&mut decl, prop_count(entry.value(), k, &at)?, &ctx)?,
+            Set::Flag(set) => set(&mut decl, prop_flag(entry.value(), k, &at)?),
+        }
+    }
+
+    for child in node
+        .children()
+        .map(kdl::KdlDocument::nodes)
+        .unwrap_or_default()
+    {
         let name = child.name().value();
         let Some(k) = key(name) else {
             bail!(
@@ -220,6 +287,7 @@ fn pane_block(
                 key_list(false)
             );
         };
+        record(&mut seen, k, &at)?;
         match k.set {
             Set::Text(set) => set(&mut decl, one_text(child, k, &at)?),
             Set::Count(set) => set(&mut decl, one_count(child, k, &at)?, &ctx)?,
@@ -228,6 +296,36 @@ fn pane_block(
         }
     }
     Ok(decl)
+}
+
+/// `shell` is read before the pass that assigns it, because the command
+/// split depends on it. A peek only: if `shell` is written in both
+/// positions the pass raises the duplicate error, so the peek's choice
+/// never reaches a spawn.
+fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<bool>> {
+    let k = key("shell").expect("`shell` is a pane key");
+    if let Some(entry) = node.entry("shell") {
+        return prop_flag(entry.value(), k, at).map(Some);
+    }
+    match node.children().and_then(|doc| doc.get("shell")) {
+        Some(child) => one_flag(child, k, at).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn prop_text(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<String> {
+    value
+        .as_string()
+        .map(str::to_string)
+        .ok_or_else(|| prop_shape_err(k, at))
+}
+
+fn prop_count(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<i128> {
+    value.as_integer().ok_or_else(|| prop_shape_err(k, at))
+}
+
+fn prop_flag(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<bool> {
+    value.as_bool().ok_or_else(|| prop_shape_err(k, at))
 }
 
 /// Every positional entry of a node — the values a key was written with.
@@ -484,6 +582,122 @@ pane "all" {
         assert_eq!(pane.padding.as_deref(), Some("0 1"));
         assert_eq!(pane.title.as_deref(), Some("Recent commits"));
         assert_eq!(pane.chrome, Some(false));
+    }
+
+    /// The C equivalence proof: a scalar key means the same thing on
+    /// the block's own line as inside it. Author's choice, uniformly.
+    #[test]
+    fn a_scalar_key_may_be_written_as_a_property_or_a_child_node() {
+        let as_properties = parse(
+            r#"
+pane "log" interval="15s" height=7 width="2fr" chrome=#false {
+    command "git" "log"
+}
+"#,
+        )
+        .expect("properties parse");
+        let as_children = parse(
+            r#"
+pane "log" {
+    interval "15s"
+    height 7
+    width "2fr"
+    chrome #false
+    command "git" "log"
+}
+"#,
+        )
+        .expect("children parse");
+        assert_eq!(as_properties, as_children);
+        assert_eq!(as_properties.panes[0].interval.as_deref(), Some("15s"));
+        assert_eq!(as_properties.panes[0].height, Some(7));
+    }
+
+    #[test]
+    fn defaults_collapses_to_one_line_of_properties() {
+        let one_line =
+            parse("defaults interval=\"5s\" border=\"rounded\" padding=\"0 1\" height=7\n")
+                .expect("parses");
+        let block = parse(
+            "defaults {\n    interval \"5s\"\n    border \"rounded\"\n    padding \"0 1\"\n    height 7\n}\n",
+        )
+        .expect("parses");
+        assert_eq!(one_line, block);
+        assert_eq!(one_line.defaults.border.as_deref(), Some("rounded"));
+    }
+
+    /// A KDL property holds exactly one value, so the two list keys
+    /// have no property spelling — and the error says where they go.
+    #[test]
+    fn a_list_key_as_a_property_says_where_it_belongs() {
+        for text in [
+            "pane \"log\" command=\"git log\" {\n    height 3\n}\n",
+            "pane \"log\" trigger=\"file:./x\" {\n    command \"date\"\n}\n",
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains("holds a list"), "{err}");
+            assert!(err.contains("child node"), "{err}");
+            assert!(err.contains("inside the block"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_property_names_the_keys_that_may_be_properties() {
+        let err = format!(
+            "{:#}",
+            parse("pane \"log\" intervl=\"15s\" {\n    command \"date\"\n}\n").unwrap_err()
+        );
+        assert!(err.contains("unknown property"), "{err}");
+        assert!(err.contains("intervl"), "{err}");
+        assert!(err.contains("interval"), "{err}");
+        assert!(
+            !err.contains("command"),
+            "a list key has no property spelling, so it must not be offered: {err}"
+        );
+    }
+
+    /// One key, one place, once — in any spelling combination. Last-wins
+    /// is invisible to a reader scanning a long pane block.
+    #[test]
+    fn a_key_declared_twice_on_one_pane_is_refused() {
+        for text in [
+            // twice as a property
+            "pane \"log\" interval=\"15s\" interval=\"30s\" {\n    command \"date\"\n}\n",
+            // twice as a child node
+            "pane \"log\" {\n    command \"date\"\n    interval \"15s\"\n    interval \"30s\"\n}\n",
+            // once each
+            "pane \"log\" interval=\"15s\" {\n    command \"date\"\n    interval \"30s\"\n}\n",
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains("declared twice"), "{err}");
+            assert!(err.contains("interval"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_property_carries_a_kdl_boolean_not_a_quoted_string() {
+        let err = format!(
+            "{:#}",
+            parse("pane \"log\" chrome=\"false\" {\n    command \"date\"\n}\n").unwrap_err()
+        );
+        assert!(err.contains("#false"), "{err}");
+        let ok = parse("pane \"log\" chrome=#false {\n    command \"date\"\n}\n").expect("parses");
+        assert_eq!(ok.panes[0].chrome, Some(false));
+    }
+
+    /// `shell` is read before the pass that assigns it, because the
+    /// command split depends on it — and the property spelling must
+    /// reach that read, not just the field.
+    #[test]
+    fn a_property_holds_the_same_shell_the_command_split_reads() {
+        let file = parse("pane \"x\" shell=#true {\n    command \"date +%H | tr -d x\"\n}\n")
+            .expect("parses");
+        assert_eq!(file.panes[0].shell, Some(true));
+        assert_eq!(
+            file.panes[0].command,
+            Some(vec!["date +%H | tr -d x".to_string()]),
+            "one word under shell stays one word"
+        );
     }
 
     /// The teaching error names the pane it happened in, the token the
