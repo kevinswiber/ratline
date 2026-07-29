@@ -84,6 +84,20 @@ pub enum Command {
     #[cfg(debug_assertions)]
     #[command(name = "__cat", hide = true)]
     Cat(CatArgs),
+    /// Test harness: sleep, then print — a portable slow child for
+    /// staggered-completion fixtures (the cli suite is sh-free).
+    #[cfg(debug_assertions)]
+    #[command(name = "__sleep", hide = true)]
+    Sleep(SleepArgs),
+}
+
+#[cfg(debug_assertions)]
+#[derive(clap::Args)]
+pub struct SleepArgs {
+    /// Milliseconds to sleep before printing.
+    pub millis: u64,
+    /// What to print after the sleep.
+    pub text: Option<String>,
 }
 
 #[cfg(debug_assertions)]

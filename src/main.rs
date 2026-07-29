@@ -124,6 +124,14 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
             }
         }
         #[cfg(debug_assertions)]
+        Command::Sleep(args) => {
+            std::thread::sleep(std::time::Duration::from_millis(args.millis));
+            if let Some(text) = &args.text {
+                println!("{text}");
+            }
+            Ok(())
+        }
+        #[cfg(debug_assertions)]
         Command::Cat(args) => {
             use std::io::Write;
 
