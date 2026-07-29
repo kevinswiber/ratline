@@ -70,9 +70,6 @@ impl Drop for ShutdownGuard {
 /// One finished tick, as it travels from the worker to the loop.
 pub struct TickOutcome {
     /// Which source finished — the index of every per-source resource.
-    // Read by the drain once the loop generalizes; the allow comes off
-    // with its first consumer.
-    #[allow(dead_code)]
     pub source: SourceId,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
