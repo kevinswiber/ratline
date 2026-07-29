@@ -148,12 +148,6 @@ pub(crate) fn run_registry(
 ) -> AppResult {
     let (interrupted, terminated) = register_signals()?;
     let plain = matches!(registry.composition(), Composition::Plain { .. });
-    // Single-sourced trigger machinery, concatenated in registry order;
-    // per-source gates and watch sets come with the pane semantics.
-    let all_triggers: Vec<TriggerSpec> = registry
-        .ids()
-        .flat_map(|id| registry.spec(id).triggers.clone())
-        .collect();
 
     let stdout = std::io::stdout();
     let is_tty = stdout.is_tty();
@@ -169,15 +163,23 @@ pub(crate) fn run_registry(
     let interactive = is_tty && !session.once;
     // The event-wait routes need a terminal to wake; only the stat-poll
     // works piped, so the other schemes refuse early, before any
-    // terminal state changes.
-    if !interactive
-        && all_triggers
-            .iter()
-            .any(|trigger| !matches!(trigger, TriggerSpec::File(_)))
-    {
-        return Err(
-            anyhow!("fifo:/fd: triggers need an interactive terminal; use file:PATH").into(),
-        );
+    // terminal state changes. Per source: the pane that declared the
+    // spec is the one the error names.
+    if !interactive {
+        for id in registry.ids() {
+            let spec = registry.spec(id);
+            if spec
+                .triggers
+                .iter()
+                .any(|trigger| !matches!(trigger, TriggerSpec::File(_)))
+            {
+                return Err(anyhow!(
+                    "{}fifo:/fd: triggers need an interactive terminal; use file:PATH",
+                    pane_label(&registry, id)
+                )
+                .into());
+            }
+        }
     }
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
@@ -228,17 +230,37 @@ pub(crate) fn run_registry(
     };
 
     let (tx, rx) = std::sync::mpsc::channel::<TickOutcome>();
+    // `--once` arms no triggers: the run ends at the first composition,
+    // so a watcher could only fire into a loop that has already left.
+    let armed = !session.once;
     let mut runtime: Vec<SourceRuntime> = registry
         .ids()
-        .map(|id| SourceRuntime {
-            schedule: TickSchedule::new(registry.spec(id).interval),
-            slot: ChildSlot::default(),
-            tx: tx.clone(),
-            output: None,
-            hash: 0,
-            changed_at: jiff::Timestamp::UNIX_EPOCH,
-            failure: None,
-            posted: false,
+        .map(|id| {
+            let spec = registry.spec(id);
+            let mut files = MtimeWatchSet::new(if armed {
+                file_paths(&spec.triggers)
+            } else {
+                Vec::new()
+            });
+            // The baseline exists BEFORE the first spawn, per source: a
+            // change landing between this source's first child and the
+            // loop's first check must be detected, never absorbed into
+            // the baseline.
+            files.fired();
+            SourceRuntime {
+                schedule: TickSchedule::new(spec.interval),
+                slot: ChildSlot::default(),
+                tx: tx.clone(),
+                output: None,
+                hash: 0,
+                changed_at: jiff::Timestamp::UNIX_EPOCH,
+                failure: None,
+                posted: false,
+                gate: DebounceGate::new(spec.debounce),
+                files,
+                #[cfg(unix)]
+                readers: Vec::new(),
+            }
         })
         .collect();
     // Every exit from run_registry — return, `?`, panic — kills every
@@ -247,44 +269,33 @@ pub(crate) fn run_registry(
     // no registry-level lock: a shared mutex would serialize spawns
     // and could block a shutdown behind one of them.
     let _shutdown: Vec<ShutdownGuard> = runtime.iter().map(|r| r.slot.guard()).collect();
-    let mut file_watch = MtimeWatchSet::new(file_paths(&all_triggers));
-    // The baseline exists BEFORE the first spawn: a change landing
-    // between the first child's start and the loop's first check must
-    // be detected, never absorbed into the baseline.
-    file_watch.fired();
-    let debounce = registry
-        .ids()
-        .next()
-        .map(|id| registry.spec(id).debounce)
-        .unwrap_or(SLICE);
-    let mut gate = DebounceGate::new(debounce);
-    // The fifo/fd reader threads: NAMED and long-lived — dropping this
-    // vec joins every reader, so `let _ = …` would kill them here and
-    // now. Each slot carries its own end-of-life state for the one-shot
-    // notice.
+    // The fifo/fd reader threads: long-lived inside their source's
+    // runtime — dropping a runtime entry joins its readers. Each slot
+    // carries its own end-of-life state for the one-shot notice.
     #[cfg(unix)]
-    let mut trigger_readers: Vec<ReaderSlot> = {
+    if armed {
         let wake = tap.as_ref().map(TtyTap::sender);
-        let mut readers = Vec::new();
-        for spec in &all_triggers {
-            if matches!(spec, TriggerSpec::File(_)) {
-                continue; // polled in the loop, no thread
+        for id in registry.ids() {
+            for spec in &registry.spec(id).triggers {
+                if matches!(spec, TriggerSpec::File(_)) {
+                    continue; // polled in the loop, no thread
+                }
+                if let TriggerSpec::Fd(0) = spec {
+                    return Err(anyhow!(
+                        "{}fd:0 is the terminal's own input while watch reads keys; \
+                         use another descriptor",
+                        pane_label(&registry, id)
+                    )
+                    .into());
+                }
+                runtime[id.0].readers.push(ReaderSlot {
+                    reader: TriggerReader::open(spec, wake.clone())?,
+                    spec: spec.clone(),
+                    ended_seen: false,
+                });
             }
-            if let TriggerSpec::Fd(0) = spec {
-                return Err(anyhow!(
-                    "fd:0 is the terminal's own input while watch reads keys; \
-                     use another descriptor"
-                )
-                .into());
-            }
-            readers.push(ReaderSlot {
-                reader: TriggerReader::open(spec, wake.clone())?,
-                spec: spec.clone(),
-                ended_seen: false,
-            });
         }
-        readers
-    };
+    }
     let live_tail = session.live_tail.clone();
     // Loop-persistent geometry state: the one size/geometry pair the
     // spawn step, the composer, and the (future) resize arm consume. It
@@ -575,27 +586,31 @@ pub(crate) fn run_registry(
         // branch below so a piped watch refreshes on file changes too;
         // the spawn this requests happens on the next iteration's step
         // 2, at most one slice away.
-        if !all_triggers.is_empty() {
+        {
             let now = Instant::now();
             #[cfg(unix)]
             let mut ended_notices: Vec<String> = Vec::new();
-            #[cfg(unix)]
-            for slot in &mut trigger_readers {
-                if slot.reader.fired().swap(false, Ordering::SeqCst) {
-                    gate.fire(now);
+            for id in registry.ids() {
+                let r = &mut runtime[id.0];
+                #[cfg(unix)]
+                for slot in &mut r.readers {
+                    if slot.reader.fired().swap(false, Ordering::SeqCst) {
+                        r.gate.fire(now);
+                    }
+                    if !slot.ended_seen && slot.reader.ended().load(Ordering::SeqCst) {
+                        slot.ended_seen = true; // rising edge, per reader
+                        ended_notices.push(ended_text(&registry, id, &slot.spec));
+                    }
                 }
-                if !slot.ended_seen && slot.reader.ended().load(Ordering::SeqCst) {
-                    slot.ended_seen = true; // rising edge, per reader
-                    ended_notices.push(format!("trigger ended: {}", slot.spec));
+                if r.files.fired() {
+                    r.gate.fire(now);
                 }
-            }
-            if file_watch.fired() {
-                gate.fire(now);
-            }
-            if gate.due(now) {
-                // A fired trigger observed a change any in-flight child
-                // predates: a respawn, never a plain request.
-                runtime[0].schedule.request_respawn();
+                if r.gate.due(now) {
+                    // A fired trigger observed a change any in-flight
+                    // child of THIS source predates: a respawn, never a
+                    // plain request.
+                    r.schedule.request_respawn();
+                }
             }
             // Every source that ended this iteration is named in ONE
             // one-shot notice row; with no frame yet the batch drops.
@@ -1871,6 +1886,25 @@ fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     true
 }
 
+/// A pane's error prefix: empty for plain watch (whose messages are
+/// byte-frozen), the pane's name under a declared layout — at N the
+/// question "whose trigger/whose error?" has an answer.
+fn pane_label(registry: &Registry, id: SourceId) -> String {
+    match registry.pane(id) {
+        Some(_) => format!("pane {}: ", registry.spec(id).name),
+        None => String::new(),
+    }
+}
+
+/// The one-shot end-of-life line for a dead reader. `rat watch` keeps
+/// its shipped sentence byte for byte; a pane names itself first.
+fn ended_text(registry: &Registry, id: SourceId, spec: &TriggerSpec) -> String {
+    match registry.pane(id) {
+        Some(_) => format!("{}: trigger ended: {spec}", registry.spec(id).name),
+        None => format!("trigger ended: {spec}"),
+    }
+}
+
 /// The looping spawn-error wording. `rat watch` passes `"watch"` and
 /// reproduces its shipped line byte for byte; a pane passes its own
 /// name, so the failure names itself inside its box.
@@ -2048,6 +2082,14 @@ struct SourceRuntime {
     /// Whether this source has completed at least once — the once-mode
     /// exit condition at N sources.
     posted: bool,
+    /// This source's own debounce window: its fires collapse into one
+    /// respawn of THIS pane per window.
+    gate: DebounceGate,
+    /// The `file:` triggers it stat-polls.
+    files: MtimeWatchSet,
+    /// Its fifo/fd reader threads; dropping the runtime joins them.
+    #[cfg(unix)]
+    readers: Vec<ReaderSlot>,
 }
 
 /// The change key: a combining hash over the per-source OUTPUT hashes
@@ -2648,6 +2690,10 @@ mod tests {
             changed_at: stamp(0),
             failure: None,
             posted: false,
+            gate: DebounceGate::new(Duration::ZERO),
+            files: MtimeWatchSet::new(Vec::new()),
+            #[cfg(unix)]
+            readers: Vec::new(),
         }
     }
 
@@ -2835,6 +2881,40 @@ mod tests {
         assert_ne!(
             body_signature(&body, None),
             body_signature(&body, Some("exit 3"))
+        );
+    }
+
+    #[test]
+    fn only_the_fired_sources_schedule_collapses() {
+        // Two trigger-only sources (no deadline after their first
+        // completion). One gate fires; only its schedule may spawn.
+        // This is the executable spec of the per-source walk: it goes
+        // red the moment the gates collapse back into one shared gate.
+        let t = Instant::now();
+        let mut gates = [
+            DebounceGate::new(Duration::ZERO),
+            DebounceGate::new(Duration::ZERO),
+        ];
+        let mut schedules = [TickSchedule::new(None), TickSchedule::new(None)];
+        for s in &mut schedules {
+            assert_eq!(s.poll(t), Due::Spawn); // the first tick, interval or not
+            s.completed(t);
+        }
+        gates[0].fire(t);
+        for (gate, schedule) in gates.iter_mut().zip(schedules.iter_mut()) {
+            if gate.due(t) {
+                schedule.request_respawn();
+            }
+        }
+        assert_eq!(
+            schedules[0].poll(t),
+            Due::Spawn,
+            "the fired source respawns"
+        );
+        assert_eq!(
+            schedules[1].poll(t),
+            Due::Wait,
+            "its neighbour stays parked"
         );
     }
 
