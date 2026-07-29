@@ -36,7 +36,7 @@ pane "clock" {
 }
 
 pane "nested" {
-    command "rat" "dashboard" "examples/panes.toml" "--once"
+    command "rat" "dashboard" "examples/panes.kdl" "--once"
     height 15
 }
 

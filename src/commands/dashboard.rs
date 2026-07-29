@@ -11,7 +11,7 @@ use crate::exit::AppResult;
 use crate::theme::Palette;
 
 pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppResult {
-    let registry = load(&args.file, args.format)?;
+    let registry = load(&args.file)?;
     let session = SessionArgs {
         once: args.once,
         clear: args.clear,

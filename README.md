@@ -178,37 +178,12 @@ each pane running its own command on its own interval, with its own
 triggers:
 
 ```sh
-rat dashboard panes.toml          # or panes.kdl
-rat dashboard panes.toml --once   # render one frame and exit
+rat dashboard panes.kdl
+rat dashboard panes.kdl --once   # render one frame and exit
 ```
 
 The declaration file names each pane's command and cadence, shared
-defaults, and the layout. Both grammars are shipped while the choice
-between them settles; they declare exactly the same thing:
-
-```toml
-gap = 1
-
-[defaults]
-interval = "5s"
-border = "rounded"
-padding = "0 1"
-height = 7
-
-[[pane]]
-name = "log"
-command = ["git", "log", "--oneline", "-3"]
-interval = "15s"
-
-[[pane]]
-name = "clock"
-command = ["date", "+%H:%M:%S"]
-interval = "1s"
-height = 4
-
-[layout]
-rows = [ "log", "clock" ]
-```
+defaults, and the layout, in KDL:
 
 ```kdl
 gap 1
@@ -240,13 +215,13 @@ layout {
 `[defaults]` supplies anything a pane omits. `name` is the pane's
 identity — its default title, and the value of `RAT_PANE` in the
 child's environment, so one script can serve every pane by dispatching
-on it. `command` is a string split like a shell word list, an array
-taken verbatim as argv, or a raw script string with `shell = true`.
+on it. `command` is a string split like a shell word list, multiple
+arguments taken verbatim as argv, or a raw script string with
+`shell #true`.
 
 The layout is a vertical stack of rows; a row is one or more panes side
 by side — and rows and columns nest to any depth, so grids need no
-second mechanism. KDL nests with explicit blocks; TOML nests by
-alternating arrays (an array inside a row is a column, and vice versa):
+second mechanism:
 
 ```kdl
 layout {
@@ -255,11 +230,6 @@ layout {
         column "clock"
     }
 }
-```
-
-```toml
-[layout]
-rows = [ [ ["log", "branch"], ["clock"] ] ]
 ```
 
 Omit the layout and every pane stacks in declaration order. `gap` is
@@ -305,8 +275,7 @@ that width; height-stable output keeps repaints cheapest, which is
 equally true for plain `rat watch` scripts — a placeholder row beats a
 row that comes and goes.
 
-Runnable declarations live at
-[`examples/panes.toml`](examples/panes.toml) and
+A runnable declaration lives at
 [`examples/panes.kdl`](examples/panes.kdl);
 [`examples/panes-nested.kdl`](examples/panes-nested.kdl) shows nested
 layout blocks and a dashboard-in-a-dashboard pane together.
@@ -599,7 +568,7 @@ Runnable versions of this — plus the interactive prompts chained together —
 live in [`examples/`](examples/) for bash, zsh, fish, and PowerShell. The
 shell scripts are single-command watch dashboards: one script renders the
 whole frame on one cadence. The declaration files beside them
-(`panes.toml`, `panes.kdl`) are the other shape — N commands on N
+(`panes.kdl`, `panes-nested.kdl`) are the other shape — N commands on N
 cadences, composed by `rat dashboard`.
 
 ## Differences from gum

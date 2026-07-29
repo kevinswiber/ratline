@@ -16,7 +16,7 @@ fn rat_bin() -> String {
 
 /// Write a fixture and hand back its path. Commands are interpolated so
 /// every pane runs the rat binary under test. The backslash escape
-/// keeps a Windows binary path a valid TOML basic string.
+/// keeps a Windows binary path a valid KDL quoted string.
 fn fixture(dir: &std::path::Path, name: &str, body: &str) -> String {
     let path = dir.join(name);
     std::fs::write(&path, body).expect("write fixture");
@@ -24,24 +24,25 @@ fn fixture(dir: &std::path::Path, name: &str, body: &str) -> String {
 }
 
 #[test]
-fn a_toml_dashboard_renders_its_panes_once() {
+fn a_dashboard_renders_its_panes_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = fixture(
         dir.path(),
-        "board.toml",
+        "board.kdl",
         &format!(
             r#"
-[defaults]
-height = 3
-chrome = false
+defaults {{
+    height 3
+    chrome #false
+}}
 
-[[pane]]
-name = "left"
-command = ["{bin}", "style", "hello"]
+pane "left" {{
+    command "{bin}" "style" "hello"
+}}
 
-[[pane]]
-name = "right"
-command = ["{bin}", "style", "world"]
+pane "right" {{
+    command "{bin}" "style" "world"
+}}
 "#,
             bin = rat_bin().replace('\\', "\\\\")
         ),
@@ -56,84 +57,6 @@ command = ["{bin}", "style", "world"]
 }
 
 #[test]
-fn a_kdl_dashboard_renders_the_same_frame_as_its_toml_twin() {
-    // Byte equality is only meaningful on a stamp-free frame: the pane
-    // chrome row carries an absolute HH:MM:SS, which two runs a second
-    // apart will disagree about. Both fixtures set chrome = false, so
-    // what is compared is geometry, order, and content — exactly what
-    // the two grammars are supposed to agree on.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let bin = rat_bin().replace('\\', "\\\\");
-    let toml = fixture(
-        dir.path(),
-        "board.toml",
-        &format!(
-            r#"
-gap = 1
-
-[defaults]
-height = 4
-chrome = false
-border = "rounded"
-
-[[pane]]
-name = "left"
-command = ["{bin}", "style", "hello"]
-
-[[pane]]
-name = "right"
-command = ["{bin}", "style", "world"]
-
-[layout]
-rows = [ ["left", "right"] ]
-"#
-        ),
-    );
-    let kdl = fixture(
-        dir.path(),
-        "board.kdl",
-        &format!(
-            r#"
-gap 1
-
-defaults {{
-    height 4
-    chrome #false
-    border "rounded"
-}}
-
-pane "left" {{
-    command "{bin}" "style" "hello"
-}}
-
-pane "right" {{
-    command "{bin}" "style" "world"
-}}
-
-layout {{
-    row "left" "right"
-}}
-"#
-        ),
-    );
-
-    let from_toml = rat()
-        .env("NO_COLOR", "1")
-        .args(["dashboard", &toml, "--once"])
-        .assert()
-        .success();
-    let from_kdl = rat()
-        .env("NO_COLOR", "1")
-        .args(["dashboard", &kdl, "--once"])
-        .assert()
-        .success();
-    assert_eq!(
-        String::from_utf8_lossy(&from_toml.get_output().stdout),
-        String::from_utf8_lossy(&from_kdl.get_output().stdout)
-    );
-}
-
-#[test]
 fn a_pane_child_is_told_its_inner_geometry() {
     // A Cells pane with no border and no padding has an inner width
     // equal to its declared cells, whatever the terminal is — so the
@@ -143,27 +66,28 @@ fn a_pane_child_is_told_its_inner_geometry() {
     let bin = rat_bin().replace('\\', "\\\\");
     let file = fixture(
         dir.path(),
-        "geom.toml",
+        "geom.kdl",
         &format!(
             r#"
-[defaults]
-height = 3
-chrome = false
-border = "none"
-padding = "0"
-width = "20"
+defaults {{
+    height 3
+    chrome #false
+    border "none"
+    padding "0"
+    width "20"
+}}
 
-[[pane]]
-name = "cols"
-command = ["{bin}", "__env", "RAT_WIDTH"]
+pane "cols" {{
+    command "{bin}" "__env" "RAT_WIDTH"
+}}
 
-[[pane]]
-name = "rows"
-command = ["{bin}", "__env", "RAT_HEIGHT"]
+pane "rows" {{
+    command "{bin}" "__env" "RAT_HEIGHT"
+}}
 
-[[pane]]
-name = "whoami"
-command = ["{bin}", "__env", "RAT_PANE"]
+pane "whoami" {{
+    command "{bin}" "__env" "RAT_PANE"
+}}
 "#
         ),
     );
@@ -195,15 +119,15 @@ fn a_pane_taller_than_its_box_is_truncated_keep_top() {
     let bin = rat_bin().replace('\\', "\\\\");
     let file = fixture(
         dir.path(),
-        "tall.toml",
+        "tall.kdl",
         &format!(
             r#"
-[[pane]]
-name = "tall"
-height = 3
-chrome = false
-border = "none"
-command = ["{bin}", "style", "AAA", "BBB", "CCC", "DDD", "EEE"]
+pane "tall" {{
+    height 3
+    chrome #false
+    border "none"
+    command "{bin}" "style" "AAA" "BBB" "CCC" "DDD" "EEE"
+}}
 "#
         ),
     );
@@ -233,21 +157,22 @@ fn a_pane_that_has_not_run_renders_blank_at_its_declared_size() {
     let bin = rat_bin().replace('\\', "\\\\");
     let file = fixture(
         dir.path(),
-        "stack.toml",
+        "stack.kdl",
         &format!(
             r#"
-[defaults]
-height = 3
-chrome = false
-border = "none"
+defaults {{
+    height 3
+    chrome #false
+    border "none"
+}}
 
-[[pane]]
-name = "a"
-command = ["{bin}", "style", "one"]
+pane "a" {{
+    command "{bin}" "style" "one"
+}}
 
-[[pane]]
-name = "b"
-command = ["{bin}", "style", "two"]
+pane "b" {{
+    command "{bin}" "style" "two"
+}}
 "#
         ),
     );
@@ -268,7 +193,7 @@ command = ["{bin}", "style", "two"]
 
 #[test]
 fn an_unreadable_file_names_the_path() {
-    let missing = "definitely-no-such-dashboard-xyz.toml";
+    let missing = "definitely-no-such-dashboard-xyz.kdl";
     rat()
         .args(["dashboard", missing])
         .assert()
@@ -276,15 +201,17 @@ fn an_unreadable_file_names_the_path() {
         .stderr(predicates::str::contains(missing));
 }
 
+/// A file that is not KDL fails as a parse error carrying the path —
+/// there is no format selection left to point at.
 #[test]
-fn an_unknown_extension_names_the_format_flag() {
+fn a_file_that_is_not_kdl_names_the_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = fixture(dir.path(), "board.conf", "gap = 0\n");
     rat()
         .args(["dashboard", &file])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("--format"));
+        .stderr(predicates::str::contains("board.conf"));
 }
 
 /// The failure lives in the failing pane's own box — its text, its
@@ -296,24 +223,25 @@ fn a_failing_pane_shows_its_exit_code_and_the_rest_of_the_dashboard_survives() {
     let dir = tempfile::tempdir().expect("tempdir");
     let steady = dir.path().join("steady");
     std::fs::write(&steady, "steady-content").expect("seed");
-    let decl = dir.path().join("dash.toml");
+    let decl = dir.path().join("dash.kdl");
     std::fs::write(
         &decl,
         format!(
             r#"
-row-gap = 0
+row-gap 0
 
-[defaults]
-height = 5
-border = "rounded"
+defaults {{
+    height 5
+    border "rounded"
+}}
 
-[[pane]]
-name = "broken"
-command = ["{rat}", "__exitcode", "3", "boom-from-stderr"]
+pane "broken" {{
+    command "{rat}" "__exitcode" "3" "boom-from-stderr"
+}}
 
-[[pane]]
-name = "steady"
-command = ["{rat}", "__cat", "{steady}"]
+pane "steady" {{
+    command "{rat}" "__cat" "{steady}"
+}}
 "#,
             rat = rat_bin().escape_default(),
             steady = steady.display().to_string().escape_default(),
@@ -409,29 +337,30 @@ fn a_file_trigger_refreshes_only_its_own_pane() {
     std::fs::write(&steady, "a0").expect("seed");
     std::fs::write(&shared, "v0").expect("seed");
     std::fs::write(&untouched, "x").expect("seed");
-    let decl = dir.path().join("dash.toml");
+    let decl = dir.path().join("dash.kdl");
     std::fs::write(
         &decl,
         format!(
             r#"
-row-gap = 0
+row-gap 0
 
-[defaults]
-height = 1
-border = "none"
-chrome = false
-interval = "never"
-trigger-debounce = "0ms"
+defaults {{
+    height 1
+    border "none"
+    chrome #false
+    interval "never"
+    trigger-debounce "0ms"
+}}
 
-[[pane]]
-name = "alpha"
-command = ["{rat}", "__cat", "{steady}"]
-trigger = ["file:{untouched}"]
+pane "alpha" {{
+    command "{rat}" "__cat" "{steady}"
+    trigger "file:{untouched}"
+}}
 
-[[pane]]
-name = "beta"
-command = ["{rat}", "__cat", "{shared}"]
-trigger = ["file:{shared}"]
+pane "beta" {{
+    command "{rat}" "__cat" "{shared}"
+    trigger "file:{shared}"
+}}
 "#,
             rat = rat_bin().escape_default(),
             steady = steady.display().to_string().escape_default(),
@@ -473,23 +402,24 @@ fn once_emits_exactly_one_complete_frame() {
     let bin = rat_bin().replace('\\', "\\\\");
     let file = fixture(
         dir.path(),
-        "staggered.toml",
+        "staggered.kdl",
         &format!(
             r#"
-row-gap = 0
+row-gap 0
 
-[defaults]
-height = 1
-chrome = false
-border = "none"
+defaults {{
+    height 1
+    chrome #false
+    border "none"
+}}
 
-[[pane]]
-name = "quick"
-command = ["{bin}", "style", "one"]
+pane "quick" {{
+    command "{bin}" "style" "one"
+}}
 
-[[pane]]
-name = "slow"
-command = ["{bin}", "__sleep", "300", "two"]
+pane "slow" {{
+    command "{bin}" "__sleep" "300" "two"
+}}
 "#
         ),
     );
@@ -521,15 +451,15 @@ fn a_piped_dashboard_sizes_from_rat_width() {
     let bin = rat_bin().replace('\\', "\\\\");
     let file = fixture(
         dir.path(),
-        "sized.toml",
+        "sized.kdl",
         &format!(
             r#"
-[[pane]]
-name = "wide"
-height = 2
-chrome = false
-border = "none"
-command = ["{bin}", "style", "x"]
+pane "wide" {{
+    height 2
+    chrome #false
+    border "none"
+    command "{bin}" "style" "x"
+}}
 "#
         ),
     );
@@ -555,29 +485,34 @@ fn a_nested_layout_renders_a_grid() {
     let bin = rat_bin().replace('\\', "\\\\");
     let file = fixture(
         dir.path(),
-        "grid.toml",
+        "grid.kdl",
         &format!(
             r#"
-[defaults]
-height = 1
-chrome = false
-border = "none"
+defaults {{
+    height 1
+    chrome #false
+    border "none"
+}}
 
-[[pane]]
-name = "a"
-command = ["{bin}", "style", "one"]
+pane "a" {{
+    command "{bin}" "style" "one"
+}}
 
-[[pane]]
-name = "b"
-command = ["{bin}", "style", "two"]
+pane "b" {{
+    command "{bin}" "style" "two"
+}}
 
-[[pane]]
-name = "c"
-height = 2
-command = ["{bin}", "style", "three"]
+pane "c" {{
+    height 2
+    command "{bin}" "style" "three"
+}}
 
-[layout]
-rows = [ [ ["a", "b"], "c" ] ]
+layout {{
+    row {{
+        column "a" "b"
+        column "c"
+    }}
+}}
 "#
         ),
     );

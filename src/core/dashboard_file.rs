@@ -1,10 +1,9 @@
-//! The format-agnostic dashboard declaration and the ONE path that
-//! validates it.
+//! The parsed dashboard declaration and the ONE path that validates it.
 //!
-//! Both format constructors (`dashboard_toml`, `dashboard_kdl`) produce
-//! a [`DashboardFile`] and nothing else; every token in a dashboard
-//! file is parsed exactly once, here, so a rule can never differ
-//! between the two grammars.
+//! The constructor (`dashboard_kdl`) produces a [`DashboardFile`] and
+//! nothing else; every token in a dashboard file is parsed exactly
+//! once, here, so the grammar walk and the rules can never drift
+//! apart.
 //!
 //! ## Interval resolution
 //!
@@ -34,15 +33,8 @@ const DEFAULT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(2
 /// The shipped `rat watch` default interval.
 const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Which grammar a declaration file is written in.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
-pub enum DeclFormat {
-    Toml,
-    Kdl,
-}
-
-/// The format-agnostic declaration. Both constructors produce exactly
-/// this; ONE validation path turns it into a [`Registry`].
+/// The parsed declaration. The constructor produces exactly this; ONE
+/// validation path turns it into a [`Registry`].
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct DashboardFile {
     pub gap: Option<usize>,
@@ -373,34 +365,14 @@ fn resolve_node(
     }
 }
 
-/// Read + parse + validate. Format: the flag, else the file extension.
-pub fn load(path: &std::path::Path, format: Option<DeclFormat>) -> anyhow::Result<Registry> {
+/// Read + parse + validate.
+pub fn load(path: &std::path::Path) -> anyhow::Result<Registry> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file = match format_for(path, format)? {
-        DeclFormat::Toml => crate::core::dashboard_toml::parse(&text),
-        DeclFormat::Kdl => crate::core::dashboard_kdl::parse(&text),
-    }
-    .with_context(|| format!("in {}", path.display()))?;
+    let file = crate::core::dashboard_kdl::parse(&text)
+        .with_context(|| format!("in {}", path.display()))?;
     file.into_registry()
         .with_context(|| format!("in {}", path.display()))
-}
-
-/// Which grammar a file is written in: the `--format` flag when given,
-/// otherwise the extension. `load` itself arrives with the two `parse`
-/// functions.
-pub fn format_for(path: &std::path::Path, flag: Option<DeclFormat>) -> anyhow::Result<DeclFormat> {
-    if let Some(format) = flag {
-        return Ok(format);
-    }
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("toml") => Ok(DeclFormat::Toml),
-        Some("kdl") => Ok(DeclFormat::Kdl),
-        _ => Err(anyhow!(
-            "cannot tell the format of {}: name it .toml or .kdl, or pass --format",
-            path.display()
-        )),
-    }
 }
 
 #[cfg(test)]

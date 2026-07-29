@@ -58,19 +58,18 @@ fn labeled_counter_cmd(path: &std::path::Path, label: &str) -> String {
 }
 
 /// Writes the fixture declaration and returns its path. THE ONLY
-/// format-specific text in this file — the format pick's deletion
-/// commit rewrites this one function (and the body builders below) if
-/// the surviving format is not the one it emits.
+/// format-specific text in this file lives in this function and the
+/// body builders below.
 fn write_dashboard(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-    let path = dir.join("dash.toml");
+    let path = dir.join("dash.kdl");
     std::fs::write(&path, body).expect("write the dashboard declaration");
     path
 }
 
 /// Declaration body for two 1fr panes in one row, both parked at 1h.
-/// `labeled_counter_cmd` emits only single-quoted sh, which a TOML
-/// basic string carries verbatim (only `"` and `\` would need escapes;
-/// tempdir paths contain neither).
+/// `labeled_counter_cmd` emits only single-quoted sh, which a KDL
+/// quoted string carries verbatim (only `"` and `\` would need
+/// escapes; tempdir paths contain neither).
 fn two_pane_row(left: &std::path::Path, right: &std::path::Path) -> String {
     panes_row(left, "left", "1h", right, "right", "1h")
 }
@@ -92,11 +91,11 @@ fn panes_row(
     let b_cmd = labeled_counter_cmd(b, b_name);
     debug_assert!(!a_cmd.contains('"') && !b_cmd.contains('"'));
     format!(
-        "gap = 1\n\n\
-         [defaults]\nheight = 5\nborder = \"rounded\"\nwidth = \"1fr\"\nshell = true\n\n\
-         [[pane]]\nname = \"{a_name}\"\ninterval = \"{a_interval}\"\ncommand = \"{a_cmd}\"\n\n\
-         [[pane]]\nname = \"{b_name}\"\ninterval = \"{b_interval}\"\ncommand = \"{b_cmd}\"\n\n\
-         [layout]\nrows = [[\"{a_name}\", \"{b_name}\"]]\n"
+        "gap 1\n\n\
+         defaults {{\n    height 5\n    border \"rounded\"\n    width \"1fr\"\n    shell #true\n}}\n\n\
+         pane \"{a_name}\" {{\n    interval \"{a_interval}\"\n    command \"{a_cmd}\"\n}}\n\n\
+         pane \"{b_name}\" {{\n    interval \"{b_interval}\"\n    command \"{b_cmd}\"\n}}\n\n\
+         layout {{\n    row \"{a_name}\" \"{b_name}\"\n}}\n"
     )
 }
 
@@ -263,23 +262,24 @@ fn a_slow_panes_change_stays_marked_across_the_fast_panes_ticks() {
         dir.path(),
         &format!(
             r#"
-row-gap = 0
+row-gap 0
 
-[defaults]
-height = 1
-border = "none"
-chrome = false
-shell = true
+defaults {{
+    height 1
+    border "none"
+    chrome #false
+    shell #true
+}}
 
-[[pane]]
-name = "fast"
-interval = "250ms"
-command = "{fast}"
+pane "fast" {{
+    interval "250ms"
+    command "{fast}"
+}}
 
-[[pane]]
-name = "slow"
-interval = "300ms"
-command = "printf 'slow-%s' \"$(cat {slow})\""
+pane "slow" {{
+    interval "300ms"
+    command "printf 'slow-%s' \"$(cat {slow})\""
+}}
 "#,
             fast = labeled_counter_cmd(&fast_count, "fast"),
             slow = slow_value.display(),
@@ -377,16 +377,16 @@ fn counter_values(bytes: &[u8]) -> Vec<u64> {
 /// only other place format-specific text lives — the format pick's
 /// deletion commit rewrites these builders together.
 fn board(defaults: &str, panes: &[(&str, &str, &str)]) -> String {
-    let mut body = format!("row-gap = 0\n\n[defaults]\n{defaults}\n");
+    let mut body = format!("row-gap 0\n\ndefaults {{\n{defaults}\n}}\n");
     for (name, interval, command) in panes {
         body.push_str(&format!(
-            "\n[[pane]]\nname = \"{name}\"\ninterval = \"{interval}\"\ncommand = \"{command}\"\n"
+            "\npane \"{name}\" {{\n    interval \"{interval}\"\n    command \"{command}\"\n}}\n"
         ));
     }
     body
 }
 
-const STACKED: &str = "height = 5\nborder = \"none\"\nchrome = false\nshell = true";
+const STACKED: &str = "    height 5\n    border \"none\"\n    chrome #false\n    shell #true";
 
 /// Per-source schedules and the min-nap: a 50ms pane and a 2s pane run
 /// at their own cadences instead of one shared clock.
@@ -709,7 +709,7 @@ fn scrub_steps_distinct_composed_frames() {
     let decl = write_dashboard(
         dir.path(),
         &board(
-            "height = 1\nborder = \"none\"\nchrome = false\nshell = true",
+            "    height 1\n    border \"none\"\n    chrome #false\n    shell #true",
             &[
                 ("ticker", "50ms", &ticker),
                 ("slow", "1h", &labeled_counter_cmd(&slow, "slow")),

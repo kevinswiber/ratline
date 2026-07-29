@@ -1,6 +1,6 @@
-//! The KDL constructor. A `KdlDocument` walk to [`DashboardFile`] — the
-//! same model the TOML constructor builds, with the same rules and no
-//! extra ones. KDL v2 grammar (`#true` / `#false` for booleans).
+//! The KDL constructor. A `KdlDocument` walk to [`DashboardFile`] —
+//! parsing only; every rule lives once, in `into_registry`. KDL v2
+//! grammar (`#true` / `#false` for booleans).
 
 use anyhow::{Context, anyhow, bail};
 
@@ -52,8 +52,7 @@ pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
 
 /// One `pane "name" { … }` or `defaults { … }` block. The block's own
 /// `shell` is read FIRST because the command split depends on it —
-/// `shell` is the one thing a parser resolves against defaults (the
-/// same comment stands in the TOML constructor).
+/// `shell` is the one thing the parser resolves against defaults.
 fn pane_block(
     node: &kdl::KdlNode,
     name: Option<String>,
@@ -81,8 +80,8 @@ fn pane_block(
                     // One word under `shell` stays one word.
                     [script] if shell.unwrap_or(default_shell) => vec![script.clone()],
                     // An unbalanced string is a parse error naming the
-                    // pane — identical to the TOML side, never a
-                    // one-word fallback that survives to a spawn.
+                    // pane — never a one-word fallback that survives
+                    // to a spawn.
                     [line] => shell_words::split(line).map_err(|err| {
                         anyhow!("pane {label:?}: command has unbalanced quoting ({err})")
                     })?,
@@ -183,9 +182,7 @@ fn bool_value(node: &kdl::KdlNode) -> anyhow::Result<bool> {
 
 /// Checked, field-named conversion: a negative value must FAIL LOUDLY,
 /// never wrap — `as usize` would turn `gap -1` into a repeat count near
-/// usize::MAX, which `" ".repeat(gap)` would try to allocate. (The TOML
-/// side gets this for free: serde's `usize` deserialization rejects
-/// negatives natively.)
+/// usize::MAX, which `" ".repeat(gap)` would try to allocate.
 fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
     usize::try_from(first_int(node)?).map_err(|_| anyhow!("{name} must be a non-negative integer"))
 }
@@ -193,36 +190,6 @@ fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const TOML_FIXTURE: &str = r#"
-gap = 1
-
-[defaults]
-interval = "5s"
-border = "rounded"
-padding = "0 1"
-height = 7
-
-[[pane]]
-name = "clock"
-command = "date +%H:%M:%S"
-interval = "60s"
-trigger = ["file:./stamp", "file:./notes"]
-height = 16
-width = "2fr"
-
-[[pane]]
-name = "branch"
-command = ["git", "branch", "--show-current"]
-
-[[pane]]
-name = "notes"
-command = "rat style hello"
-interval = "never"
-
-[layout]
-rows = [ "clock", ["branch", "notes"] ]
-"#;
 
     const KDL_FIXTURE: &str = r#"
 gap 1
@@ -258,17 +225,13 @@ layout {
 "#;
 
     #[test]
-    fn toml_and_kdl_declare_the_same_dashboard() {
-        // The thinness proof. Neither grammar may hold a rule the other
-        // does not: if the two parsers disagree about ANYTHING — word
-        // splitting, defaults, layout shape, a missing field — these
-        // two values differ, and no amount of downstream validation can
-        // put them back together.
-        let from_toml = crate::core::dashboard_toml::parse(TOML_FIXTURE).expect("toml parses");
+    fn the_fixture_parses_to_the_declared_dashboard() {
+        // The thinness proof, one-sided since the TOML grammar's
+        // deletion: the parser emits exactly what the file declares —
+        // word splitting, defaults, layout shape — with no rule of its
+        // own. (Its two-grammar ancestor also asserted TOML equality;
+        // that property lost its second side with the format pick.)
         let from_kdl = parse(KDL_FIXTURE).expect("kdl parses");
-        assert_eq!(from_toml, from_kdl);
-        // Spot-check the shape too, so a mutual regression cannot pass
-        // by making both parsers equally wrong.
         assert_eq!(from_kdl.gap, Some(1));
         assert_eq!(from_kdl.panes.len(), 3);
         assert_eq!(
@@ -298,20 +261,13 @@ layout {
     }
 
     #[test]
-    fn nested_layout_blocks_match_the_toml_alternation() {
-        // KDL nests explicitly (row/column blocks); TOML nests by
-        // alternating arrays (rows hold columns hold rows...). Both
-        // must reach the same declaration or the grammars have
-        // diverged.
-        let toml = crate::core::dashboard_toml::parse(
-            "[[pane]]\nname = \"a\"\nheight = 3\ncommand = \"date\"\n\n[[pane]]\nname = \"b\"\nheight = 3\ncommand = \"date\"\n\n[[pane]]\nname = \"c\"\nheight = 3\ncommand = \"date\"\n\n[layout]\nrows = [ [ [\"a\", \"b\"], \"c\" ] ]\n",
-        )
-        .expect("toml parses");
+    fn nested_layout_blocks_reach_the_recursive_declaration() {
+        // row/column blocks nest to any depth and land on the same
+        // recursive `LayoutDecl` tree the engine has always had.
         let kdl = parse(
             "pane \"a\" {\n    height 3\n    command \"date\"\n}\npane \"b\" {\n    height 3\n    command \"date\"\n}\npane \"c\" {\n    height 3\n    command \"date\"\n}\nlayout {\n    row {\n        column \"a\" \"b\"\n        column \"c\"\n    }\n}\n",
         )
         .expect("kdl parses");
-        assert_eq!(toml.layout, kdl.layout);
         use crate::core::dashboard_file::LayoutDecl;
         assert_eq!(
             kdl.layout,

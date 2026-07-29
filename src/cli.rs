@@ -445,11 +445,8 @@ pub struct WatchArgs {
 
 #[derive(clap::Args)]
 pub struct DashboardArgs {
-    /// Dashboard declaration file (.toml or .kdl)
+    /// Dashboard declaration file (KDL)
     pub file: std::path::PathBuf,
-    /// Declaration format when the extension does not say
-    #[arg(long, value_enum)]
-    pub format: Option<crate::core::dashboard_file::DeclFormat>,
     /// Run every pane once and exit
     #[arg(long)]
     pub once: bool,

@@ -2,8 +2,6 @@
 // flicker-free frame. Run from a git repository:
 //
 //   rat dashboard examples/panes.kdl
-//
-// The same declaration in TOML is examples/panes.toml.
 
 gap 1
 
