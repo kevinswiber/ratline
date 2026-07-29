@@ -364,9 +364,22 @@ pub enum FrameAction {
 
 #[derive(clap::Args)]
 pub struct WatchArgs {
-    /// Refresh interval, e.g. "2s", "500ms", "1m"
-    #[arg(short = 'n', long, default_value = "2s")]
-    pub interval: String,
+    /// Refresh interval, e.g. "2s", "500ms", "1m" (default 2s; omit
+    /// beside --trigger for trigger-only refresh)
+    #[arg(short = 'n', long)]
+    pub interval: Option<String>,
+    /// Refresh on an external event: fifo:PATH, file:PATH, or fd:N
+    /// (repeatable)
+    #[arg(long, value_name = "SPEC", conflicts_with = "once")]
+    pub trigger: Vec<String>,
+    /// Collapse trigger fires into one refresh per window
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = "250ms",
+        requires = "trigger"
+    )]
+    pub trigger_debounce: String,
     /// Run one tick and exit
     #[arg(long)]
     pub once: bool,
