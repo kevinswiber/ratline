@@ -4,7 +4,10 @@
 //! spawn-if-due → drain-then-compose-once → triggers → nap → age
 //! refresh → theme verify → events. The drain terminates because each
 //! source has at most one tick in flight; nothing ever paints inside
-//! it, and nothing outside this file writes to the terminal.
+//! it, and nothing outside this file writes to the terminal. Every
+//! gesture is whole-dashboard: there is no focus concept, `action_for`
+//! takes no pane, and a future per-pane gesture is a deliberate
+//! re-opening of that decision, not a small edit.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -70,6 +73,11 @@ pub(crate) struct SessionArgs {
     pub snapshot_ansi: bool,
     /// The run-constant footer suffix, pre-built by the constructor.
     pub live_tail: String,
+    /// The `?` reference's first row — the caller names its surface.
+    pub help_heading: &'static str,
+    /// The caller's own section of the `?` reference, appended after
+    /// the shared key families.
+    pub help_extra: Vec<String>,
     /// Reflow boxes and respawn every source on a resize; off means the
     /// spawn step owns the geometry re-measure (one writer per mode).
     pub resize_respawn: bool,
@@ -93,6 +101,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         .as_deref()
         .or(triggers.is_empty().then_some("2s"));
     let live_tail = live_suffix(args.once, interval_label, !triggers.is_empty());
+    let help_extra = trigger_help(&triggers);
     let registry = Registry::single(
         SourceSpec {
             name: String::new(),
@@ -120,6 +129,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         snapshot_dir: args.snapshot_dir.clone(),
         snapshot_ansi: args.snapshot_ansi,
         live_tail,
+        help_heading: "rat watch — keys",
+        help_extra,
         resize_respawn: false,
     };
     run_registry(registry, session, profile, palette)
@@ -666,15 +677,18 @@ pub(crate) fn run_registry(
                             return Ok(());
                         }
                         action @ (WatchAction::Page | WatchAction::Help) => {
-                            let Some(live) = live.as_ref() else { continue };
                             // ? pages the key reference through the same
                             // ritual v pages the frame — one handoff path,
-                            // and search over the bindings comes free.
+                            // and search over the bindings comes free. The
+                            // reference needs no frame: it is static text,
+                            // and the window before the first frame is
+                            // exactly when a reader reaches for it.
                             let help;
                             let content: &[String] = if action == WatchAction::Help {
-                                help = help_lines(&all_triggers);
+                                help = help_lines(session.help_heading, &session.help_extra);
                                 &help
                             } else {
+                                let Some(live) = live.as_ref() else { continue };
                                 pause.as_ref().map_or(&live.lines, |p| &p.frozen)
                             };
                             // The pager reads the same terminal. Stop the
@@ -719,23 +733,28 @@ pub(crate) fn run_registry(
                             // tick would stall the return by a whole child
                             // runtime on a slow dashboard. The pager left the
                             // diff invalidated, so this paints the full frame
-                            // over the restored copy.
-                            let size = crossterm::terminal::size().unwrap_or((80, 24));
-                            previous_key = Some(repaint(
-                                &mut renderer,
-                                pause.as_ref(),
-                                live_scroll,
-                                live,
-                                &live_tail,
-                                &palette,
-                                view,
-                                pager_notice,
-                                size,
-                                session.max_height,
-                                &faint,
-                                profile,
-                                &history,
-                            )?);
+                            // over the restored copy. With no frame yet there
+                            // is nothing to restore: page_frame already called
+                            // renderer.finish(), so the loop simply paints its
+                            // first frame when the first child lands.
+                            if let Some(live) = live.as_ref() {
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    live,
+                                    &live_tail,
+                                    &palette,
+                                    view,
+                                    pager_notice,
+                                    size,
+                                    session.max_height,
+                                    &faint,
+                                    profile,
+                                    &history,
+                                )?);
+                            }
                         }
                         WatchAction::Scroll(step) => {
                             let Some(live) = live.as_ref() else { continue };
@@ -788,7 +807,7 @@ pub(crate) fn run_registry(
                             // must visibly answer even while a slow child is
                             // still running.
                             if pause.take().is_some() {
-                                runtime[0].schedule.request_now();
+                                request_now_all(&mut runtime);
                             }
                             live_scroll = None;
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
@@ -994,7 +1013,7 @@ pub(crate) fn run_registry(
                         // environment. A RESPAWN, not a plain request: the
                         // in-flight child was started under the old
                         // RAT_APPEARANCE and cannot satisfy this.
-                        runtime[0].schedule.request_respawn();
+                        request_respawn_all(&mut runtime);
                         if let Some(live) = live.as_ref() {
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
@@ -1083,7 +1102,9 @@ enum WatchAction {
 /// The whole binding table, for both input paths and every mode — unix and
 /// Windows read their keys differently but mean the same things by them.
 /// What a Scroll action does while live is the loop's business, not the
-/// table's. View keys never freeze.
+/// table's. View keys never freeze. No key addresses a pane: every
+/// gesture acts on the whole surface, which is why this table has no
+/// pane parameter.
 fn action_for(key: Key, mode: FrameMode) -> WatchAction {
     match key {
         Key::CtrlC => WatchAction::Abort,
@@ -1294,44 +1315,54 @@ fn local_hms(t: jiff::Timestamp) -> String {
 }
 
 /// The key reference `?` pages: plain text, grouped the way the keys
-/// are learned, plus the configured trigger sources when any exist.
-/// Content only — the pager owns presentation.
-fn help_lines(triggers: &[TriggerSpec]) -> Vec<String> {
-    let mut lines: Vec<String> = [
-        "rat watch — keys",
-        "",
-        "  q                  quit",
-        "  v, Enter           view the full frame in the pager",
-        "  ?                  this key reference",
-        "  S                  snapshot the viewed frame to a file",
-        "",
-        "  j/k, Up/Down       scroll one line (opens a live window)",
-        "  d/u                scroll half a window",
-        "  f/b, PgDn/PgUp     scroll a full window",
-        "  g, Home            top — and back to the live view",
-        "  G, End             bottom — stick to the tail",
-        "",
-        "  p                  freeze the frame in place (the command keeps running)",
-        "  Esc, F             resume the live tail",
-        "  <, ,               step back through distinct frames",
-        "  >, .               step forward again",
-        "",
-        "  w                  wrap or chop long lines",
-        "  h/l, Left/Right    shift the view horizontally",
-        "  D                  toggle the change gutter",
-        "  c                  toggle the change highlights",
-        "  t                  time style: wall-clock stamps or counting ages",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    if !triggers.is_empty() {
-        lines.push(String::new());
-        lines.push("  refresh triggers:".to_string());
-        for spec in triggers {
-            lines.push(format!("    {spec}"));
-        }
+/// are learned, under the caller's heading and followed by whatever
+/// section belongs to the caller's surface — the shared body lives
+/// here, the surface-specific tail with the caller. Content only —
+/// the pager owns presentation.
+fn help_lines(heading: &str, extra: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = std::iter::once(heading.to_string())
+        .chain(
+            [
+                "",
+                "  q                  quit",
+                "  v, Enter           view the full frame in the pager",
+                "  ?                  this key reference",
+                "  S                  snapshot the viewed frame to a file",
+                "",
+                "  j/k, Up/Down       scroll one line (opens a live window)",
+                "  d/u                scroll half a window",
+                "  f/b, PgDn/PgUp     scroll a full window",
+                "  g, Home            top — and back to the live view",
+                "  G, End             bottom — stick to the tail",
+                "",
+                "  p                  freeze the frame in place (the command keeps running)",
+                "  Esc, F             resume the live tail",
+                "  <, ,               step back through distinct frames",
+                "  >, .               step forward again",
+                "",
+                "  w                  wrap or chop long lines",
+                "  h/l, Left/Right    shift the view horizontally",
+                "  D                  toggle the change gutter",
+                "  c                  toggle the change highlights",
+                "  t                  time style: wall-clock stamps or counting ages",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        )
+        .collect();
+    lines.extend(extra.iter().cloned());
+    lines
+}
+
+/// Watch's slice of the key reference: the trigger sources it was
+/// started with. Empty when none are configured, so the reference
+/// stays clean.
+fn trigger_help(triggers: &[TriggerSpec]) -> Vec<String> {
+    if triggers.is_empty() {
+        return Vec::new();
     }
+    let mut lines = vec![String::new(), "  refresh triggers:".to_string()];
+    lines.extend(triggers.iter().map(|spec| format!("    {spec}")));
     lines
 }
 
@@ -1850,6 +1881,24 @@ fn fold_changed_at(
     }
 }
 
+/// Every gesture is whole-dashboard: a resume means the whole surface
+/// is stale, so every source is asked for a tick — the request an
+/// in-flight child CAN discharge, because its environment is unchanged.
+fn request_now_all(runtime: &mut [SourceRuntime]) {
+    for r in runtime {
+        r.schedule.request_now();
+    }
+}
+
+/// A theme adoption supersedes the environment every in-flight child
+/// was started under, so no completion discharges it: every source
+/// spawns a fresh child.
+fn request_respawn_all(runtime: &mut [SourceRuntime]) {
+    for r in runtime {
+        r.schedule.request_respawn();
+    }
+}
+
 /// The `file:` paths among a set of triggers. On Windows `File` is the
 /// only variant, so the match is exhaustively `Some` and clippy wants a
 /// plain map — the unix arms are what make it a filter.
@@ -2104,7 +2153,7 @@ mod tests {
     #[test]
     fn the_help_reference_names_the_trigger_sources() {
         let specs = vec![TriggerSpec::File("/tmp/state.json".into())];
-        let lines = help_lines(&specs);
+        let lines = help_lines("rat watch — keys", &trigger_help(&specs));
         assert!(
             lines
                 .iter()
@@ -2113,7 +2162,9 @@ mod tests {
         );
         // And stays clean when none are configured.
         assert!(
-            !help_lines(&[]).iter().any(|line| line.contains("trigger")),
+            !help_lines("rat watch — keys", &trigger_help(&[]))
+                .iter()
+                .any(|line| line.contains("trigger")),
             "the untriggered reference must not mention triggers"
         );
     }
@@ -2461,6 +2512,73 @@ mod tests {
         assert_eq!(fold_changed_at(None, false, quiet), None);
     }
 
+    #[test]
+    fn esc_requests_a_tick_on_every_source() {
+        // A resume means the WHOLE dashboard is stale: no source keeps
+        // its old deadline just because it is not the one the eye was
+        // on. A plain request, not a respawn — each in-flight child was
+        // started under an environment this gesture does not supersede,
+        // so its completion may discharge the request.
+        let t = Instant::now();
+        let mut runtime = vec![runtime_with(1), runtime_with(2)];
+        for r in &mut runtime {
+            r.schedule.poll(t);
+            r.schedule.completed(t);
+            assert_eq!(r.schedule.poll(t), Due::Wait);
+        }
+        request_now_all(&mut runtime);
+        for r in &mut runtime {
+            assert_eq!(r.schedule.poll(t), Due::Spawn);
+        }
+    }
+
+    #[test]
+    fn a_theme_flip_requests_a_respawn_on_every_source() {
+        // Every in-flight child was started under the superseded
+        // RAT_APPEARANCE, so no completion can discharge this: each
+        // source spawns a FRESH child, and one adoption cannot leave
+        // half the dashboard in the old palette.
+        let t = Instant::now();
+        let mut runtime = vec![runtime_with(1), runtime_with(2)];
+        for r in &mut runtime {
+            assert_eq!(r.schedule.poll(t), Due::Spawn); // in flight
+        }
+        request_respawn_all(&mut runtime);
+        for r in &mut runtime {
+            r.schedule.completed(t); // the stale-env child lands …
+            assert_eq!(r.schedule.poll(t), Due::Spawn); // … and did not satisfy it
+        }
+    }
+
+    #[test]
+    fn help_lines_carry_the_heading_and_the_extra_block() {
+        // A3: the reference is shared chrome. The caller names the
+        // surface and appends whatever section belongs to it; the key
+        // families in between are the same text for everyone.
+        let extra = vec![
+            String::new(),
+            "  refresh triggers:".to_string(),
+            "    file:/tmp/state.json".to_string(),
+        ];
+        let lines = help_lines("rat watch — keys", &extra);
+        assert_eq!(lines.first().map(String::as_str), Some("rat watch — keys"));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("    file:/tmp/state.json")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("freeze the frame in place"))
+        );
+        // An empty extra block adds nothing at all — no stray blank
+        // row, no empty heading — and the shared body is a prefix of
+        // the extended one, so a section can only ever append.
+        let bare = help_lines("rat watch — keys", &[]);
+        assert!(!bare.iter().any(|line| line.contains("trigger")));
+        assert_eq!(lines[..bare.len()], bare[..]);
+    }
+
     fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
         SourceSpec {
             name: String::new(),
@@ -2532,7 +2650,7 @@ mod tests {
 
     #[test]
     fn the_help_names_the_key_families() {
-        let text = help_lines(&[]).join("\n");
+        let text = help_lines("rat watch — keys", &[]).join("\n");
         for needle in [
             "quit",
             "pager",
