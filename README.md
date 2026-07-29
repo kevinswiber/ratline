@@ -171,6 +171,121 @@ overwriting. The snapshot is the data, not the viewport: it always
 contains the full untruncated frame, however the view is scrolled,
 wrapped, or shifted.
 
+### `rat dashboard` — N panes, N cadences, one frame
+
+One command, one file, N panes composed into one flicker-free frame —
+each pane running its own command on its own interval, with its own
+triggers:
+
+```sh
+rat dashboard panes.toml          # or panes.kdl
+rat dashboard panes.toml --once   # render one frame and exit
+```
+
+The declaration file names each pane's command and cadence, shared
+defaults, and the layout. Both grammars are shipped while the choice
+between them settles; they declare exactly the same thing:
+
+```toml
+gap = 1
+
+[defaults]
+interval = "5s"
+border = "rounded"
+padding = "0 1"
+height = 7
+
+[[pane]]
+name = "log"
+command = ["git", "log", "--oneline", "-3"]
+interval = "15s"
+
+[[pane]]
+name = "clock"
+command = ["date", "+%H:%M:%S"]
+interval = "1s"
+height = 4
+
+[layout]
+rows = [ "log", "clock" ]
+```
+
+```kdl
+gap 1
+
+defaults {
+    interval "5s"
+    border "rounded"
+    padding "0 1"
+    height 7
+}
+
+pane "log" {
+    command "git" "log" "--oneline" "-3"
+    interval "15s"
+}
+
+pane "clock" {
+    command "date" "+%H:%M:%S"
+    interval "1s"
+    height 4
+}
+
+layout {
+    row "log"
+    row "clock"
+}
+```
+
+`[defaults]` supplies anything a pane omits. `name` is the pane's
+identity — its default title, and the value of `RAT_PANE` in the
+child's environment, so one script can serve every pane by dispatching
+on it. `command` is a string split like a shell word list, an array
+taken verbatim as argv, or a raw script string with `shell = true`.
+
+The layout is a vertical stack of rows; a row is one or more panes side
+by side. Omit it and every pane stacks in declaration order. `gap` is
+the columns between panes in a row, `row-gap` the blank rows between
+rows.
+
+Per pane, `interval` takes a duration or `"never"` for a pane only a
+trigger moves; `trigger` takes the same `file:` / `fifo:` / `fd:`
+sources `rat watch --trigger` does, with `trigger-debounce` as its
+window; a pane with neither runs every 2s. `height` pins the finished
+box, borders and chrome included — the pin is what keeps the frame's
+row count constant and repaints cheap. Longer output is cut by
+`overflow`: `keep-top` (the default) or `keep-bottom` for a log tail.
+`width` takes cells (`"40"`), a weight (`"2fr"`), or `"auto"`.
+
+Every pane's last inner row is a faint `{cadence} · {stamp}` line the
+loop owns. The stamp is when that pane's output last *changed*, not
+when it last ran, so a calm dashboard stays calm; `t` flips every
+time-bearing row — footer and panes together — to counting ages. A
+pane that fails fails inside its own box: a spawn error renders as its
+text, a nonzero exit shows the command's output and stderr with
+` · exit N` on the chrome row, and the rest of the dashboard is
+untouched.
+
+There is no pane focus: every key acts on the whole dashboard, exactly
+as in `rat watch` — freeze, scrub, snapshot, pager, scroll, and the
+view toggles all work on the composed frame, and `?` pages the key
+reference with each pane's cadence listed. `--once` runs every pane
+once in parallel, prints one frame, and exits; piped output degrades to
+plain text with each pane's stderr folded into its own box.
+
+**Authoring for panes:** a pane's child prints *content only* — boxes,
+titles, heights, and the side-by-side layout are the loop's job, so a
+child that draws its own border just gets another drawn around it.
+Each child is told its pane's inner size through `RAT_WIDTH` and
+`RAT_HEIGHT` (and its name through `RAT_PANE`) and should format to
+that width; height-stable output keeps repaints cheapest, which is
+equally true for plain `rat watch` scripts — a placeholder row beats a
+row that comes and goes.
+
+Runnable declarations live at
+[`examples/panes.toml`](examples/panes.toml) and
+[`examples/panes.kdl`](examples/panes.kdl).
+
 ### `rat frame` — flicker-free repaint for script-owned loops
 
 When you want your own loop, pipe each frame's content through `rat frame`:
@@ -456,7 +571,11 @@ esac
 ```
 
 Runnable versions of this — plus the interactive prompts chained together —
-live in [`examples/`](examples/) for bash, zsh, fish, and PowerShell.
+live in [`examples/`](examples/) for bash, zsh, fish, and PowerShell. The
+shell scripts are single-command watch dashboards: one script renders the
+whole frame on one cadence. The declaration files beside them
+(`panes.toml`, `panes.kdl`) are the other shape — N commands on N
+cadences, composed by `rat dashboard`.
 
 ## Differences from gum
 
@@ -465,8 +584,8 @@ the dashboard toolkit above.
 
 - **Not ported:** `format`, `write`, `file`, `pager` — none of them earn
   their keep in a dashboard script.
-- **Added:** `bar`, `spark`, `watch`, `frame`, `doctor`, `duration`, `date`,
-  `table`.
+- **Added:** `bar`, `spark`, `watch`, `dashboard`, `frame`, `doctor`,
+  `duration`, `date`, `table`.
 - **`rat table` is a layout filter**, not gum's interactive row picker — no
   selection or sorting, and per-column config is positional comma lists
   (`--widths 27,,8`).
