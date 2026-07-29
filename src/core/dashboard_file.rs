@@ -19,10 +19,6 @@
 //! `"never"` is spelled out HERE and nowhere else: teaching it to
 //! `core::duration::parse_interval` would leak into `rat watch -n`.
 
-// The declaration layer lands before the subcommand that reads it; the
-// dashboard subcommand is the first real caller and removes this.
-#![allow(dead_code)]
-
 use anyhow::{Context, anyhow, bail};
 
 use crate::core::box_model::{BorderPreset, Sides, parse_sides};

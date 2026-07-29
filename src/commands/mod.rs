@@ -2,6 +2,7 @@ pub mod bar;
 pub mod choose;
 pub mod completion;
 pub mod confirm;
+pub mod dashboard;
 pub mod date;
 pub mod doctor;
 pub mod duration;

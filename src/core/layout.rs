@@ -4,10 +4,6 @@
 //! *resolution*: only the loop knows the source's name, so the default
 //! is applied there and `render_pane` uses `chrome.title` verbatim.
 
-// The renderer lands before the engine that calls it; the dashboard
-// subcommand is the first real caller and removes this.
-#![allow(dead_code)]
-
 use crate::color::ColorProfile;
 use crate::core::box_model::{BoxSpec, render_box};
 use crate::core::measure::{

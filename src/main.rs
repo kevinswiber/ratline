@@ -94,6 +94,7 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
         Command::Log(args) => commands::log::run(args, profile, palette),
         Command::Frame(args) => commands::frame::run(args, profile, palette),
         Command::Watch(args) => commands::watch::run(args, profile, palette),
+        Command::Dashboard(args) => commands::dashboard::run(args, profile, palette),
         Command::Doctor(args) => commands::doctor::run(args, profile, palette),
         Command::Choose(args) => commands::choose::run(args, profile, palette),
         Command::Confirm(args) => commands::confirm::run(args, profile, palette),

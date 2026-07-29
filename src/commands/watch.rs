@@ -21,6 +21,7 @@ use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
 use crate::core::child::{ChildSlot, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
+use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{Composition, PaneGeometry, Registry, SourceId, SourceSpec};
@@ -396,9 +397,12 @@ pub(crate) fn run_registry(
                 Composition::Plain { .. } => {
                     compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty)
                 }
-                Composition::Panes { .. } => {
-                    unreachable!("the composed arm lands with the subcommand")
-                }
+                // A pane's stderr is already inside its own box, stdout
+                // then stderr — what the tty shows and what the pipe
+                // gets, so "whose stderr" never needs an answer and
+                // nothing writes to the terminal outside the frame
+                // engine.
+                Composition::Panes { .. } => output_lines(&stdout, &stderr),
             });
             // One clock per tick, stamped at COMPLETION on the worker:
             // the absolute stamp, the counting form, and the history
@@ -445,7 +449,7 @@ pub(crate) fn run_registry(
             let lines: Vec<String> = match registry.composition() {
                 Composition::Plain { .. } => runtime[0].output.clone().unwrap_or_default(),
                 Composition::Panes { .. } => {
-                    unreachable!("the composed arm lands with the subcommand")
+                    compose_sources(&registry, &runtime, &geom, &palette, profile).lines
                 }
             };
             let current = Live {
@@ -516,8 +520,11 @@ pub(crate) fn run_registry(
                         writeln!(out, "{line}").context("writing")?;
                     }
                     out.flush().context("flushing")?;
-                    // Piped mode keeps the streams separate for log readability.
-                    if !piped_stderr.is_empty() {
+                    // Piped mode keeps the streams separate for log
+                    // readability — under Plain only: a pane's stderr is
+                    // already inside its own box (D-12 as sharpened:
+                    // gate on the composition, not the source count).
+                    if plain && !piped_stderr.is_empty() {
                         let mut err = std::io::stderr().lock();
                         err.write_all(&piped_stderr).context("writing stderr")?;
                         err.flush().context("flushing stderr")?;
@@ -1834,6 +1841,113 @@ fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     }
     *palette = Palette::builtin(reported, AppearanceSource::Notification);
     true
+}
+
+/// The `Composition::Panes` compose step — ONE named function, because
+/// it has exactly three re-entrants: the collect step, the resize
+/// arm's reflow, and the counting-refresh path. Renders every source
+/// into its declared box and joins them by the layout tree.
+fn compose_sources(
+    registry: &Registry,
+    runtime: &[SourceRuntime],
+    geom: &[PaneGeometry],
+    palette: &Palette,
+    profile: ColorProfile,
+) -> PaneBlock {
+    let Composition::Panes {
+        layout,
+        gap,
+        row_gap,
+    } = registry.composition()
+    else {
+        return PaneBlock::default();
+    };
+    let blocks: Vec<PaneBlock> = registry
+        .ids()
+        .map(|id| {
+            let source = &runtime[id.0];
+            let spec = registry.spec(id);
+            let pane = registry
+                .pane(id)
+                .expect("a Panes registry boxes every source");
+            let cadence = cadence_label(spec);
+            // The last-CHANGE stamp, never last-produced: a produced-at
+            // stamp would repaint every tick and cost byte-silence. A
+            // pane that has not run yet has no instant to name.
+            let stamp = if source.posted {
+                local_hms(source.changed_at)
+            } else {
+                "…".to_string()
+            };
+            let chrome = PaneChrome {
+                title: pane.title.as_deref().unwrap_or(&spec.name),
+                cadence: &cadence,
+                stamp: &stamp,
+                failure: None,
+            };
+            render_pane(
+                source.output.as_deref().unwrap_or(&[]),
+                &[],
+                pane,
+                geom[id.0],
+                &chrome,
+                palette,
+                profile,
+            )
+        })
+        .collect();
+    compose_panes(layout, &blocks, *gap, *row_gap)
+}
+
+/// The pane chrome's cadence phrase. Unlike watch's footer, which
+/// echoes the user's own `-n` token, a pane's interval is a `Duration`
+/// by the time it reaches the engine, so the phrase is formatted back
+/// from it.
+pub(crate) fn cadence_label(spec: &SourceSpec) -> String {
+    match (spec.interval, spec.triggers.is_empty()) {
+        (Some(interval), true) => format!("every {}", interval_words(interval)),
+        (Some(interval), false) => {
+            format!("every {} or on trigger", interval_words(interval))
+        }
+        (None, false) => "on trigger".to_string(),
+        (None, true) => "once".to_string(),
+    }
+}
+
+/// A duration as the shortest honest token: 90s stays `90s` (never
+/// `1m30s` — one unit, no arithmetic surprises), whole minutes and
+/// hours shorten, sub-second prints millis.
+fn interval_words(interval: Duration) -> String {
+    let millis = interval.as_millis();
+    let secs = interval.as_secs();
+    if millis == 0 || !millis.is_multiple_of(1000) {
+        return format!("{millis}ms");
+    }
+    if secs.is_multiple_of(3600) {
+        return format!("{}h", secs / 3600);
+    }
+    if secs.is_multiple_of(60) {
+        return format!("{}m", secs / 60);
+    }
+    format!("{secs}s")
+}
+
+/// A child's raw bytes as frame lines: lossy UTF-8, the trailing
+/// newline dropped, stderr lines after stdout's when present.
+fn output_lines(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let body = String::from_utf8_lossy(stdout);
+    lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
+    if !stderr.is_empty() {
+        let err_body = String::from_utf8_lossy(stderr);
+        lines.extend(
+            err_body
+                .trim_end_matches('\n')
+                .split('\n')
+                .map(str::to_string),
+        );
+    }
+    lines
 }
 
 /// Runtime state per source: the schedule, the slot, and everything the
