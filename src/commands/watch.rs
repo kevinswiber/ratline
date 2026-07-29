@@ -12,6 +12,7 @@ use crate::core::child::{ChildSlot, TickOutcome, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
+use crate::core::registry::SourceId;
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::core::trigger::{DebounceGate, MtimeWatchSet, TriggerSpec, parse_trigger};
@@ -225,11 +226,11 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             let mut inline = args.once;
             if !inline {
                 let command = build_command(&args, interactive, palette.appearance, size);
-                inline = spawn_tick(command, slot.clone(), tx.clone()).is_err();
+                inline = spawn_tick(command, SourceId(0), slot.clone(), tx.clone()).is_err();
             }
             if inline {
                 let command = build_command(&args, interactive, palette.appearance, size);
-                let _ = tx.send(run_tick(command));
+                let _ = tx.send(run_tick(command, SourceId(0)));
             }
         }
         // 3. Collect a finished tick — at most one can be queued.
