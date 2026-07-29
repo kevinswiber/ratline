@@ -1,3 +1,11 @@
+//! One loop, N sources: the shared frame engine behind `rat watch`
+//! (one source, no box) and — through the same `run_registry` — any
+//! registry of sources. The iteration order is law: signals →
+//! spawn-if-due → drain-then-compose-once → triggers → nap → age
+//! refresh → theme verify → events. The drain terminates because each
+//! source has at most one tick in flight; nothing ever paints inside
+//! it, and nothing outside this file writes to the terminal.
+
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,11 +16,11 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
-use crate::core::child::{ChildSlot, TickOutcome, run_tick, spawn_tick};
+use crate::core::child::{ChildSlot, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
-use crate::core::registry::SourceId;
+use crate::core::registry::{Composition, PaneGeometry, Registry, SourceId, SourceSpec};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::core::trigger::{DebounceGate, MtimeWatchSet, TriggerSpec, parse_trigger};
@@ -49,10 +57,28 @@ struct Live {
     since: String,
 }
 
-// The palette follows the terminal only where the reader can see its
-// reports; elsewhere it stays the startup verdict for the whole run.
-#[cfg_attr(windows, allow(unused_mut))]
-pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppResult {
+/// Everything the loop needs that is not per-source: paint knobs, mode
+/// flags, and the pre-built chrome strings each constructor owns.
+pub(crate) struct SessionArgs {
+    pub once: bool,
+    pub clear: bool,
+    pub no_hide_cursor: bool,
+    pub no_sync: bool,
+    pub wrap: bool,
+    pub max_height: Option<u16>,
+    pub snapshot_dir: Option<std::path::PathBuf>,
+    pub snapshot_ansi: bool,
+    /// The run-constant footer suffix, pre-built by the constructor.
+    pub live_tail: String,
+    /// Reflow boxes and respawn every source on a resize; off means the
+    /// spawn step owns the geometry re-measure (one writer per mode).
+    pub resize_respawn: bool,
+}
+
+/// Parse the watch flags, build the one-source registry, run it. The
+/// surface is byte-frozen: the flags, footer, compose, and child
+/// environment all pass through unchanged.
+pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let triggers = args
         .trigger
         .iter()
@@ -60,25 +86,80 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         .collect::<anyhow::Result<Vec<TriggerSpec>>>()?;
     let interval = resolve_interval(args.interval.as_deref(), !triggers.is_empty())?;
     let debounce = parse_interval(&args.trigger_debounce)?;
+    // The footer label carries the user's own token; a defaulted interval
+    // reads as its literal default. Trigger-only mode has no token at all.
+    let interval_label = args
+        .interval
+        .as_deref()
+        .or(triggers.is_empty().then_some("2s"));
+    let live_tail = live_suffix(args.once, interval_label, !triggers.is_empty());
+    let registry = Registry::single(
+        SourceSpec {
+            name: String::new(),
+            command: if args.shell {
+                // A shell source keeps the raw script as ONE element,
+                // or split-then-join would destroy its quoting.
+                vec![args.command.join(" ")]
+            } else {
+                args.command.clone()
+            },
+            shell: args.shell,
+            interval,
+            triggers,
+            debounce,
+        },
+        args.title.clone(),
+    );
+    let session = SessionArgs {
+        once: args.once,
+        clear: args.clear,
+        no_hide_cursor: args.no_hide_cursor,
+        no_sync: args.no_sync,
+        wrap: !args.no_wrap,
+        max_height: args.max_height,
+        snapshot_dir: args.snapshot_dir.clone(),
+        snapshot_ansi: args.snapshot_ansi,
+        live_tail,
+        resize_respawn: false,
+    };
+    run_registry(registry, session, profile, palette)
+}
+
+// The palette follows the terminal only where the reader can see its
+// reports; elsewhere it stays the startup verdict for the whole run.
+#[cfg_attr(windows, allow(unused_mut))]
+pub(crate) fn run_registry(
+    registry: Registry,
+    session: SessionArgs,
+    profile: ColorProfile,
+    mut palette: Palette,
+) -> AppResult {
     let (interrupted, terminated) = register_signals()?;
+    let plain = matches!(registry.composition(), Composition::Plain { .. });
+    // Single-sourced trigger machinery, concatenated in registry order;
+    // per-source gates and watch sets come with the pane semantics.
+    let all_triggers: Vec<TriggerSpec> = registry
+        .ids()
+        .flat_map(|id| registry.spec(id).triggers.clone())
+        .collect();
 
     let stdout = std::io::stdout();
     let is_tty = stdout.is_tty();
     // Framing only makes sense on a terminal; piped output gets the plain
     // content so `rat watch | tee log` stays readable.
     let mut renderer = InlineRenderer::new(stdout.lock())
-        .with_cursor_hidden(is_tty && !args.no_hide_cursor)
-        .with_sync_output(is_tty && !args.no_sync)
-        .with_clear_screen(is_tty && args.clear);
+        .with_cursor_hidden(is_tty && !session.no_hide_cursor)
+        .with_sync_output(is_tty && !session.no_sync)
+        .with_clear_screen(is_tty && session.clear);
 
     // The looping tty mode reads keys (q quits, v pages the full frame), so
     // it owns the terminal input; children must not compete for it.
-    let interactive = is_tty && !args.once;
+    let interactive = is_tty && !session.once;
     // The event-wait routes need a terminal to wake; only the stat-poll
     // works piped, so the other schemes refuse early, before any
     // terminal state changes.
     if !interactive
-        && triggers
+        && all_triggers
             .iter()
             .any(|trigger| !matches!(trigger, TriggerSpec::File(_)))
     {
@@ -119,37 +200,50 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     #[cfg(unix)]
     let mut verify = VerifyState::default();
 
-    let title_line = args.title.as_ref().map(|title| {
-        StyleSpec {
-            bold: true,
-            ..StyleSpec::default()
-        }
-        .render(title, profile)
-    });
+    let title_line = match registry.composition() {
+        Composition::Plain { title } => title.as_ref().map(|title| {
+            StyleSpec {
+                bold: true,
+                ..StyleSpec::default()
+            }
+            .render(title, profile)
+        }),
+        Composition::Panes { .. } => None,
+    };
     let faint = StyleSpec {
         faint: true,
         ..StyleSpec::default()
     };
 
-    let mut schedule = TickSchedule::new(interval);
-    // On Windows `File` is the only variant, so this match is
-    // exhaustively Some and clippy wants a plain map — the unix arms
-    // are what make it a filter.
-    #[cfg_attr(windows, allow(clippy::unnecessary_filter_map))]
-    let mut file_watch = MtimeWatchSet::new(
-        triggers
-            .iter()
-            .filter_map(|trigger| match trigger {
-                TriggerSpec::File(path) => Some(path.clone()),
-                #[cfg(unix)]
-                _ => None,
-            })
-            .collect(),
-    );
+    let (tx, rx) = std::sync::mpsc::channel::<TickOutcome>();
+    let mut runtime: Vec<SourceRuntime> = registry
+        .ids()
+        .map(|id| SourceRuntime {
+            schedule: TickSchedule::new(registry.spec(id).interval),
+            slot: ChildSlot::default(),
+            tx: tx.clone(),
+            output: None,
+            hash: 0,
+            changed_at: jiff::Timestamp::UNIX_EPOCH,
+            posted: false,
+        })
+        .collect();
+    // Every exit from run_registry — return, `?`, panic — kills every
+    // in-flight child through these guards' Drop. A NAMED binding:
+    // `let _ =` would drop them here and now. One guard per slot, and
+    // no registry-level lock: a shared mutex would serialize spawns
+    // and could block a shutdown behind one of them.
+    let _shutdown: Vec<ShutdownGuard> = runtime.iter().map(|r| r.slot.guard()).collect();
+    let mut file_watch = MtimeWatchSet::new(file_paths(&all_triggers));
     // The baseline exists BEFORE the first spawn: a change landing
     // between the first child's start and the loop's first check must
     // be detected, never absorbed into the baseline.
     file_watch.fired();
+    let debounce = registry
+        .ids()
+        .next()
+        .map(|id| registry.spec(id).debounce)
+        .unwrap_or(SLICE);
     let mut gate = DebounceGate::new(debounce);
     // The fifo/fd reader threads: NAMED and long-lived — dropping this
     // vec joins every reader, so `let _ = …` would kill them here and
@@ -159,7 +253,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     let mut trigger_readers: Vec<ReaderSlot> = {
         let wake = tap.as_ref().map(TtyTap::sender);
         let mut readers = Vec::new();
-        for spec in &triggers {
+        for spec in &all_triggers {
             if matches!(spec, TriggerSpec::File(_)) {
                 continue; // polled in the loop, no thread
             }
@@ -178,26 +272,21 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         }
         readers
     };
-    // The footer label carries the user's own token; a defaulted interval
-    // reads as its literal default. Trigger-only mode has no token at all.
-    let interval_label = args
-        .interval
-        .as_deref()
-        .or(triggers.is_empty().then_some("2s"));
-    let live_tail = live_suffix(args.once, interval_label, !triggers.is_empty());
-    let slot = ChildSlot::default();
-    // Every exit from run() — return, `?`, panic — kills the in-flight
-    // child through this guard's Drop. A NAMED binding: `let _ =`
-    // would drop it here and now.
-    let _shutdown = slot.guard();
-    let (tx, rx) = std::sync::mpsc::channel::<TickOutcome>();
+    let live_tail = session.live_tail.clone();
+    // Loop-persistent geometry state: the one size/geometry pair the
+    // spawn step, the composer, and the (future) resize arm consume. It
+    // outlives the spawn branch — a completion can arrive in an
+    // iteration with no new spawn, and the composer still needs an
+    // in-scope geometry vector.
+    let mut size = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut geom = registry.geometry(size);
     let mut previous_key: Option<PaintKey> = None;
     let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
     let mut history = History::new();
     let mut view = ViewState {
-        wrap: !args.no_wrap,
+        wrap: session.wrap,
         hshift: 0,
         gutter: false,
         highlight: false,
@@ -213,37 +302,74 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             renderer.finish().context("restoring terminal")?;
             return Ok(());
         }
-        // 2. Start a child if one is due. At most one is ever in
-        // flight, and its environment is measured HERE, at the spawn
-        // instant, on this thread.
-        if schedule.poll(Instant::now()) == Due::Spawn {
-            let size = crossterm::terminal::size().unwrap_or((80, 24));
-            // Once mode has no loop to keep responsive: it runs the
-            // tick on this thread and posts it to the channel a worker
-            // would have used, so both modes share one completion
-            // handler. The same detour catches an OS that refuses a
-            // thread — that costs a stall, never a tick.
-            let mut inline = args.once;
-            if !inline {
-                let command = build_command(&args, interactive, palette.appearance, size);
-                inline = spawn_tick(command, SourceId(0), slot.clone(), tx.clone()).is_err();
+        // 2. Start every source that is due. Each source has at most
+        // one tick in flight; a child's environment is measured HERE,
+        // before its spawn, on this thread. Each mode has exactly ONE
+        // geometry re-measure site: without a resize arm the spawn
+        // step re-measures when something is about to start (the
+        // shipped cadence); with one, that arm is the pair's only
+        // writer — a coincident spawn would otherwise consume the new
+        // size first and blind the arm's change detection.
+        let now = Instant::now();
+        let due: Vec<SourceId> = registry
+            .ids()
+            .filter(|id| runtime[id.0].schedule.poll(now) == Due::Spawn)
+            .collect();
+        if !due.is_empty() {
+            if !session.resize_respawn {
+                size = crossterm::terminal::size().unwrap_or(size);
+                geom = registry.geometry(size);
             }
-            if inline {
-                let command = build_command(&args, interactive, palette.appearance, size);
-                let _ = tx.send(run_tick(command, SourceId(0)));
+            for id in due {
+                // Once mode has no loop to keep responsive: it runs the
+                // tick on this thread and posts it to the channel a
+                // worker would have used, so both modes share one
+                // completion handler. The same detour catches an OS
+                // that refuses a thread — that costs a stall, never a
+                // tick. It stays a single-source detour: N sources run
+                // inline would cost the sum of their runtimes, not the
+                // max.
+                let mut inline = session.once && plain;
+                if !inline {
+                    let command =
+                        source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
+                    inline = spawn_tick(
+                        command,
+                        id,
+                        runtime[id.0].slot.clone(),
+                        runtime[id.0].tx.clone(),
+                    )
+                    .is_err();
+                }
+                if inline {
+                    let command =
+                        source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
+                    let _ = runtime[id.0].tx.send(run_tick(command, id));
+                }
             }
         }
-        // 3. Collect a finished tick — at most one can be queued.
-        if let Ok(outcome) = rx.try_recv() {
+        // 3. Drain EVERY queued completion, then compose ONCE. The
+        // drain terminates in at most N iterations: one source can
+        // have at most one tick in flight, so it can post at most one
+        // outcome per iteration. Only per-source state is touched in
+        // here; painting inside this loop would put an intermediate
+        // composition on screen — the one thing the iteration order
+        // exists to prevent.
+        let mut drained: Vec<SourceId> = Vec::new();
+        let mut changed: Option<jiff::Timestamp> = None;
+        let mut newest = jiff::Timestamp::UNIX_EPOCH;
+        let mut piped_stderr: Vec<u8> = Vec::new();
+        while let Ok(outcome) = rx.try_recv() {
+            let id = outcome.source;
             let (stdout, stderr) = match outcome.spawn_error {
                 // Once mode fails loudly, before any paint; loop mode
                 // renders the failure as content so a transient error
                 // does not tear down the dashboard.
-                Some(err) if args.once => {
-                    return Err(anyhow!("running {:?}: {err}", args.command[0]).into());
+                Some(err) if session.once => {
+                    return Err(anyhow!("running {:?}: {err}", registry.spec(id).command[0]).into());
                 }
                 Some(err) => (
-                    format!("watch: {:?}: {err}", args.command[0]).into_bytes(),
+                    format!("watch: {:?}: {err}", registry.spec(id).command[0]).into_bytes(),
                     Vec::new(),
                 ),
                 None => (outcome.stdout, outcome.stderr),
@@ -251,42 +377,80 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             let mut combined = stdout.clone();
             combined.extend_from_slice(&stderr);
             let hash = signature(&combined);
+            let r = &mut runtime[id.0];
+            // A source's own rendered lines. Without panes this IS the
+            // whole frame — the shipped composer, shipped arguments,
+            // shipped bytes.
+            r.output = Some(match registry.composition() {
+                Composition::Plain { .. } => {
+                    compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty)
+                }
+                Composition::Panes { .. } => {
+                    unreachable!("the composed arm lands with the subcommand")
+                }
+            });
             // One clock per tick, stamped at COMPLETION on the worker:
             // the absolute stamp, the counting form, and the history
             // entry a scrub later shows all name the instant the
             // content became current — even when the completion waited
-            // (behind a pager, say) to be collected.
-            let now = outcome.at;
+            // (behind a pager, say) to be collected. Only a source
+            // whose OWN content changed may re-date the frame.
+            changed = fold_changed_at(changed, hash != r.hash, outcome.at);
+            newest = newest.max(outcome.at);
+            r.hash = hash;
+            r.changed_at = outcome.at;
+            r.posted = true;
+            piped_stderr = stderr;
+            drained.push(id);
+        }
+        if !drained.is_empty() {
+            let content = combined_hash(&runtime);
             // The live status row names the ABSOLUTE local time of the
             // last content change: a counting age would change every
-            // tick and defeat the repaint gate. Tracked against the
-            // tick hash, independent of whether the gate repaints.
-            let (changed_at, since) = match live.take() {
-                Some(prev) if prev.hash == hash => (prev.changed_at, prev.since),
-                _ => (now, local_hms(now)),
+            // tick and defeat the repaint gate. A drain in which
+            // nothing actually changed carries the previous stamp
+            // forward; with no previous frame the newest completion
+            // dates it, which is the shipped first-frame behavior.
+            let (changed_at, since) = match (changed, live.take()) {
+                (Some(at), _) => (at, local_hms(at)),
+                (None, Some(prev)) => (prev.changed_at, prev.since),
+                (None, None) => (newest, local_hms(newest)),
             };
-            // The terminal size joins the change key: a resize must
+            // The terminal size joins the paint key: a resize must
             // repaint even when the content is unchanged. So does the
             // appearance: a palette swap must repaint even when the
-            // child prints the same bytes.
-            let size = crossterm::terminal::size().unwrap_or((80, 24));
-            // Composed above the repaint gate: the newest frame is
-            // tracked on every completion, so paging always acts on
-            // the newest content.
+            // child prints the same bytes. Without a resize arm this
+            // is the collect-time measure shipped watch takes — the
+            // same single-writer mode the spawn step uses; with one,
+            // the arm keeps the pair fresh every iteration.
+            if !session.resize_respawn {
+                size = crossterm::terminal::size().unwrap_or(size);
+                geom = registry.geometry(size);
+            }
+            // Composed once, above the repaint gate: the newest frame
+            // is tracked on every completion, so paging always acts on
+            // the newest content. Combining the single source's output
+            // is the identity — the bytes cannot drift.
+            let lines: Vec<String> = match registry.composition() {
+                Composition::Plain { .. } => runtime[0].output.clone().unwrap_or_default(),
+                Composition::Panes { .. } => {
+                    unreachable!("the composed arm lands with the subcommand")
+                }
+            };
             let current = Live {
-                lines: compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty),
-                hash,
+                lines,
+                hash: content,
                 changed_at,
                 since,
             };
             if is_tty {
                 // Every distinct frame is retained (byte-capped,
                 // deduped) so the scrub keys can walk back through it.
-                history.record(hash, &current.lines, now);
+                history.record(current.hash, &current.lines, newest);
             }
             // A resize while frozen must not leave the window past the frame.
             if let Some(p) = pause.as_mut() {
-                let window = usize::from(window_rows(args.max_height, size.1));
+                let window = usize::from(window_rows(session.max_height, size.1));
                 p.scroll = p.scroll.clamp(p.frozen.len(), window);
             }
             // A live window rides the tail whatever shape the frame takes:
@@ -295,7 +459,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             // collapses to the live view. Freezing is never implicit — the
             // history ring holds any moment that slides away.
             if let Some(ls) = live_scroll {
-                let window = usize::from(window_rows(args.max_height, size.1));
+                let window = usize::from(window_rows(session.max_height, size.1));
                 let re = ls.reanchor(current.lines.len(), window);
                 live_scroll = (!re.at_top()).then_some(re);
             }
@@ -330,7 +494,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                         view,
                         None,
                         size,
-                        args.max_height,
+                        session.max_height,
                         &faint,
                         profile,
                         &history,
@@ -342,25 +506,30 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     }
                     out.flush().context("flushing")?;
                     // Piped mode keeps the streams separate for log readability.
-                    if !stderr.is_empty() {
+                    if !piped_stderr.is_empty() {
                         let mut err = std::io::stderr().lock();
-                        err.write_all(&stderr).context("writing stderr")?;
+                        err.write_all(&piped_stderr).context("writing stderr")?;
                         err.flush().context("flushing stderr")?;
                     }
                 }
             }
             live = Some(current);
-            if args.once {
+            // The deadline is set when a tick COMPOSES, not when it is
+            // drained: the fixed delay counts from the frame the reader
+            // actually saw.
+            for id in &drained {
+                runtime[id.0].schedule.completed(Instant::now());
+            }
+            if session.once && runtime.iter().all(|r| r.posted) {
                 break;
             }
-            schedule.completed(Instant::now());
         }
         // 3b. External triggers: collapse fires into one respawn
         // request per debounce window. Sits BEFORE the non-interactive
         // branch below so a piped watch refreshes on file changes too;
         // the spawn this requests happens on the next iteration's step
         // 2, at most one slice away.
-        if !triggers.is_empty() {
+        if !all_triggers.is_empty() {
             let now = Instant::now();
             #[cfg(unix)]
             let mut ended_notices: Vec<String> = Vec::new();
@@ -380,7 +549,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
             if gate.due(now) {
                 // A fired trigger observed a change any in-flight child
                 // predates: a respawn, never a plain request.
-                schedule.request_respawn();
+                runtime[0].schedule.request_respawn();
             }
             // Every source that ended this iteration is named in ONE
             // one-shot notice row; with no frame yet the batch drops.
@@ -398,17 +567,22 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     view,
                     Some(notice),
                     size,
-                    args.max_height,
+                    session.max_height,
                     &faint,
                     profile,
                     &history,
                 )?);
             }
         }
-        // 4. How long we may sleep: never past the next spawn, never
-        // past one slice, so a signal, a key, and a completing child
-        // are all noticed promptly.
-        let nap = schedule.nap(Instant::now(), SLICE);
+        // 4. How long we may sleep: never past the SOONEST deadline,
+        // never past one slice, so a signal, a key, and a completing
+        // child are all noticed promptly — and no source waits on
+        // another's cadence.
+        let nap = runtime
+            .iter()
+            .map(|r| r.schedule.nap(Instant::now(), SLICE))
+            .min()
+            .unwrap_or(SLICE);
         if !interactive {
             std::thread::sleep(nap);
             continue;
@@ -433,7 +607,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                     view,
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
-                    args.max_height,
+                    session.max_height,
                     &faint,
                     profile,
                     &history,
@@ -498,7 +672,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             // and search over the bindings comes free.
                             let help;
                             let content: &[String] = if action == WatchAction::Help {
-                                help = help_lines(&triggers);
+                                help = help_lines(&all_triggers);
                                 &help
                             } else {
                                 pause.as_ref().map_or(&live.lines, |p| &p.frozen)
@@ -557,7 +731,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 pager_notice,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -572,7 +746,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             // live viewport — freezing is explicit (p or
                             // <), never a side effect of navigation.
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
-                            let window = usize::from(window_rows(args.max_height, size.1));
+                            let window = usize::from(window_rows(session.max_height, size.1));
                             if let Some(p) = pause.as_mut() {
                                 p.scroll = p.scroll.step(step, p.frozen.len(), window);
                             } else if let Some(ls) = live_scroll {
@@ -599,7 +773,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 None,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -614,7 +788,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             // must visibly answer even while a slow child is
                             // still running.
                             if pause.take().is_some() {
-                                schedule.request_now();
+                                runtime[0].schedule.request_now();
                             }
                             live_scroll = None;
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
@@ -628,7 +802,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 None,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -640,7 +814,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             // place. From a live window it freezes at the
                             // current offset; from the live view at zero.
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
-                            let window = usize::from(window_rows(args.max_height, size.1));
+                            let window = usize::from(window_rows(session.max_height, size.1));
                             let offset = live_scroll.map_or(0, LiveScroll::offset);
                             pause.get_or_insert_with(|| PauseState {
                                 frozen: live.lines.clone(),
@@ -661,7 +835,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 None,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -691,7 +865,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             };
                             let Some(entry) = entry else { continue };
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
-                            let window = usize::from(window_rows(args.max_height, size.1));
+                            let window = usize::from(window_rows(session.max_height, size.1));
                             // The scroll position is held across steps
                             // — a watched line stays under the eye.
                             let scroll = pause
@@ -720,7 +894,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 None,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -762,7 +936,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 None,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -775,7 +949,8 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                             // through the notice row of an in-place paint.
                             let text = snapshot_frame(
                                 pause.as_ref().map_or(&live.lines, |p| &p.frozen),
-                                &args,
+                                session.snapshot_dir.as_deref(),
+                                session.snapshot_ansi,
                             );
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
@@ -788,7 +963,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 Some(text),
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -819,7 +994,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                         // environment. A RESPAWN, not a plain request: the
                         // in-flight child was started under the old
                         // RAT_APPEARANCE and cannot satisfy this.
-                        schedule.request_respawn();
+                        runtime[0].schedule.request_respawn();
                         if let Some(live) = live.as_ref() {
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
@@ -832,7 +1007,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
                                 view,
                                 debug_notice,
                                 size,
-                                args.max_height,
+                                session.max_height,
                                 &faint,
                                 profile,
                                 &history,
@@ -1401,14 +1576,13 @@ fn paint_frame(
 /// Write `lines` to a timestamped file and describe the outcome for the
 /// notice row. The snapshot is the data, not the viewport: wrap, shift,
 /// and scroll state never change what lands in the file.
-fn snapshot_frame(lines: &[String], args: &WatchArgs) -> String {
-    let dir = args
-        .snapshot_dir
-        .clone()
+fn snapshot_frame(lines: &[String], dir: Option<&std::path::Path>, ansi: bool) -> String {
+    let dir = dir
+        .map(std::path::Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let stamp = snapshot_stamp(&jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::system()));
-    let body = snapshot_body(lines, args.snapshot_ansi);
+    let body = snapshot_body(lines, ansi);
     match write_snapshot(&dir, &stamp, &body) {
         Ok(path) => format!("snapshot → {}", path.display()),
         Err(err) => format!("snapshot failed ({err}) — set --snapshot-dir or RAT_SNAPSHOT_DIR"),
@@ -1491,32 +1665,54 @@ fn spawn_first(pagers: &[PagerCommand]) -> std::io::Result<(String, std::process
 /// The child for one tick, fully configured on the loop thread: the
 /// shell or direct form, a null stdin while we own the keyboard, and
 /// the per-tick environment measured by the CALLER — whoever runs the
-/// command never reads the terminal and never sees the palette.
-fn build_command(
-    args: &WatchArgs,
+/// command never reads the terminal and never sees the palette. This
+/// function is the seam a future non-process source would replace:
+/// everything upstream of it deals only in a spec and a geometry.
+fn build_source_command(
+    spec: &SourceSpec,
     interactive: bool,
     appearance: Appearance,
-    size: (u16, u16),
+    geom: PaneGeometry,
 ) -> std::process::Command {
-    let mut command = if args.shell {
-        shell_command(&args.command.join(" "))
+    let mut command = if spec.shell {
+        // A shell spec holds the raw script as one element, so the
+        // join reproduces it byte for byte.
+        shell_command(&spec.command.join(" "))
     } else {
-        let mut cmd = std::process::Command::new(&args.command[0]);
-        cmd.args(&args.command[1..]);
+        let mut cmd = std::process::Command::new(&spec.command[0]);
+        cmd.args(&spec.command[1..]);
         cmd
     };
     if interactive {
         command.stdin(std::process::Stdio::null());
     }
-    // Children lay out against the frame without a tty side channel: the
-    // size is re-measured every tick, so scripts adapt to resizes live.
-    let (cols, rows) = size;
-    command.env("RAT_WIDTH", cols.to_string());
-    command.env("RAT_HEIGHT", rows.to_string());
+    // Children lay out against their pane without a tty side channel:
+    // the geometry is re-measured every tick, so scripts adapt to
+    // resizes live. Without panes the inner size IS the terminal size,
+    // so the plain-watch environment cannot move.
+    command.env("RAT_WIDTH", geom.inner_cols.to_string());
+    command.env("RAT_HEIGHT", geom.inner_rows.to_string());
     // Children inherit the controlling terminal, so a child that resolved its
     // own appearance would query a terminal this process is reading from.
     // Hand it the verdict instead.
     command.env("RAT_APPEARANCE", appearance.as_str());
+    command
+}
+
+/// `build_source_command` plus the pane identity, which only exists
+/// under a declared layout: `Registry::pane` answers `None` without
+/// one, so no RAT_PANE is ever exported to a plain watch child.
+fn source_command(
+    registry: &Registry,
+    id: SourceId,
+    interactive: bool,
+    appearance: Appearance,
+    geom: PaneGeometry,
+) -> std::process::Command {
+    let mut command = build_source_command(registry.spec(id), interactive, appearance, geom);
+    if registry.pane(id).is_some() {
+        command.env("RAT_PANE", &registry.spec(id).name);
+    }
     command
 }
 
@@ -1607,6 +1803,66 @@ fn adopt(palette: &mut Palette, reported: Appearance) -> bool {
     }
     *palette = Palette::builtin(reported, AppearanceSource::Notification);
     true
+}
+
+/// Runtime state per source: the schedule, the slot, and everything the
+/// drain updates. The registry itself stays pure — these are the
+/// resources it deliberately does not carry.
+struct SourceRuntime {
+    schedule: TickSchedule,
+    slot: ChildSlot,
+    tx: std::sync::mpsc::Sender<TickOutcome>,
+    /// This source's rendered lines: without panes, the whole frame the
+    /// shipped composer produced; with them, the child's own lines
+    /// awaiting their box.
+    output: Option<Vec<String>>,
+    hash: u64,
+    changed_at: jiff::Timestamp,
+    /// Whether this source has completed at least once — the once-mode
+    /// exit condition at N sources.
+    posted: bool,
+}
+
+/// The change key: a combining hash over the per-source OUTPUT hashes
+/// in registry order. Never over composed bytes — a resize would then
+/// re-date the content and record a spurious distinct frame.
+fn combined_hash(runtime: &[SourceRuntime]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    for r in runtime {
+        r.hash.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Fold one drained outcome into the frame's change stamp: only a
+/// source whose OWN content changed may re-date the frame, and the
+/// newest such stamp wins.
+fn fold_changed_at(
+    acc: Option<jiff::Timestamp>,
+    changed: bool,
+    at: jiff::Timestamp,
+) -> Option<jiff::Timestamp> {
+    match (acc, changed) {
+        (acc, false) => acc,
+        (Some(best), true) => Some(best.max(at)),
+        (None, true) => Some(at),
+    }
+}
+
+/// The `file:` paths among a set of triggers. On Windows `File` is the
+/// only variant, so the match is exhaustively `Some` and clippy wants a
+/// plain map — the unix arms are what make it a filter.
+#[cfg_attr(windows, allow(clippy::unnecessary_filter_map))]
+fn file_paths(triggers: &[TriggerSpec]) -> Vec<std::path::PathBuf> {
+    triggers
+        .iter()
+        .filter_map(|trigger| match trigger {
+            TriggerSpec::File(path) => Some(path.clone()),
+            #[cfg(unix)]
+            _ => None,
+        })
+        .collect()
 }
 
 fn signature(bytes: &[u8]) -> u64 {
@@ -2127,22 +2383,102 @@ mod tests {
         );
     }
 
-    fn watch_args(command: &[&str], shell: bool) -> WatchArgs {
-        WatchArgs {
-            interval: Some("2s".to_string()),
-            trigger: Vec::new(),
-            trigger_debounce: "250ms".to_string(),
-            once: false,
-            clear: false,
-            no_hide_cursor: false,
-            no_sync: false,
-            shell,
-            title: None,
-            max_height: None,
-            snapshot_dir: None,
-            snapshot_ansi: false,
-            no_wrap: false,
+    fn stamp(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(secs).expect("a representable second")
+    }
+
+    /// A runtime carrying nothing but the output hash the key folds.
+    /// The channel end is real but never used: these tests exercise
+    /// the pure pieces, not the loop.
+    fn runtime_with(hash: u64) -> SourceRuntime {
+        let (tx, _rx) = std::sync::mpsc::channel::<TickOutcome>();
+        SourceRuntime {
+            schedule: TickSchedule::new(Some(Duration::from_secs(2))),
+            slot: ChildSlot::default(),
+            tx,
+            output: None,
+            hash,
+            changed_at: stamp(0),
+            posted: false,
+        }
+    }
+
+    #[test]
+    fn the_combining_key_changes_when_any_source_changes() {
+        // The key is folded over the per-source OUTPUT hashes in
+        // registry order: one pane moving must re-key the frame, and
+        // two panes trading content must not collide with the
+        // original — order is part of the key, not just membership.
+        let base = [runtime_with(11), runtime_with(22)];
+        let moved = [runtime_with(11), runtime_with(23)];
+        let traded = [runtime_with(22), runtime_with(11)];
+        assert_ne!(combined_hash(&base), combined_hash(&moved));
+        assert_ne!(combined_hash(&base), combined_hash(&traded));
+    }
+
+    #[test]
+    fn the_combining_key_is_stable_when_no_source_changes() {
+        // Byte-silence's precondition: an unchanged dashboard keys
+        // identically every iteration, or the gate repaints forever.
+        let now = [runtime_with(11), runtime_with(22)];
+        let again = [runtime_with(11), runtime_with(22)];
+        assert_eq!(combined_hash(&now), combined_hash(&again));
+        // And the key is content-only: geometry reaches the gate
+        // through PaintKey.cols/rows, never through here.
+        assert_eq!(combined_hash(&[]), combined_hash(&[]));
+    }
+
+    #[test]
+    fn changed_at_takes_the_newest_changed_source() {
+        // Two panes both moved in one drain: the frame is as fresh as
+        // the newest of them, whichever order the channel handed them
+        // over.
+        let early = stamp(10);
+        let late = stamp(40);
+        assert_eq!(
+            fold_changed_at(fold_changed_at(None, true, early), true, late),
+            Some(late)
+        );
+        assert_eq!(
+            fold_changed_at(fold_changed_at(None, true, late), true, early),
+            Some(late)
+        );
+    }
+
+    #[test]
+    fn changed_at_ignores_an_unchanged_source_that_completed_later() {
+        // Only a source whose OWN content changed may re-date the
+        // frame. A heartbeat pane printing the same bytes every second
+        // must never make the dashboard read as fresher than it is.
+        let changed = stamp(10);
+        let quiet = stamp(40);
+        assert_eq!(
+            fold_changed_at(fold_changed_at(None, true, changed), false, quiet),
+            Some(changed)
+        );
+        // Nothing changed at all: the caller carries (changed_at,
+        // since) forward from the previous frame.
+        assert_eq!(fold_changed_at(None, false, quiet), None);
+    }
+
+    fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
+        SourceSpec {
+            name: String::new(),
             command: command.iter().map(|s| s.to_string()).collect(),
+            shell,
+            interval: Some(Duration::from_secs(2)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+        }
+    }
+
+    /// The plain-watch geometry: the terminal size, verbatim.
+    fn terminal_geom(cols: u16, rows: u16) -> PaneGeometry {
+        PaneGeometry {
+            cells: cols,
+            rows,
+            inner_cols: cols,
+            inner_rows: rows,
         }
     }
 
@@ -2160,8 +2496,8 @@ mod tests {
 
     #[test]
     fn every_child_is_told_the_frame_size_and_appearance() {
-        let args = watch_args(&["some-tool", "--flag"], false);
-        let cmd = build_command(&args, true, Appearance::Light, (100, 40));
+        let spec = source_spec(&["some-tool", "--flag"], false);
+        let cmd = build_source_command(&spec, true, Appearance::Light, terminal_geom(100, 40));
         let envs: std::collections::HashMap<String, String> = cmd
             .get_envs()
             .filter_map(|(k, v)| {
@@ -2181,8 +2517,8 @@ mod tests {
 
     #[test]
     fn direct_mode_runs_the_command_verbatim() {
-        let args = watch_args(&["some-tool", "--flag", "value"], false);
-        let cmd = build_command(&args, false, Appearance::Dark, (80, 24));
+        let spec = source_spec(&["some-tool", "--flag", "value"], false);
+        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(program_of(&cmd), "some-tool");
         assert_eq!(argv_of(&cmd), ["--flag", "value"]);
     }
@@ -2216,8 +2552,8 @@ mod tests {
 
     #[test]
     fn shell_mode_goes_through_the_platform_shell() {
-        let args = watch_args(&["echo hi"], true);
-        let cmd = build_command(&args, false, Appearance::Dark, (80, 24));
+        let spec = source_spec(&["echo hi"], true);
+        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         #[cfg(unix)]
         {
             assert_eq!(program_of(&cmd), "sh");
