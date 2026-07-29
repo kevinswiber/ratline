@@ -6,22 +6,156 @@ use anyhow::{Context, anyhow, bail};
 
 use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
 
-/// Every node name a pane or `defaults` block accepts, in the order the
-/// teaching error lists them.
-const PANE_NODES: &[&str] = &[
-    "command",
-    "shell",
-    "interval",
-    "trigger",
-    "trigger-debounce",
-    "height",
-    "width",
-    "overflow",
-    "border",
-    "padding",
-    "title",
-    "chrome",
+/// The one function that puts a key's value on the declaration. The
+/// variant IS the key's shape: it says what the value looks like, and
+/// therefore where it may be written — a KDL property holds exactly one
+/// value, so only `List` lacks a property spelling.
+enum Set {
+    Text(fn(&mut PaneDecl, String)),
+    Count(fn(&mut PaneDecl, i128, &Ctx<'_>) -> anyhow::Result<()>),
+    Flag(fn(&mut PaneDecl, bool)),
+    List(fn(&mut PaneDecl, Vec<String>, &Ctx<'_>) -> anyhow::Result<()>),
+}
+
+impl Set {
+    /// A list key has no property spelling; every other shape has both.
+    fn takes_a_property(&self) -> bool {
+        !matches!(self, Set::List(_))
+    }
+}
+
+/// One key a `pane` or `defaults` block accepts: its name, the example
+/// every teaching error shows, and the one function that applies it.
+/// Dispatch, property legality and every accepted-set list read THIS —
+/// a new key is one row here and nothing else.
+struct Key {
+    name: &'static str,
+    example: &'static str,
+    set: Set,
+}
+
+const PANE_KEYS: &[Key] = &[
+    Key {
+        name: "command",
+        example: r#"command "git" "log""#,
+        set: Set::List(set_command),
+    },
+    Key {
+        name: "shell",
+        example: "shell #true",
+        set: Set::Flag(|d, v| d.shell = Some(v)),
+    },
+    Key {
+        name: "interval",
+        example: r#"interval "5s""#,
+        set: Set::Text(|d, v| d.interval = Some(v)),
+    },
+    Key {
+        name: "trigger",
+        example: r#"trigger "file:./stamp""#,
+        set: Set::List(|d, v, _| {
+            d.trigger = Some(v);
+            Ok(())
+        }),
+    },
+    Key {
+        name: "trigger-debounce",
+        example: r#"trigger-debounce "250ms""#,
+        set: Set::Text(|d, v| d.trigger_debounce = Some(v)),
+    },
+    Key {
+        name: "height",
+        example: "height 7",
+        set: Set::Count(set_height),
+    },
+    Key {
+        name: "width",
+        example: r#"width "2fr""#,
+        set: Set::Text(|d, v| d.width = Some(v)),
+    },
+    Key {
+        name: "overflow",
+        example: r#"overflow "keep-bottom""#,
+        set: Set::Text(|d, v| d.overflow = Some(v)),
+    },
+    Key {
+        name: "border",
+        example: r#"border "rounded""#,
+        set: Set::Text(|d, v| d.border = Some(v)),
+    },
+    Key {
+        name: "padding",
+        example: r#"padding "0 1""#,
+        set: Set::Text(|d, v| d.padding = Some(v)),
+    },
+    Key {
+        name: "title",
+        example: r#"title "Recent commits""#,
+        set: Set::Text(|d, v| d.title = Some(v)),
+    },
+    Key {
+        name: "chrome",
+        example: "chrome #false",
+        set: Set::Flag(|d, v| d.chrome = Some(v)),
+    },
 ];
+
+/// What a setter needs beyond the value: the phrase every teaching
+/// error opens with, and the shell mode in force where the command was
+/// written — the one thing the parser resolves against defaults.
+struct Ctx<'a> {
+    at: &'a str,
+    shell: bool,
+}
+
+fn set_command(decl: &mut PaneDecl, argv: Vec<String>, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    decl.command = Some(match argv.as_slice() {
+        // One word under `shell` stays one word.
+        [script] if ctx.shell => vec![script.clone()],
+        // An unbalanced string is a parse error naming the pane — never
+        // a one-word fallback that survives to a spawn.
+        [line] => shell_words::split(line)
+            .map_err(|err| anyhow!("{}: command has unbalanced quoting ({err})", ctx.at))?,
+        argv => argv.to_vec(),
+    });
+    Ok(())
+}
+
+fn set_height(decl: &mut PaneDecl, cells: i128, ctx: &Ctx<'_>) -> anyhow::Result<()> {
+    decl.height = Some(u16::try_from(cells).map_err(|_| {
+        anyhow!(
+            "{}: height must be a non-negative integer (max 65535)",
+            ctx.at
+        )
+    })?);
+    Ok(())
+}
+
+fn key(name: &str) -> Option<&'static Key> {
+    PANE_KEYS.iter().find(|k| k.name == name)
+}
+
+/// The keys legal in the position the error is complaining about.
+fn key_list(property_position: bool) -> String {
+    PANE_KEYS
+        .iter()
+        .filter(|k| !property_position || k.set.takes_a_property())
+        .map(|k| k.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every shape error is generated from the key's own example, so there
+/// is no per-key error text to keep in step with the table.
+fn shape_err(k: &Key, at: &str) -> anyhow::Error {
+    let takes = match k.set {
+        Set::Text(_) => "one string",
+        Set::Count(_) => "one integer",
+        Set::Flag(_) => "#true or #false",
+        Set::List(_) => "one or more strings",
+    };
+    anyhow!("{at}: `{}` takes {takes} — write `{}`", k.name, k.example)
+}
 
 pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
     let doc: kdl::KdlDocument = text.parse().context("reading the dashboard KDL")?;
@@ -59,57 +193,90 @@ fn pane_block(
     default_shell: bool,
 ) -> anyhow::Result<PaneDecl> {
     let children = node.children();
+    let at = match name.as_deref() {
+        Some(name) => format!("pane {name:?}"),
+        None => "defaults".to_string(),
+    };
     let shell = children
         .and_then(|doc| doc.get("shell"))
-        .map(bool_value)
+        .map(|child| one_flag(child, key("shell").expect("`shell` is a pane key"), &at))
         .transpose()?;
-    let label = name.as_deref().unwrap_or("defaults").to_string();
+    let ctx = Ctx {
+        at: &at,
+        shell: shell.unwrap_or(default_shell),
+    };
     let mut decl = PaneDecl {
         name,
-        shell,
         ..PaneDecl::default()
     };
     let Some(children) = children else {
         return Ok(decl);
     };
     for child in children.nodes() {
-        match child.name().value() {
-            "command" => {
-                let argv = strings(child)?;
-                decl.command = Some(match argv.as_slice() {
-                    // One word under `shell` stays one word.
-                    [script] if shell.unwrap_or(default_shell) => vec![script.clone()],
-                    // An unbalanced string is a parse error naming the
-                    // pane — never a one-word fallback that survives
-                    // to a spawn.
-                    [line] => shell_words::split(line).map_err(|err| {
-                        anyhow!("pane {label:?}: command has unbalanced quoting ({err})")
-                    })?,
-                    argv => argv.to_vec(),
-                });
-            }
-            "shell" => {} // read above
-            "chrome" => decl.chrome = Some(bool_value(child)?),
-            "trigger" => decl.trigger = Some(strings(child)?),
-            "height" => {
-                decl.height = Some(u16::try_from(first_int(child)?).map_err(|_| {
-                    anyhow!("pane {label:?}: height must be a non-negative integer (max 65535)")
-                })?);
-            }
-            "interval" => decl.interval = Some(first_string(child)?),
-            "trigger-debounce" => decl.trigger_debounce = Some(first_string(child)?),
-            "width" => decl.width = Some(first_string(child)?),
-            "overflow" => decl.overflow = Some(first_string(child)?),
-            "border" => decl.border = Some(first_string(child)?),
-            "padding" => decl.padding = Some(first_string(child)?),
-            "title" => decl.title = Some(first_string(child)?),
-            other => bail!(
-                "unknown node {other:?}: expected one of {}",
-                PANE_NODES.join(", ")
-            ),
+        let name = child.name().value();
+        let Some(k) = key(name) else {
+            bail!(
+                "{at}: unknown node {name:?} — a pane's keys are {}",
+                key_list(false)
+            );
+        };
+        match k.set {
+            Set::Text(set) => set(&mut decl, one_text(child, k, &at)?),
+            Set::Count(set) => set(&mut decl, one_count(child, k, &at)?, &ctx)?,
+            Set::Flag(set) => set(&mut decl, one_flag(child, k, &at)?),
+            Set::List(set) => set(&mut decl, many_text(child, k, &at)?, &ctx)?,
         }
     }
     Ok(decl)
+}
+
+/// Every positional entry of a node — the values a key was written with.
+fn positional(node: &kdl::KdlNode) -> Vec<&kdl::KdlValue> {
+    node.entries()
+        .iter()
+        .filter(|entry| entry.name().is_none())
+        .map(kdl::KdlEntry::value)
+        .collect()
+}
+
+fn one_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<String> {
+    match positional(node).as_slice() {
+        [value] => value
+            .as_string()
+            .map(str::to_string)
+            .ok_or_else(|| shape_err(k, at)),
+        _ => Err(shape_err(k, at)),
+    }
+}
+
+fn one_count(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<i128> {
+    match positional(node).as_slice() {
+        [value] => value.as_integer().ok_or_else(|| shape_err(k, at)),
+        _ => Err(shape_err(k, at)),
+    }
+}
+
+fn one_flag(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<bool> {
+    match positional(node).as_slice() {
+        [value] => value.as_bool().ok_or_else(|| shape_err(k, at)),
+        _ => Err(shape_err(k, at)),
+    }
+}
+
+fn many_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<Vec<String>> {
+    let values = positional(node);
+    if values.is_empty() {
+        return Err(shape_err(k, at));
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            value
+                .as_string()
+                .map(str::to_string)
+                .ok_or_else(|| shape_err(k, at))
+        })
+        .collect()
 }
 
 /// `layout { row "a"; row "b" "c"; row { column "d" "e" } }` — a
@@ -170,14 +337,6 @@ fn first_int(node: &kdl::KdlNode) -> anyhow::Result<i128> {
         .find(|entry| entry.name().is_none())
         .and_then(|entry| entry.value().as_integer())
         .ok_or_else(|| anyhow!("{}: expected an integer", node.name().value()))
-}
-
-fn bool_value(node: &kdl::KdlNode) -> anyhow::Result<bool> {
-    node.entries()
-        .iter()
-        .find(|entry| entry.name().is_none())
-        .and_then(|entry| entry.value().as_bool())
-        .ok_or_else(|| anyhow!("{}: expected #true or #false", node.name().value()))
 }
 
 /// Checked, field-named conversion: a negative value must FAIL LOUDLY,
@@ -281,13 +440,64 @@ layout {
         );
     }
 
+    /// One table, twelve keys: every key a pane accepts must land on
+    /// the declaration through it. A key the table forgets shows up
+    /// here as a `None` field, not as a silently ignored node.
     #[test]
-    fn an_unknown_kdl_node_names_the_accepted_set() {
+    fn every_pane_key_reaches_the_declaration_through_one_table() {
+        let file = parse(
+            r#"
+pane "all" {
+    command "git" "log"
+    shell #false
+    interval "5s"
+    trigger "file:./stamp" "file:./notes"
+    trigger-debounce "250ms"
+    height 7
+    width "2fr"
+    overflow "keep-bottom"
+    border "rounded"
+    padding "0 1"
+    title "Recent commits"
+    chrome #false
+}
+"#,
+        )
+        .expect("parses");
+        let pane = &file.panes[0];
+        assert_eq!(pane.name.as_deref(), Some("all"));
+        assert_eq!(
+            pane.command,
+            Some(vec!["git".to_string(), "log".to_string()])
+        );
+        assert_eq!(pane.shell, Some(false));
+        assert_eq!(pane.interval.as_deref(), Some("5s"));
+        assert_eq!(
+            pane.trigger,
+            Some(vec!["file:./stamp".to_string(), "file:./notes".to_string()])
+        );
+        assert_eq!(pane.trigger_debounce.as_deref(), Some("250ms"));
+        assert_eq!(pane.height, Some(7));
+        assert_eq!(pane.width.as_deref(), Some("2fr"));
+        assert_eq!(pane.overflow.as_deref(), Some("keep-bottom"));
+        assert_eq!(pane.border.as_deref(), Some("rounded"));
+        assert_eq!(pane.padding.as_deref(), Some("0 1"));
+        assert_eq!(pane.title.as_deref(), Some("Recent commits"));
+        assert_eq!(pane.chrome, Some(false));
+    }
+
+    /// The teaching error names the pane it happened in, the token the
+    /// user wrote, and the keys they meant — all three read off the one
+    /// table. Supersedes `an_unknown_kdl_node_names_the_accepted_set`,
+    /// which could not name the pane.
+    #[test]
+    fn an_unknown_pane_key_names_the_pane_and_the_keys() {
         let err = format!(
             "{:#}",
-            parse("pane \"a\" {\n    comand \"date\"\n    height 3\n}\n").unwrap_err()
+            parse("pane \"log\" {\n    comand \"date\"\n    height 3\n}\n").unwrap_err()
         );
-        assert!(err.contains("comand"), "{err}");
+        assert!(err.contains("log"), "names the pane: {err}");
+        assert!(err.contains("comand"), "quotes what was written: {err}");
         assert!(err.contains("command"), "{err}");
         assert!(err.contains("interval"), "{err}");
     }
