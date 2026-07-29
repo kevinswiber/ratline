@@ -131,6 +131,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
     };
 
     let mut schedule = TickSchedule::new(interval);
+    // On Windows `File` is the only variant, so this match is
+    // exhaustively Some and clippy wants a plain map — the unix arms
+    // are what make it a filter.
+    #[cfg_attr(windows, allow(clippy::unnecessary_filter_map))]
     let mut file_watch = MtimeWatchSet::new(
         triggers
             .iter()
