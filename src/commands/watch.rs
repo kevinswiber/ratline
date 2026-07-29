@@ -25,7 +25,7 @@ use crate::term::scroll::{
 };
 use crate::term::tap::TapEvent;
 #[cfg(unix)]
-use crate::term::tap::{TapScanner, TtyTap};
+use crate::term::tap::{TapChunk, TapScanner, TtyTap};
 #[cfg(unix)]
 use crate::term::theme_notify::{OscColorKind, ThemeNotifyGuard, classify_colors, may_subscribe};
 use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
@@ -397,10 +397,18 @@ pub fn run(args: WatchArgs, profile: ColorProfile, mut palette: Palette) -> AppR
         }
         #[cfg(unix)]
         let events = match tap.as_ref() {
-            Some(tap) => match tap.recv_timeout(nap) {
-                Some(chunk) => scanner.feed(&chunk),
-                None => scanner.idle(nap),
-            },
+            Some(tap) => {
+                let waited = Instant::now();
+                match tap.recv_timeout(nap) {
+                    Some(TapChunk::Tty(chunk)) => scanner.feed(&chunk),
+                    // An early wake is NOT a timed-out slice: account
+                    // the real elapsed silence so a pending bare ESC
+                    // still resolves honestly. The wake itself carries
+                    // nothing — the trigger block reads the fired flag.
+                    Some(TapChunk::Trigger) => scanner.idle(waited.elapsed()),
+                    None => scanner.idle(nap),
+                }
+            }
             None => crossterm_slice(nap)?,
         };
         #[cfg(windows)]

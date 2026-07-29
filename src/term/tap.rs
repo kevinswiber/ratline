@@ -199,6 +199,22 @@ struct TapControl {
     shutdown: std::sync::atomic::AtomicBool,
 }
 
+/// One message on the tap's channel. Wrapping the raw bytes in an
+/// envelope lets a trigger reader wake the receiver early through the
+/// same channel — the wake carries no data (the fired flag is the
+/// source of truth), it exists so `recv_timeout` returns now instead of
+/// at the slice's end.
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum TapChunk {
+    /// Raw bytes from the terminal device.
+    Tty(Vec<u8>),
+    /// A trigger reader's wake.
+    // The trigger reader lands in the next commit; the allow goes with it.
+    #[allow(dead_code)]
+    Trigger,
+}
+
 /// A private reader for the terminal's input. Long-running commands use it
 /// instead of an event library's pump so that escape sequences the terminal
 /// sends on its own initiative are parsed by the component that owns the
@@ -206,7 +222,12 @@ struct TapControl {
 /// terminal at any instant.
 #[cfg(unix)]
 pub struct TtyTap {
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    rx: std::sync::mpsc::Receiver<TapChunk>,
+    /// A handle for foreign wakers (`sender()`); the terminal reader
+    /// holds its own clone.
+    // The trigger reader lands in the next commit; the allow goes with it.
+    #[allow(dead_code)]
+    tx: std::sync::mpsc::Sender<TapChunk>,
     control: std::sync::Arc<TapControl>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -220,18 +241,27 @@ impl TtyTap {
         let (tx, rx) = std::sync::mpsc::channel();
         let control = std::sync::Arc::new(TapControl::default());
         let reader_control = std::sync::Arc::clone(&control);
+        let reader_tx = tx.clone();
         let reader = std::thread::Builder::new()
             .name("rat-tty-tap".to_string())
-            .spawn(move || read_loop(&tty, &tx, &reader_control))?;
+            .spawn(move || read_loop(&tty, &reader_tx, &reader_control))?;
         Ok(TtyTap {
             rx,
+            tx,
             control,
             reader: Some(reader),
         })
     }
 
+    /// A sender foreign wakers may post `TapChunk::Trigger` through.
+    // The trigger reader lands in the next commit; the allow goes with it.
+    #[allow(dead_code)]
+    pub fn sender(&self) -> std::sync::mpsc::Sender<TapChunk> {
+        self.tx.clone()
+    }
+
     /// The next chunk of input, or `None` when the slice expired.
-    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<Vec<u8>> {
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<TapChunk> {
         use std::sync::mpsc::RecvTimeoutError;
         match self.rx.recv_timeout(timeout) {
             Ok(chunk) => Some(chunk),
@@ -298,7 +328,7 @@ impl Drop for TtyTap {
 }
 
 #[cfg(unix)]
-fn read_loop(tty: &std::fs::File, tx: &std::sync::mpsc::Sender<Vec<u8>>, control: &TapControl) {
+fn read_loop(tty: &std::fs::File, tx: &std::sync::mpsc::Sender<TapChunk>, control: &TapControl) {
     use std::os::unix::io::AsRawFd;
     use std::sync::atomic::Ordering;
 
@@ -355,7 +385,10 @@ fn read_loop(tty: &std::fs::File, tx: &std::sync::mpsc::Sender<Vec<u8>>, control
         if read <= 0 {
             return; // End of input, or the device went away.
         }
-        if tx.send(buf[..read as usize].to_vec()).is_err() {
+        if tx
+            .send(TapChunk::Tty(buf[..read as usize].to_vec()))
+            .is_err()
+        {
             return; // Nobody is listening any more.
         }
     }
@@ -364,6 +397,26 @@ fn read_loop(tty: &std::fs::File, tx: &std::sync::mpsc::Sender<Vec<u8>>, control
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_posted_trigger_wakes_the_receiver_early() {
+        // The channel is the wake path: a Trigger posted from another
+        // thread returns from recv_timeout well before the timeout.
+        // Self-skipping when no terminal device exists (CI).
+        let Ok(tap) = TtyTap::spawn() else { return };
+        let sender = tap.sender();
+        std::thread::spawn(move || {
+            let _ = sender.send(TapChunk::Trigger);
+        });
+        let start = std::time::Instant::now();
+        let got = tap.recv_timeout(std::time::Duration::from_secs(5));
+        assert_eq!(got, Some(TapChunk::Trigger));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "the trigger did not wake the receiver early"
+        );
+    }
 
     #[test]
     fn a_split_report_reassembles_across_feeds() {
