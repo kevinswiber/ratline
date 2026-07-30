@@ -81,6 +81,17 @@ pub struct TickOutcome {
     /// is the caller's: frame content while looping, a hard error
     /// under `--once`.
     pub spawn_error: Option<std::io::Error>,
+    /// The watched union, stamped on the WORKER immediately after the child
+    /// is reaped — the closing side of its bracket. Empty when the source
+    /// watches nothing, which is every source under `--once`.
+    ///
+    /// Taken here rather than in the loop's drain on purpose: the loop can
+    /// sleep up to one slice between the child's exit and the drain, and that
+    /// slop widens the attribution window enough to matter.
+    /// Staged: the loop's drain reads this in the next task, which removes
+    /// the allow. A bin crate counts a field nobody in the binary reads.
+    #[allow(dead_code)]
+    pub close_stamps: Vec<(std::path::PathBuf, crate::core::trigger::PathStamp)>,
     /// The child's exit status, for the per-pane failure row. Absent
     /// when nothing ran: a spawn error, or a child reclaimed by a
     /// shutdown kill — a defaulted `exit 0` would read as a healthy
@@ -90,8 +101,12 @@ pub struct TickOutcome {
 }
 
 /// Run one configured child to completion on this thread.
-pub fn run_tick(command: std::process::Command, source: SourceId) -> TickOutcome {
-    run_parked(command, source, &ChildSlot::default())
+pub fn run_tick(
+    command: std::process::Command,
+    source: SourceId,
+    union: Vec<std::path::PathBuf>,
+) -> TickOutcome {
+    run_parked(command, source, &ChildSlot::default(), &union)
 }
 
 /// Run one configured child on a worker thread, which posts exactly
@@ -102,13 +117,14 @@ pub fn spawn_tick(
     source: SourceId,
     slot: ChildSlot,
     tx: std::sync::mpsc::Sender<TickOutcome>,
+    union: Vec<std::path::PathBuf>,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("rat-watch-child".into())
         .spawn(move || {
             // On a shutdown race the receiver is already gone; the
             // failed send is the no-op it should be.
-            let _ = tx.send(run_parked(command, source, &slot));
+            let _ = tx.send(run_parked(command, source, &slot, &union));
         })?;
     Ok(())
 }
@@ -117,6 +133,7 @@ fn run_parked(
     mut command: std::process::Command,
     source: SourceId,
     slot: &ChildSlot,
+    union: &[std::path::PathBuf],
 ) -> TickOutcome {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     // The lock spans the spawn: shutdown() takes the same lock, so it
@@ -151,6 +168,9 @@ fn run_parked(
         // Reclaimed by a shutdown kill: there is no status to report.
         None
     };
+    // The bracket closes HERE, not in the loop's drain: a change the child
+    // made is attributable to it only while the window is still this tight.
+    let close_stamps = crate::core::trigger::stamps(union);
     TickOutcome {
         source,
         stdout: out,
@@ -158,6 +178,7 @@ fn run_parked(
         at: jiff::Timestamp::now(),
         spawn_error: None,
         status,
+        close_stamps,
     }
 }
 
@@ -167,6 +188,7 @@ fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
         stdout: Vec::new(),
         stderr: Vec::new(),
         at: jiff::Timestamp::now(),
+        close_stamps: Vec::new(),
         spawn_error: Some(err),
         status: None,
     }
@@ -240,12 +262,67 @@ mod tests {
     }
 
     #[test]
+    fn the_outcome_carries_post_exit_stamps_for_the_watched_union() {
+        // The bracket's closing side. Stamped on the worker, immediately
+        // after the child is reaped, because the loop can sleep up to a slice
+        // before it drains — and that slop measurably costs discrimination.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+
+        let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()]);
+        assert_eq!(outcome.close_stamps.len(), 1);
+        assert_eq!(outcome.close_stamps[0].0, f);
+    }
+
+    #[test]
+    fn a_childs_own_write_is_visible_in_the_closing_stamps() {
+        // What makes the bracket attributable at all: the child writes a
+        // watched path, and the stamp taken after it exits differs from one
+        // taken before.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        let before = crate::core::trigger::stamps(std::slice::from_ref(&f));
+
+        #[cfg(unix)]
+        let cmd = script(&format!("printf 1 >> {}", f.display()));
+        #[cfg(windows)]
+        let cmd = script(&format!("echo 1 >> {}", f.display()));
+        let outcome = run_tick(cmd, SourceId(0), vec![f.clone()]);
+
+        assert_ne!(
+            outcome.close_stamps, before,
+            "the child's write must be visible after it exits"
+        );
+    }
+
+    #[test]
+    fn an_empty_union_costs_no_stats_and_returns_empty() {
+        // The common case, and every source under --once, where no trigger is
+        // armed at all.
+        let outcome = run_tick(script("echo hi"), SourceId(0), Vec::new());
+        assert!(outcome.close_stamps.is_empty());
+    }
+
+    #[test]
+    fn a_spawn_error_still_returns_well_formed_closing_stamps() {
+        let outcome = run_tick(
+            std::process::Command::new("definitely-not-a-program-here"),
+            SourceId(0),
+            vec![std::path::PathBuf::from("/sa")],
+        );
+        assert!(outcome.spawn_error.is_some());
+        assert!(outcome.close_stamps.is_empty());
+    }
+
+    #[test]
     fn a_tick_captures_both_streams_separately() {
         #[cfg(unix)]
         let cmd = script("echo out; echo err >&2");
         #[cfg(windows)]
         let cmd = script("echo out & echo err 1>&2");
-        let outcome = run_tick(cmd, SourceId(0));
+        let outcome = run_tick(cmd, SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout, b"out"));
         assert!(contains(&outcome.stderr, b"err"));
@@ -262,7 +339,7 @@ mod tests {
         let body = format!(
             "i=0; while [ $i -lt 3000 ]; do echo {line}; echo {line} >&2; i=$((i+1)); done"
         );
-        let outcome = run_tick(script(&body), SourceId(0));
+        let outcome = run_tick(script(&body), SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
         assert_eq!(outcome.stdout.len(), 3000 * 101);
         assert_eq!(outcome.stderr.len(), 3000 * 101);
@@ -273,6 +350,7 @@ mod tests {
         let outcome = run_tick(
             std::process::Command::new("definitely-no-such-binary-xyz"),
             SourceId(0),
+            Vec::new(),
         );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.stdout.is_empty());
@@ -285,7 +363,7 @@ mod tests {
         let cmd = script("echo hi; exit 3");
         #[cfg(windows)]
         let cmd = script("echo hi & exit 3");
-        let outcome = run_tick(cmd, SourceId(0));
+        let outcome = run_tick(cmd, SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout, b"hi"));
     }
@@ -295,8 +373,14 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         // The only Sender moves in, so the worker's exit closes the
         // channel: one outcome, then Disconnected — proven together.
-        spawn_tick(script("echo once"), SourceId(0), ChildSlot::default(), tx)
-            .expect("spawn worker");
+        spawn_tick(
+            script("echo once"),
+            SourceId(0),
+            ChildSlot::default(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
         let outcome = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("one outcome");
@@ -308,7 +392,7 @@ mod tests {
     fn a_parked_child_can_be_killed_from_another_thread() {
         let slot = ChildSlot::default();
         let (tx, rx) = mpsc::channel();
-        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx).expect("spawn worker");
+        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx, Vec::new()).expect("spawn worker");
         wait_until_parked(&slot);
         slot.shutdown();
         // The kill closed the pipes, the drains hit EOF, the worker
@@ -328,7 +412,7 @@ mod tests {
         let cmd = script(&format!("type nul > {}", marker.display()));
         let slot = ChildSlot::default();
         slot.shutdown();
-        let outcome = run_parked(cmd, SourceId(0), &slot);
+        let outcome = run_parked(cmd, SourceId(0), &slot, &[]);
         let err = outcome.spawn_error.expect("barred spawn reports an error");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
         assert!(!marker.exists(), "the child must never have spawned");
@@ -338,7 +422,7 @@ mod tests {
     fn dropping_the_guard_shuts_the_slot_down() {
         let slot = ChildSlot::default();
         let (tx, rx) = mpsc::channel();
-        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx).expect("spawn worker");
+        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx, Vec::new()).expect("spawn worker");
         wait_until_parked(&slot);
         // The RAII half: a guard going out of scope is the shutdown.
         // (Which is why run() must HOLD its guard in a named binding —
@@ -352,12 +436,18 @@ mod tests {
         // The tag every per-source resource is indexed by: it rides the
         // outcome home, so a drain never has to guess who finished.
         // Both paths carry it — the inline one and the worker's.
-        let outcome = run_tick(script("echo tagged"), SourceId(2));
+        let outcome = run_tick(script("echo tagged"), SourceId(2), Vec::new());
         assert_eq!(outcome.source, SourceId(2));
 
         let (tx, rx) = mpsc::channel();
-        spawn_tick(script("echo tagged"), SourceId(5), ChildSlot::default(), tx)
-            .expect("spawn worker");
+        spawn_tick(
+            script("echo tagged"),
+            SourceId(5),
+            ChildSlot::default(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
         let posted = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("one outcome");
@@ -373,7 +463,7 @@ mod tests {
         let cmd = script("echo hi; exit 3");
         #[cfg(windows)]
         let cmd = script("echo hi & exit 3");
-        let outcome = run_tick(cmd, SourceId(0));
+        let outcome = run_tick(cmd, SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout, b"hi"));
         assert_eq!(outcome.status.and_then(|status| status.code()), Some(3));
@@ -386,6 +476,7 @@ mod tests {
         let outcome = run_tick(
             std::process::Command::new("definitely-no-such-binary-xyz"),
             SourceId(0),
+            Vec::new(),
         );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.status.is_none());

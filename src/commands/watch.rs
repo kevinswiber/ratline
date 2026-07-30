@@ -386,13 +386,15 @@ pub(crate) fn run_registry(
                         id,
                         runtime[id.0].slot.clone(),
                         runtime[id.0].tx.clone(),
+                        // Task 2.2 passes the real watched union here.
+                        Vec::new(),
                     )
                     .is_err();
                 }
                 if inline {
                     let command =
                         source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
-                    let _ = runtime[id.0].tx.send(run_tick(command, id));
+                    let _ = runtime[id.0].tx.send(run_tick(command, id, Vec::new()));
                 }
             }
         }
