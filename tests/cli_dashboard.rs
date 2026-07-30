@@ -388,6 +388,59 @@ pane "beta" {{
     // child zombies (unix) and races tempdir cleanup.
 }
 
+/// Every change fires, not just the first. The loop now stats the watched
+/// union on its own account, to learn whether a path ever moves while the
+/// dashboard is idle — and that observer keeps its OWN baselines. If it ever
+/// shared them with the trigger, its stat would consume the fire and the pane
+/// would quietly stop refreshing, which is the failure this guards.
+#[test]
+fn successive_trigger_changes_each_refresh_the_pane() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let watched = dir.path().join("watched");
+    std::fs::write(&watched, "v0").expect("seed");
+    let decl = dir.path().join("dash.kdl");
+    std::fs::write(
+        &decl,
+        format!(
+            r#"
+row-gap 0
+
+defaults {{
+    height 1
+    border "none"
+    chrome #false
+    interval "never"
+    trigger-debounce "0ms"
+}}
+
+pane "only" {{
+    command "{rat}" "__cat" "{watched}"
+    trigger "file:{watched}"
+}}
+"#,
+            rat = rat_bin().escape_default(),
+            watched = watched.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &decl.display().to_string()])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let stream = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&stream, &mut seen, "v0");
+
+    // Three in a row: a shared baseline would swallow one of them.
+    for value in ["v1", "v2", "v3"] {
+        std::fs::write(&watched, value).expect("mtime change");
+        read_until(&stream, &mut seen, value);
+    }
+}
+
 /// `--once` prints ONE complete frame: a staggered pane must not make
 /// the partial composition reach the pipe first.
 #[test]

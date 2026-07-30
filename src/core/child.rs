@@ -88,9 +88,6 @@ pub struct TickOutcome {
     /// Taken here rather than in the loop's drain on purpose: the loop can
     /// sleep up to one slice between the child's exit and the drain, and that
     /// slop widens the attribution window enough to matter.
-    /// Staged: the loop's drain reads this in the next task, which removes
-    /// the allow. A bin crate counts a field nobody in the binary reads.
-    #[allow(dead_code)]
     pub close_stamps: Vec<(std::path::PathBuf, crate::core::trigger::PathStamp)>,
     /// The child's exit status, for the per-pane failure row. Absent
     /// when nothing ran: a spawn error, or a child reclaimed by a
