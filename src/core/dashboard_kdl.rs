@@ -241,7 +241,12 @@ fn only_a_value(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<()> {
             None => refuse_annotation(entry.ty(), k.name, at)?,
         }
     }
-    if node.children().is_some_and(|doc| !doc.nodes().is_empty()) {
+    // `is_some`, not "has nodes": an EMPTY block is still a block the
+    // author wrote, and this very message tells them the key holds
+    // none. A block they slashdashed OUT never reaches here — the crate
+    // strips it before the walk, which is what keeps commenting-out
+    // working (D-8).
+    if node.children().is_some() {
         bail!(
             "{at}: `{}` takes {} and holds no block — write `{}`",
             k.name,
@@ -657,7 +662,7 @@ fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
             entry.ty().expect("filtered to annotated").value()
         );
     }
-    if node.children().is_some_and(|doc| !doc.nodes().is_empty()) {
+    if node.children().is_some() {
         bail!("{name} takes one integer and holds no block — write `{name} 1`");
     }
     let cells = match positional(node).as_slice() {
@@ -1180,6 +1185,13 @@ pane "all" {
                 "interval \"5s\" { junk \"x\" }",
                 "pane \"log\": `interval` takes one string and holds no block — write `interval \"5s\"`",
             ),
+            // An EMPTY block is still a block the author wrote. The
+            // message says the key holds none, so accepting `{}` would
+            // make the parser contradict its own error.
+            (
+                "interval \"5s\" {}",
+                "pane \"log\": `interval` takes one string and holds no block — write `interval \"5s\"`",
+            ),
             (
                 "(u8)interval \"5s\"",
                 "pane \"log\": the (u8) type annotation on `interval` has no meaning here — remove it",
@@ -1234,10 +1246,14 @@ pane "all" {
     /// block or an annotation on it reaches nothing.
     #[test]
     fn a_document_setting_carries_its_value_and_nothing_else() {
-        assert_eq!(
-            container_err("gap 1 { junk \"x\" }\npane \"a\" { height 3; command \"date\" }\n"),
-            "gap takes one integer and holds no block — write `gap 1`"
-        );
+        for block in ["{ junk \"x\" }", "{}"] {
+            assert_eq!(
+                container_err(&format!(
+                    "gap 1 {block}\npane \"a\" {{ height 3; command \"date\" }}\n"
+                )),
+                "gap takes one integer and holds no block — write `gap 1`"
+            );
+        }
         assert_eq!(
             container_err("(u8)gap 1\npane \"a\" { height 3; command \"date\" }\n"),
             "the (u8) type annotation on `gap` has no meaning here — remove it"
@@ -1277,6 +1293,18 @@ pane "all" {
         .expect("parses");
         assert_eq!(file.panes[0].interval, None);
         assert_eq!(file.panes[0].command, Some(vec!["date".to_string()]));
+    }
+
+    /// The boundary the "holds no block" rule must not cross: a block
+    /// the author COMMENTED OUT was not written, so refusing it would
+    /// punish the ordinary way of temporarily removing something.
+    #[test]
+    fn a_commented_out_block_is_not_a_block() {
+        let file = parse(
+            "pane \"log\" {\n    height 3\n    interval \"5s\" /-{ junk \"x\" }\n    command \"date\"\n}\n",
+        )
+        .expect("a slashdashed block is not a block");
+        assert_eq!(file.panes[0].interval.as_deref(), Some("5s"));
     }
 
     #[test]
