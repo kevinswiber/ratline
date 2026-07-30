@@ -200,6 +200,58 @@ fn takes(k: &Key) -> &'static str {
     }
 }
 
+/// I-55 at the document level: a dashboard has one gap and one set of
+/// defaults, so a second declaration is not a refinement of the first —
+/// it is a line the reader will believe and the parser would drop.
+fn declared_once(name: &'static str, seen: &mut Vec<&'static str>) -> anyhow::Result<()> {
+    if seen.contains(&name) {
+        bail!("`{name}` is declared twice — a dashboard declares it once");
+    }
+    seen.push(name);
+    Ok(())
+}
+
+/// A KDL type annotation never means anything to this grammar, wherever
+/// it is hung — on the key node, or on the value the key holds (D-7).
+fn refuse_annotation(ty: Option<&kdl::KdlIdentifier>, key: &str, at: &str) -> anyhow::Result<()> {
+    match ty {
+        Some(ty) => bail!(
+            "{at}: the ({}) type annotation on `{key}` has no meaning here — remove it",
+            ty.value()
+        ),
+        None => Ok(()),
+    }
+}
+
+/// A key node carries its value and NOTHING else. A property hung on
+/// it, a block under it, or an annotation anywhere on it is a token
+/// with nowhere to go — the same silent discard I-52 closes one level
+/// up, one level down.
+fn only_a_value(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<()> {
+    refuse_annotation(node.ty(), k.name, at)?;
+    for entry in node.entries() {
+        match entry.name() {
+            Some(prop) => bail!(
+                "{at}: `{}` takes {}, but {:?} is set — write `{}`",
+                k.name,
+                takes(k),
+                prop.value(),
+                k.example
+            ),
+            None => refuse_annotation(entry.ty(), k.name, at)?,
+        }
+    }
+    if node.children().is_some_and(|doc| !doc.nodes().is_empty()) {
+        bail!(
+            "{at}: `{}` takes {} and holds no block — write `{}`",
+            k.name,
+            takes(k),
+            k.example
+        );
+    }
+    Ok(())
+}
+
 /// One key, one place, once: a key written twice on the same block —
 /// two properties, two child nodes, or one of each — is an error.
 /// Last-wins is invisible to a reader scanning a long pane block.
@@ -229,11 +281,19 @@ pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
     // node anywhere in the document still supplies the `shell` the
     // command split depends on.
     let mut tree: Vec<&kdl::KdlNode> = Vec::new();
+    let mut settings: Vec<&'static str> = Vec::new();
     for node in doc.nodes() {
         match node.name().value() {
-            "gap" => file.gap = Some(usize_field(node, "gap")?),
-            "row-gap" => file.row_gap = Some(usize_field(node, "row-gap")?),
+            "gap" => {
+                declared_once("gap", &mut settings)?;
+                file.gap = Some(usize_field(node, "gap")?);
+            }
+            "row-gap" => {
+                declared_once("row-gap", &mut settings)?;
+                file.row_gap = Some(usize_field(node, "row-gap")?);
+            }
             "defaults" => {
+                declared_once("defaults", &mut settings)?;
                 if !positional(node).is_empty() {
                     bail!("defaults takes no name — it holds the keys every pane inherits");
                 }
@@ -406,6 +466,7 @@ fn pane_block(
             );
         };
         record(&mut seen, k, &at)?;
+        only_a_value(child, k, &at)?;
         match k.set {
             Set::Text(set) => set(&mut decl, one_text(child, k, &at)?),
             Set::Count(set) => set(&mut decl, one_count(child, k, &at)?, &ctx)?,
@@ -561,10 +622,30 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
 /// never wrap — `as usize` would turn `gap -1` into a repeat count near
 /// usize::MAX, which `" ".repeat(gap)` would try to allocate.
 fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
-    // A document setting's own two answers: it is a node, not a key, so
-    // it has no property spelling to offer.
+    // A document setting's own answers: it is a node, not a key, so it
+    // has no property spelling to offer — and like any key it carries
+    // its value and nothing else.
+    if let Some(ty) = node.ty() {
+        bail!(
+            "the ({}) type annotation on `{name}` has no meaning here — remove it",
+            ty.value()
+        );
+    }
     if node.entries().iter().any(|entry| entry.name().is_some()) {
         bail!("{name} takes no properties — write `{name} 1`");
+    }
+    if let Some(entry) = node
+        .entries()
+        .iter()
+        .find(|entry| entry.name().is_none() && entry.ty().is_some())
+    {
+        bail!(
+            "the ({}) type annotation on `{name}` has no meaning here — remove it",
+            entry.ty().expect("filtered to annotated").value()
+        );
+    }
+    if node.children().is_some_and(|doc| !doc.nodes().is_empty()) {
+        bail!("{name} takes one integer and holds no block — write `{name} 1`");
     }
     let cells = match positional(node).as_slice() {
         [value] => value
@@ -1069,6 +1150,75 @@ pane "all" {
         ] {
             let err = format!("{:#}", parse(text).unwrap_err());
             assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    /// I-52 reaches the key node itself, not just the block holding it.
+    /// A key node carries its value and nothing else — a property, a
+    /// block, or an annotation hung on it is a token with nowhere to go.
+    #[test]
+    fn a_key_node_carries_its_value_and_nothing_else() {
+        for (tail, wanted) in [
+            (
+                "interval \"5s\" bogus=\"x\"",
+                "pane \"log\": `interval` takes one string, but \"bogus\" is set — write `interval \"5s\"`",
+            ),
+            (
+                "interval \"5s\" { junk \"x\" }",
+                "pane \"log\": `interval` takes one string and holds no block — write `interval \"5s\"`",
+            ),
+            (
+                "(u8)interval \"5s\"",
+                "pane \"log\": the (u8) type annotation on `interval` has no meaning here — remove it",
+            ),
+            (
+                "interval (string)\"5s\"",
+                "pane \"log\": the (string) type annotation on `interval` has no meaning here — remove it",
+            ),
+        ] {
+            assert_eq!(
+                container_err(&format!(
+                    "pane \"log\" {{\n    height 3\n    {tail}\n    command \"date\"\n}}\n"
+                )),
+                wanted
+            );
+        }
+    }
+
+    /// A document setting is a key too: `gap` holds one integer, so a
+    /// block or an annotation on it reaches nothing.
+    #[test]
+    fn a_document_setting_carries_its_value_and_nothing_else() {
+        assert_eq!(
+            container_err("gap 1 { junk \"x\" }\npane \"a\" { height 3; command \"date\" }\n"),
+            "gap takes one integer and holds no block — write `gap 1`"
+        );
+        assert_eq!(
+            container_err("(u8)gap 1\npane \"a\" { height 3; command \"date\" }\n"),
+            "the (u8) type annotation on `gap` has no meaning here — remove it"
+        );
+    }
+
+    /// I-55 at the document level: last-wins is as invisible here as it
+    /// is inside a pane block, and a second `defaults` silently
+    /// replacing the first is the same silent discard in a new place.
+    #[test]
+    fn a_document_setting_is_declared_once() {
+        for (text, wanted) in [
+            (
+                "gap 1\ngap 5\npane \"a\" { height 3; command \"date\" }\n",
+                "`gap` is declared twice — a dashboard declares it once",
+            ),
+            (
+                "row-gap 1\nrow-gap 5\npane \"a\" { height 3; command \"date\" }\n",
+                "`row-gap` is declared twice — a dashboard declares it once",
+            ),
+            (
+                "defaults { height 3 }\ndefaults { height 9 }\npane \"a\" { command \"date\" }\n",
+                "`defaults` is declared twice — a dashboard declares it once",
+            ),
+        ] {
+            assert_eq!(container_err(text), wanted);
         }
     }
 
