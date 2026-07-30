@@ -339,6 +339,18 @@ impl PathLedger {
         }
     }
 
+    /// Test-only: place a change directly, so the suspicion tests can build
+    /// a window without touching a filesystem.
+    #[cfg(test)]
+    pub fn inject(
+        &mut self,
+        path: &std::path::Path,
+        at: std::time::Instant,
+        containing: Vec<(SourceId, std::time::Duration)>,
+    ) {
+        self.record(path.to_path_buf(), at, containing);
+    }
+
     fn record(
         &mut self,
         path: std::path::PathBuf,
@@ -613,6 +625,281 @@ impl Bracket {
     fn spans(&self, at: std::time::Instant) -> bool {
         self.opened <= at && self.closed.is_none_or(|closed| closed >= at)
     }
+}
+
+/// The suspicion test's thresholds. The defaults are research starting
+/// points, not results, and none of them is user-facing: under report-only a
+/// false positive is cosmetic, so a switch can be added later without
+/// breaking anyone, while removing one could not.
+#[allow(dead_code)]
+pub struct LoopSuspicion {
+    pub window: std::time::Duration,
+    pub min_respawns: usize,
+    pub abstain_at_or_above: f64,
+}
+
+impl Default for LoopSuspicion {
+    fn default() -> LoopSuspicion {
+        LoopSuspicion {
+            window: std::time::Duration::from_secs(30),
+            min_respawns: 50,
+            abstain_at_or_above: 0.5,
+        }
+    }
+}
+
+/// One pane's windowed facts, assembled by the loop. Every count here is
+/// already restricted to the window by `WindowLog`.
+#[allow(dead_code)]
+pub struct PaneWindow<'a> {
+    pub source: SourceId,
+    pub trigger_respawns: usize,
+    /// Its `file:` paths, read through the ledger.
+    pub watched: &'a [std::path::PathBuf],
+    /// Its fifo/fd triggers, read through the log's arrivals. Separate
+    /// because a reader route has no path to stat.
+    pub readers: &'a [TriggerKey],
+}
+
+#[allow(dead_code)]
+pub struct Verdict {
+    /// The implicated panes; empty when nothing is suspected. A SET, because
+    /// concurrent children make direction unavailable even as coincidence.
+    pub panes: Vec<SourceId>,
+    /// Present only where attribution was precise enough to order them.
+    pub ordered: Option<Vec<SourceId>>,
+    /// The test declined to answer. Distinct from an empty `panes`:
+    /// abstaining is not the same as finding nothing.
+    pub abstained: bool,
+}
+
+#[allow(dead_code)]
+impl LoopSuspicion {
+    /// Which panes are implicated over the window ending at `now`.
+    ///
+    /// All four conditions must hold. The first three are not sufficient on
+    /// their own: a legitimate one-way producer→consumer pair satisfies every
+    /// one of them, which is why the graph test exists.
+    pub fn evaluate(
+        &self,
+        now: std::time::Instant,
+        ledger: &PathLedger,
+        log: &WindowLog,
+        panes: &[PaneWindow<'_>],
+    ) -> Verdict {
+        // Condition 3 first: it is the cheapest, and it short-circuits. Lost
+        // reader evidence lands here too — missing evidence is not absent
+        // evidence, and the veto below is a zero test that cannot survive a
+        // silently dropped observation.
+        if log.evidence_lost(now) || log.busy_fraction(now) >= self.abstain_at_or_above {
+            return Verdict {
+                panes: Vec::new(),
+                ordered: None,
+                abstained: true,
+            };
+        }
+
+        let candidates: Vec<&PaneWindow<'_>> = panes
+            .iter()
+            .filter(|pane| pane.trigger_respawns >= self.min_respawns)
+            .filter(|pane| self.closed_everywhere(ledger, log, pane))
+            .collect();
+
+        // Condition 4: an edge runs from whoever is credited with writing a
+        // path to whoever watches it. A pane on a cycle in that graph is
+        // implicated; a pane on a path through it is not.
+        let mut edges: Vec<(SourceId, SourceId)> = Vec::new();
+        let mut merged: Vec<Vec<SourceId>> = Vec::new();
+        for pane in &candidates {
+            for path in pane.watched {
+                let credited = credit(ledger.changes(path));
+                Self::add(&mut edges, &mut merged, &credited, pane.source);
+            }
+            for key in pane.readers {
+                let changes = Self::arrival_changes(log, key);
+                let credited = credit(&changes);
+                Self::add(&mut edges, &mut merged, &credited, pane.source);
+            }
+        }
+
+        let implicated = on_a_cycle(&candidates, &edges, &merged);
+        let precise = merged.iter().all(|group| group.len() <= 1);
+        Verdict {
+            ordered: (precise && !implicated.is_empty()).then(|| implicated.clone()),
+            panes: implicated,
+            abstained: false,
+        }
+    }
+
+    /// Condition 2: every trigger this pane watches recorded ZERO exogenous
+    /// observations. One is enough to say the path has an outside writer.
+    fn closed_everywhere(
+        &self,
+        ledger: &PathLedger,
+        log: &WindowLog,
+        pane: &PaneWindow<'_>,
+    ) -> bool {
+        let files_closed = pane.watched.iter().all(|p| ledger.exogenous(p) == 0);
+        let readers_closed = pane.readers.iter().all(|key| {
+            log.arrivals(key)
+                .iter()
+                .all(|arrival| !arrival.containing.is_empty())
+        });
+        // A pane watching nothing cannot be closed: there is no evidence
+        // either way, and silence is not a positive.
+        let watches_something = !pane.watched.is_empty() || !pane.readers.is_empty();
+        watches_something && files_closed && readers_closed
+    }
+
+    /// A reader route's arrivals, in the shape the credit rule takes. An
+    /// arrival whose covering bracket is still open is DEFERRED — it resolves
+    /// once that bracket closes — rather than credited with a provisional
+    /// width.
+    fn arrival_changes(log: &WindowLog, key: &TriggerKey) -> Vec<Change> {
+        log.arrivals(key)
+            .iter()
+            .filter_map(|arrival| {
+                Some(Change {
+                    at: arrival.at,
+                    containing: log.widths(arrival)?,
+                })
+            })
+            .collect()
+    }
+
+    fn add(
+        edges: &mut Vec<(SourceId, SourceId)>,
+        merged: &mut Vec<Vec<SourceId>>,
+        credited: &[SourceId],
+        watcher: SourceId,
+    ) {
+        for writer in credited {
+            edges.push((*writer, watcher));
+        }
+        if credited.len() > 1 {
+            merged.push(credited.to_vec());
+        }
+    }
+}
+
+/// Who wrote this path? Two stages, and both are load-bearing.
+///
+/// **Eligibility** keeps only the panes that were in flight for MORE than
+/// half of the path's changes. Without it, a pane whose bracket merely
+/// happens to overlap gets credited, and a legitimate chain looks like a
+/// cycle.
+///
+/// **Tightness** then keeps only those whose median containing bracket is
+/// within 2x of the tightest. That separates by an order of magnitude in
+/// practice — a cycle's panes run children of near-identical cost because
+/// they are the same work phase-locked by the same debounce, while a chain's
+/// producer is arbitrarily more expensive than its consumer. The band is 2x
+/// because the measured gap it sits in is far wider than that, not because it
+/// was tuned.
+#[allow(dead_code)]
+fn credit(changes: &[Change]) -> Vec<SourceId> {
+    if changes.is_empty() {
+        return Vec::new();
+    }
+    let mut sources: Vec<SourceId> = changes
+        .iter()
+        .flat_map(|change| change.containing.iter().map(|(id, _)| *id))
+        .collect();
+    sources.sort();
+    sources.dedup();
+
+    // Stage one.
+    let eligible: Vec<SourceId> = sources
+        .into_iter()
+        .filter(|id| {
+            let covered = changes
+                .iter()
+                .filter(|c| c.containing.iter().any(|(s, _)| s == id))
+                .count();
+            covered * 2 > changes.len()
+        })
+        .collect();
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+
+    // Stage two.
+    let medians: Vec<(SourceId, std::time::Duration)> = eligible
+        .into_iter()
+        .map(|id| (id, median_width(changes, id)))
+        .collect();
+    let tightest = medians
+        .iter()
+        .map(|(_, width)| *width)
+        .min()
+        .unwrap_or_default();
+    medians
+        .into_iter()
+        .filter(|(_, width)| *width <= tightest * 2)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+#[allow(dead_code)]
+fn median_width(changes: &[Change], id: SourceId) -> std::time::Duration {
+    let mut widths: Vec<std::time::Duration> = changes
+        .iter()
+        .filter_map(|c| c.containing.iter().find(|(s, _)| *s == id).map(|(_, w)| *w))
+        .collect();
+    widths.sort();
+    widths.get(widths.len() / 2).copied().unwrap_or_default()
+}
+
+/// Panes lying on a cycle of the observed graph. A merged group is one node,
+/// so its self-edge is a cycle: when two panes' children overlap so much that
+/// either could have written either path, collapsing them loses nothing —
+/// the collapse IS the loop.
+#[allow(dead_code)]
+fn on_a_cycle(
+    candidates: &[&PaneWindow<'_>],
+    edges: &[(SourceId, SourceId)],
+    merged: &[Vec<SourceId>],
+) -> Vec<SourceId> {
+    let node = |id: SourceId| -> SourceId {
+        merged
+            .iter()
+            .find(|group| group.contains(&id))
+            .and_then(|group| group.iter().min().copied())
+            .unwrap_or(id)
+    };
+    let mut implicated: Vec<SourceId> = Vec::new();
+    for pane in candidates {
+        let start = node(pane.source);
+        // Can this node reach itself?
+        let mut seen: Vec<SourceId> = Vec::new();
+        let mut stack: Vec<SourceId> = edges
+            .iter()
+            .filter(|(from, _)| node(*from) == start)
+            .map(|(_, to)| node(*to))
+            .collect();
+        let mut cyclic = false;
+        while let Some(current) = stack.pop() {
+            if current == start {
+                cyclic = true;
+                break;
+            }
+            if seen.contains(&current) {
+                continue;
+            }
+            seen.push(current);
+            stack.extend(
+                edges
+                    .iter()
+                    .filter(|(from, _)| node(*from) == current)
+                    .map(|(_, to)| node(*to)),
+            );
+        }
+        if cyclic {
+            implicated.push(pane.source);
+        }
+    }
+    implicated.sort();
+    implicated
 }
 
 #[cfg(test)]
@@ -1310,6 +1597,302 @@ mod tests {
             log.widths(arrivals[0]),
             Some(vec![(SourceId(0), Duration::from_millis(5))]),
             "the referenced bracket must have been retained"
+        );
+    }
+
+    // ── LoopSuspicion (plan task 1.2) ───────────────────────────────────
+    //
+    // All four conditions, and the credit rule tested directly on synthetic
+    // changes so the two stages can be exercised without a filesystem.
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// `n` changes, each covered by the given (source, width) pairs.
+    fn changes_all(n: usize, containing: &[(SourceId, Duration)]) -> Vec<Change> {
+        let t = Instant::now();
+        (0..n)
+            .map(|i| Change {
+                at: t + ms(i as u64),
+                containing: containing.to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn credit_merges_two_panes_whose_children_cost_the_same() {
+        // A cycle's panes run near-identical children, because they are the
+        // same work phase-locked by the same debounce. Measured at 1.0-1.1x.
+        let credited = credit(&changes_all(
+            10,
+            &[(SourceId(0), ms(22)), (SourceId(1), ms(24))],
+        ));
+        assert_eq!(credited, vec![SourceId(0), SourceId(1)]);
+    }
+
+    #[test]
+    fn credit_rejects_a_producer_whose_bracket_merely_contains_the_consumers() {
+        // The measured chain: producer 168ms, consumer 6.5ms — 25.9x, so the
+        // producer is not within 2x of the tightest and is not credited.
+        // Without stage two both would merge and an acyclic chain would look
+        // like a loop.
+        let credited = credit(&changes_all(
+            10,
+            &[(SourceId(0), ms(168)), (SourceId(1), ms(6))],
+        ));
+        assert_eq!(credited, vec![SourceId(1)], "only the tight one");
+    }
+
+    #[test]
+    fn credit_requires_more_than_half_the_changes_not_merely_some() {
+        // Stage one, and it is not optional: a pane whose bracket happens to
+        // overlap a minority of a path's changes is not its writer, however
+        // tight that bracket is.
+        let mut changes = changes_all(8, &[(SourceId(1), ms(5))]);
+        changes.extend(changes_all(
+            2,
+            &[(SourceId(1), ms(5)), (SourceId(9), ms(1))],
+        ));
+        let credited = credit(&changes);
+        assert_eq!(
+            credited,
+            vec![SourceId(1)],
+            "SourceId(9) covered 2 of 10 and must not be credited despite being tighter"
+        );
+    }
+
+    #[test]
+    fn credit_of_nothing_is_nothing() {
+        assert!(credit(&[]).is_empty());
+        assert!(credit(&changes_all(3, &[])).is_empty());
+    }
+
+    /// A pane that has made enough trigger-driven respawns to be a candidate.
+    fn pane<'a>(
+        id: usize,
+        watched: &'a [std::path::PathBuf],
+        readers: &'a [TriggerKey],
+    ) -> PaneWindow<'a> {
+        PaneWindow {
+            source: SourceId(id),
+            trigger_respawns: 50,
+            watched,
+            readers,
+        }
+    }
+
+    /// A ledger holding exactly the changes given, with no filesystem.
+    fn ledger_with(entries: &[(&std::path::Path, Vec<Change>)]) -> PathLedger {
+        let mut ledger = PathLedger::new(Vec::new());
+        for (path, changes) in entries {
+            for change in changes {
+                ledger.inject(path, change.at, change.containing.clone());
+            }
+        }
+        ledger
+    }
+
+    #[test]
+    fn a_two_pane_cycle_trips_and_names_both() {
+        // Each pane writes the path the other watches, children overlapping,
+        // nothing exogenous.
+        let a = std::path::PathBuf::from("/sa");
+        let b = std::path::PathBuf::from("/sb");
+        let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
+        let ledger = ledger_with(&[(&a, changes_all(10, &both)), (&b, changes_all(10, &both))]);
+        let log = WindowLog::new(secs(30));
+        let (wa, wb) = (vec![a.clone()], vec![b.clone()]);
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &wa, &none), pane(1, &wb, &none)];
+
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert_eq!(v.panes, vec![SourceId(0), SourceId(1)]);
+        assert!(!v.abstained);
+    }
+
+    #[test]
+    fn concurrent_children_are_never_ordered() {
+        // Either pane could have written either path, so a direction would be
+        // a claim the observation cannot support.
+        let a = std::path::PathBuf::from("/sa");
+        let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
+        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
+        let log = WindowLog::new(secs(30));
+        let wa = vec![a.clone()];
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &wa, &none), pane(1, &wa, &none)];
+
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert!(v.ordered.is_none(), "a merged pair cannot be ordered");
+    }
+
+    #[test]
+    fn a_one_way_producer_consumer_pair_does_not_trip() {
+        // The false positive that forced condition 4 to exist: this satisfies
+        // conditions 1, 2 and 3 exactly, and only the graph test excludes it.
+        // Pane 0 writes /data; pane 1 watches it; nobody writes anything of
+        // pane 0's.
+        let data = std::path::PathBuf::from("/data");
+        let ledger = ledger_with(&[(&data, changes_all(10, &[(SourceId(0), ms(6))]))]);
+        let log = WindowLog::new(secs(30));
+        let watched1 = vec![data.clone()];
+        let watched0: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/upstream")];
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &watched0, &none), pane(1, &watched1, &none)];
+
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert!(
+            v.panes.is_empty(),
+            "an acyclic one-way chain must never be implicated"
+        );
+    }
+
+    #[test]
+    fn an_expensive_producer_chain_does_not_trip_end_to_end() {
+        // The measured S1b shape, driven through evaluate. A three-pane chain
+        // A -> B -> C, where A's child is expensive enough to wholly contain
+        // B's, so every write B makes to /d2 also falls inside A's bracket.
+        //
+        // Without the tightness stage, A and B are credited together for /d2
+        // and MERGE into one node — and because B also watches /d1, which A
+        // writes, that merged node gains an edge to itself and this acyclic
+        // chain reads as a cycle. Its duty stays under the abstention ceiling
+        // on purpose, so only the credit rule can save it.
+        let d1 = std::path::PathBuf::from("/d1"); // A writes, B watches
+        let d2 = std::path::PathBuf::from("/d2"); // B writes, C watches
+        let ledger = ledger_with(&[
+            (&d1, changes_all(10, &[(SourceId(0), ms(168))])),
+            (
+                &d2,
+                changes_all(10, &[(SourceId(0), ms(168)), (SourceId(1), ms(6))]),
+            ),
+        ]);
+        let log = WindowLog::new(secs(30));
+        let (wa, wb, wc) = (
+            vec![std::path::PathBuf::from("/upstream")],
+            vec![d1.clone()],
+            vec![d2.clone()],
+        );
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [
+            pane(0, &wa, &none),
+            pane(1, &wb, &none),
+            pane(2, &wc, &none),
+        ];
+
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert!(
+            v.panes.is_empty(),
+            "an acyclic chain must not trip because one bracket contains another: {:?}",
+            v.panes
+        );
+    }
+
+    #[test]
+    fn too_few_trigger_driven_respawns_never_trips() {
+        // Condition 1, and note what it excludes for free: an interval pane
+        // reaches its deadline without ever passing through the gate, so its
+        // count stays zero however fast it runs.
+        let a = std::path::PathBuf::from("/sa");
+        let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
+        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
+        let log = WindowLog::new(secs(30));
+        let wa = vec![a.clone()];
+        let none: Vec<TriggerKey> = Vec::new();
+        let mut slow = pane(0, &wa, &none);
+        slow.trigger_respawns = 3;
+        let panes = [slow];
+
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert!(v.panes.is_empty());
+    }
+
+    #[test]
+    fn one_exogenous_observation_clears_the_veto() {
+        // Condition 2 is a zero test, not a rate.
+        let a = std::path::PathBuf::from("/sa");
+        let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
+        let mut changes = changes_all(10, &both);
+        changes.push(Change {
+            at: Instant::now(),
+            containing: Vec::new(), // nothing in flight: an outside writer
+        });
+        let ledger = ledger_with(&[(&a, changes)]);
+        let log = WindowLog::new(secs(30));
+        let wa = vec![a.clone()];
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &wa, &none), pane(1, &wa, &none)];
+
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert!(v.panes.is_empty(), "one exogenous change is enough");
+    }
+
+    #[test]
+    fn a_pane_watching_nothing_is_never_implicated() {
+        // Silence is not a positive: with no watched trigger there is no
+        // evidence either way.
+        let ledger = PathLedger::new(Vec::new());
+        let log = WindowLog::new(secs(30));
+        let nothing: Vec<std::path::PathBuf> = Vec::new();
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &nothing, &none)];
+        let v = LoopSuspicion::default().evaluate(Instant::now(), &ledger, &log, &panes);
+        assert!(v.panes.is_empty());
+    }
+
+    #[test]
+    fn a_busy_dashboard_abstains_rather_than_guessing() {
+        // Condition 3. Duty lives in the LOG, as bracket intervals — the same
+        // cycle observations, with brackets that nearly fill the window.
+        let a = std::path::PathBuf::from("/sa");
+        let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
+        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + secs(9), Vec::new());
+
+        let wa = vec![a.clone()];
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &wa, &none), pane(1, &wa, &none)];
+        let v = LoopSuspicion::default().evaluate(t0 + secs(10), &ledger, &log, &panes);
+        assert!(v.abstained, "90% duty must abstain");
+        assert!(v.panes.is_empty(), "abstaining accuses nobody");
+    }
+
+    #[test]
+    fn lost_reader_evidence_forces_abstention() {
+        // A dropped arrival may have been the only exogenous observation, so
+        // the veto cannot be trusted for this window.
+        let a = std::path::PathBuf::from("/sa");
+        let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
+        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        log.record_overflow(t0);
+
+        let wa = vec![a.clone()];
+        let none: Vec<TriggerKey> = Vec::new();
+        let panes = [pane(0, &wa, &none), pane(1, &wa, &none)];
+        let v = LoopSuspicion::default().evaluate(t0 + secs(1), &ledger, &log, &panes);
+        assert!(v.abstained);
+    }
+
+    #[test]
+    fn an_arrival_with_an_unresolved_width_is_deferred_from_credit() {
+        // It still counts for the veto — emptiness is known — but it must not
+        // enter the median-width stage with an elapsed-so-far duration.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.open_bracket(SourceId(0), t0, Vec::new()); // never closed
+        log.observe_arrival(SourceId(1), key.clone(), t0 + ms(3));
+
+        let changes = LoopSuspicion::arrival_changes(&log, &key);
+        assert!(
+            changes.is_empty(),
+            "an unresolved arrival contributes no credit input"
         );
     }
 }
