@@ -213,7 +213,9 @@ name is its identity — its default title, and the value of `RAT_PANE`
 in the child's environment, so one script can serve every pane by
 dispatching on it. `command` is a string split like a shell word list,
 multiple arguments taken verbatim as argv, or a raw script string with
-`shell #true`.
+`shell #true`. For a script with backslashes in it — a `sed` program,
+say — reach for KDL's raw strings (`command #"sed 's/\t/ · /'"#`) so
+the escaping is the shell's job alone.
 
 Every key a `pane` or `defaults` block accepts holds exactly one value,
 so it may be written either as a property or as a child node —
