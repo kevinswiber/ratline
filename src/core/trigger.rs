@@ -363,8 +363,9 @@ pub struct TriggerKey(pub String);
 /// its covering child is still running, when the final width does not exist
 /// and elapsed-so-far would make a long-running child look artificially
 /// tight — the mis-credit the median-width rule exists to prevent.
-#[allow(dead_code)]
 pub struct Arrival {
+    /// Staged: recorded here, read when the reader route resolves arrivals.
+    #[allow(dead_code)]
     pub source: SourceId,
     pub trigger: TriggerKey,
     pub at: std::time::Instant,
@@ -440,6 +441,7 @@ impl WindowLog {
     }
 
     /// A fifo/fd arrival, resolved against the brackets already owned here.
+    /// Staged: the reader route is its only caller.
     #[allow(dead_code)]
     pub fn observe_arrival(
         &mut self,
@@ -465,12 +467,11 @@ impl WindowLog {
     /// treated as "no arrivals": the dropped one may have been the window's
     /// only exogenous observation, and losing it would turn a zero test into
     /// an accusation. Any window this touches abstains instead.
+    /// Staged: a reader is the only thing that can overflow.
     #[allow(dead_code)]
     pub fn record_overflow(&mut self, at: std::time::Instant) {
         self.overflows.push(at);
     }
-
-    #[allow(dead_code)]
     pub fn respawns_in_window(&self, source: SourceId, now: std::time::Instant) -> usize {
         let cutoff = self.cutoff(now);
         self.respawns
@@ -520,6 +521,9 @@ impl WindowLog {
     /// avoid. Ask `any_open` first — a caller that wants to classify a change
     /// as exogenous must not do so while a child is still running, or an
     /// unattributed change would wrongly clear the veto.
+    /// Staged: the reader route resolves an arrival's brackets through it.
+    /// The slice-cadence observer does NOT — it runs only while nothing is in
+    /// flight, so what it hands the ledger is always empty by construction.
     #[allow(dead_code)]
     pub fn covering(&self, at: std::time::Instant) -> Vec<(SourceId, std::time::Duration)> {
         self.brackets
@@ -606,23 +610,25 @@ impl Bracket {
 
     /// Does this bracket cover `at`? An open bracket covers everything from
     /// its start onward.
+    /// Staged with `covering`, its only caller.
     #[allow(dead_code)]
     fn spans(&self, at: std::time::Instant) -> bool {
         self.opened <= at && self.closed.is_none_or(|closed| closed >= at)
     }
 }
 
-// ── The suspicion test, staged ──────────────────────────────────────────
+// ── The suspicion test ─────────────────────────────────────────────────
 //
-// The loop feeds the ledger and the log already, but nothing calls the test
-// itself until the evaluation task lands. These allows go away with it; one
-// surviving means something the plan said would be called is not.
+// The loop feeds the ledger and the log, evaluates the test once per
+// iteration, and paints the verdict. What remains staged below is the READER
+// route only: a fifo/fd arrival has no caller until the reader tasks land,
+// and the notice reads the ordering. Each allow names what reaches it; one
+// surviving that means something the plan said would be called is not.
 
 /// The suspicion test's thresholds. The defaults are research starting
 /// points, not results, and none of them is user-facing: under report-only a
 /// false positive is cosmetic, so a switch can be added later without
 /// breaking anyone, while removing one could not.
-#[allow(dead_code)]
 pub struct LoopSuspicion {
     pub window: std::time::Duration,
     pub min_respawns: usize,
@@ -641,7 +647,6 @@ impl Default for LoopSuspicion {
 
 /// One pane's windowed facts, assembled by the loop. Every count here is
 /// already restricted to the window by `WindowLog`.
-#[allow(dead_code)]
 pub struct PaneWindow<'a> {
     pub source: SourceId,
     pub trigger_respawns: usize,
@@ -651,20 +656,21 @@ pub struct PaneWindow<'a> {
     /// because a reader route has no path to stat.
     pub readers: &'a [TriggerKey],
 }
-
-#[allow(dead_code)]
 pub struct Verdict {
     /// The implicated panes; empty when nothing is suspected. A SET, because
     /// concurrent children make direction unavailable even as coincidence.
     pub panes: Vec<SourceId>,
     /// Present only where attribution was precise enough to order them.
+    /// Staged: the badge is per-pane, so only the notice can name an order.
+    #[allow(dead_code)]
     pub ordered: Option<Vec<SourceId>>,
     /// The test declined to answer. Distinct from an empty `panes`:
-    /// abstaining is not the same as finding nothing.
+    /// abstaining is not the same as finding nothing. Staged: an abstention
+    /// implicates nobody, so the badge already follows it through `panes`;
+    /// the notice is where the difference could be said out loud.
+    #[allow(dead_code)]
     pub abstained: bool,
 }
-
-#[allow(dead_code)]
 impl LoopSuspicion {
     /// Which panes are implicated over the window ending at `now`.
     ///
@@ -787,7 +793,6 @@ impl LoopSuspicion {
 /// producer is arbitrarily more expensive than its consumer. The band is 2x
 /// because the measured gap it sits in is far wider than that, not because it
 /// was tuned.
-#[allow(dead_code)]
 fn credit(changes: &[Change]) -> Vec<SourceId> {
     if changes.is_empty() {
         return Vec::new();
@@ -830,8 +835,6 @@ fn credit(changes: &[Change]) -> Vec<SourceId> {
         .map(|(id, _)| id)
         .collect()
 }
-
-#[allow(dead_code)]
 fn median_width(changes: &[Change], id: SourceId) -> std::time::Duration {
     let mut widths: Vec<std::time::Duration> = changes
         .iter()
@@ -845,7 +848,6 @@ fn median_width(changes: &[Change], id: SourceId) -> std::time::Duration {
 /// so its self-edge is a cycle: when two panes' children overlap so much that
 /// either could have written either path, collapsing them loses nothing —
 /// the collapse IS the loop.
-#[allow(dead_code)]
 fn on_a_cycle(
     candidates: &[&PaneWindow<'_>],
     edges: &[(SourceId, SourceId)],

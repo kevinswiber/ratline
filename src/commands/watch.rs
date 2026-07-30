@@ -754,8 +754,46 @@ pub(crate) fn run_registry(
                     })
                     .collect();
                 let verdict = suspicion.evaluate(now, &ledger, &log, &panes);
-                for id in registry.ids() {
-                    runtime[id.0].looping = verdict.panes.contains(&id);
+                // A badge appearing or clearing is a displayed change,
+                // and it is decided HERE — with no outcome to ride. So
+                // the transition recomposes from the retained outputs
+                // and paints in place, taking the key the paint
+                // returned: the content key is output-derived, and the
+                // pane hashes this just moved are exactly what it is
+                // over, so the gate would let it through anyway — but
+                // the notice arm's pattern keeps the two in step.
+                if apply_verdict(&mut runtime, &verdict.panes, !plain, jiff::Timestamp::now())
+                    && is_tty
+                {
+                    recompose_live(
+                        &mut live,
+                        &registry,
+                        &runtime,
+                        &geom,
+                        view.alt_time,
+                        &palette,
+                        profile,
+                    );
+                    if let Some(l) = live.as_mut() {
+                        restamp_live(l, &runtime);
+                    }
+                    if let Some(l) = live.as_ref() {
+                        previous_key = Some(repaint(
+                            &mut renderer,
+                            pause.as_ref(),
+                            live_scroll,
+                            l,
+                            &live_tail,
+                            &palette,
+                            view,
+                            None,
+                            crossterm::terminal::size().unwrap_or((80, 24)),
+                            session.max_height,
+                            &faint,
+                            profile,
+                            &history,
+                        )?);
+                    }
                 }
             }
             // Every source that ended this iteration is named in ONE
@@ -2305,16 +2343,21 @@ fn exit_badge(status: Option<std::process::ExitStatus>) -> Option<String> {
     })
 }
 
-/// One pane's change signature: its body AND its failure badge, which
-/// is part of what the pane displays. A pane can print byte-identical
-/// output and start failing — without the badge in the pane's own hash,
-/// the composition would carry a badge nothing ever paints. The
-/// combining key stays outcome-derived and geometry-free.
-fn body_signature(lines: &[String], failure: Option<&str>) -> u64 {
+/// One pane's change signature: its body AND every badge it carries,
+/// which are part of what the pane displays. A pane can print
+/// byte-identical output and start failing, or start looping — without
+/// the badges in the pane's own hash, the composition would carry a
+/// badge nothing ever paints. The combining key stays outcome-derived
+/// and geometry-free.
+fn body_signature(lines: &[String], failure: Option<&str>, looping: bool) -> u64 {
     let mut bytes = lines.join("\n").into_bytes();
     if let Some(failure) = failure {
         bytes.push(b'\n');
         bytes.extend_from_slice(failure.as_bytes());
+    }
+    if looping {
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"looping");
     }
     signature(&bytes)
 }
@@ -2327,9 +2370,9 @@ fn body_signature(lines: &[String], failure: Option<&str>) -> u64 {
 /// switched on, and per-pane diffs are strictly less work than the
 /// composed diff they replace.
 fn record_output(r: &mut SourceRuntime, lines: Vec<String>, at: jiff::Timestamp) {
-    // The failure badge is part of what the pane displays, so it joins
-    // this pane's hash: a badge that cannot repaint is invisible.
-    let hash = body_signature(&lines, r.failure.as_deref());
+    // Both badges are part of what the pane displays, so they join this
+    // pane's hash: a badge that cannot repaint is invisible.
+    let hash = body_signature(&lines, r.failure.as_deref(), r.looping);
     if r.output.is_none() || r.hash != hash {
         r.previous = r.output.take();
         r.marks = changed_marks(r.previous.as_deref(), &lines);
@@ -2337,6 +2380,61 @@ fn record_output(r: &mut SourceRuntime, lines: Vec<String>, at: jiff::Timestamp)
         r.changed_at = at;
         r.output = Some(lines);
     }
+}
+
+/// Write the suspicion verdict into per-source state, and report
+/// whether any pane's badge actually moved on screen.
+///
+/// The verdict is decided in the trigger arm, while `record_output` runs
+/// while draining an outcome — so a badge that only rode the drain would
+/// appear at the next completion at the earliest, and a CLEARED badge
+/// would sit on an idle pane indefinitely. A transition therefore
+/// re-enters `record_output` with the pane's RETAINED body: the same
+/// path `· exit N` takes, so the two badges beside each other can never
+/// behave differently, and so the pane is re-dated exactly as a badge
+/// transition already re-dates it. Nothing re-runs, and no schedule is
+/// touched.
+///
+/// `boxed` is whether the panes have a chrome row at all: a plain watch
+/// has nowhere to show a badge, and a pane that has not yet completed
+/// has no body to recompose, so both record the state and repaint
+/// nothing. The badge folds into the hash at their next `record_output`.
+fn apply_verdict(
+    runtime: &mut [SourceRuntime],
+    implicated: &[SourceId],
+    boxed: bool,
+    at: jiff::Timestamp,
+) -> bool {
+    let mut moved = false;
+    for (i, r) in runtime.iter_mut().enumerate() {
+        let looping = implicated.contains(&SourceId(i));
+        if r.looping == looping {
+            continue;
+        }
+        r.looping = looping;
+        if let (true, Some(body)) = (boxed, r.output.clone()) {
+            record_output(r, body, at);
+            moved = true;
+        }
+    }
+    moved
+}
+
+/// Carry the frame's own change key and stamp to the panes' after a
+/// verdict moved a badge — what the drain step would have done had an
+/// outcome carried the change. The footer names the last time anything
+/// on screen changed, and that is now one of these panes. Only the
+/// verdict path calls this: the resize reflow and the counting refresh
+/// deliberately re-date nothing, because neither changed any content.
+fn restamp_live(live: &mut Live, runtime: &[SourceRuntime]) {
+    let at = runtime
+        .iter()
+        .map(|r| r.changed_at)
+        .max()
+        .unwrap_or(live.changed_at);
+    live.hash = combined_hash(runtime);
+    live.changed_at = at;
+    live.since = local_hms(at);
 }
 
 /// Which marks a paint uses. Under panes, a LIVE or LIVE-SCROLLED
@@ -2471,6 +2569,7 @@ fn compose_sources(
                 cadence: &cadence,
                 stamp: &stamp,
                 failure: source.failure.as_deref(),
+                looping: source.looping,
             };
             render_pane(
                 source.output.as_deref().unwrap_or(&[]),
@@ -3372,9 +3471,33 @@ mod tests {
         // the composition would carry a badge nothing ever paints.
         let body = vec!["steady".to_string()];
         assert_ne!(
-            body_signature(&body, None),
-            body_signature(&body, Some("exit 3"))
+            body_signature(&body, None, false),
+            body_signature(&body, Some("exit 3"), false)
         );
+    }
+
+    #[test]
+    fn the_looping_badge_is_in_the_change_signature_too() {
+        // Both badges are chrome, and both are part of what the pane
+        // DISPLAYS — so both are in its hash, independently. All four
+        // combinations must be distinct: sharing a slot would let one
+        // badge mask the other's arrival.
+        let body = vec!["steady".to_string()];
+        let all = [
+            body_signature(&body, None, false),
+            body_signature(&body, None, true),
+            body_signature(&body, Some("exit 3"), false),
+            body_signature(&body, Some("exit 3"), true),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "combination {i} collides");
+            }
+        }
+        // And the badge CLEARS back to the un-badged signature. A hash
+        // that only ever moved forward would repaint the badge's
+        // arrival and then leave it on screen for good.
+        assert_eq!(body_signature(&body, None, false), all[0]);
     }
 
     #[test]
@@ -3606,6 +3729,145 @@ mod tests {
         record_output(&mut r, vec!["two".to_string()], ago(0));
         assert_eq!(r.changed_at, t1);
         assert!(r.marks[0].changed, "the mark dwells past an unchanged tick");
+    }
+
+    #[test]
+    fn a_looping_transition_re_dates_the_pane_in_both_directions() {
+        // The verdict is decided in the trigger arm, long after
+        // `record_output` drained an outcome — so the transition has to
+        // re-date the pane from its RETAINED body, with no child
+        // completing. The clearing direction is the worse failure of the
+        // two: a badge that only appears would sit on an idle pane for
+        // as long as the dashboard runs.
+        let t0 = ago(60);
+        let mut rt = vec![SourceRuntime::for_test()];
+        record_output(&mut rt[0], vec!["steady".to_string()], t0);
+        rt[0].posted = true;
+        let clean = rt[0].hash;
+
+        let on = ago(30);
+        assert!(apply_verdict(&mut rt, &[SourceId(0)], true, on));
+        assert!(rt[0].looping);
+        assert_ne!(rt[0].hash, clean, "the badge moved the pane's hash");
+        assert_eq!(rt[0].changed_at, on, "a displayed change re-dates");
+        assert_eq!(
+            rt[0].output.as_deref(),
+            Some(&["steady".to_string()][..]),
+            "the retained body, verbatim — nothing re-ran"
+        );
+
+        let off = ago(10);
+        assert!(apply_verdict(&mut rt, &[], true, off));
+        assert!(!rt[0].looping);
+        assert_eq!(rt[0].hash, clean, "clearing returns the un-badged hash");
+        assert_eq!(rt[0].changed_at, off);
+
+        // A verdict that moves nothing is not a displayed change, and
+        // must not re-date anything: a repaint every slice would cost
+        // the byte-silence the whole surface is built on.
+        assert!(!apply_verdict(&mut rt, &[], true, ago(0)));
+        assert_eq!(rt[0].changed_at, off);
+    }
+
+    #[test]
+    fn a_cycle_marks_every_pane_in_the_set() {
+        // The verdict names a SET, so a two-pane cycle marks BOTH of
+        // them; a pane outside the set is left entirely alone.
+        let t0 = ago(60);
+        let mut rt: Vec<SourceRuntime> = (0..3).map(|_| SourceRuntime::for_test()).collect();
+        for r in &mut rt {
+            record_output(r, vec!["steady".to_string()], t0);
+        }
+        let at = ago(30);
+        assert!(apply_verdict(
+            &mut rt,
+            &[SourceId(0), SourceId(1)],
+            true,
+            at
+        ));
+        assert!(rt[0].looping && rt[1].looping);
+        assert!(!rt[2].looping, "a pane outside the set is untouched");
+        assert_eq!(rt[2].changed_at, t0, "and is not re-dated");
+    }
+
+    #[test]
+    fn a_looping_transition_takes_the_same_marks_path_as_a_failure_badge() {
+        // The badge goes THROUGH `record_output` rather than around it,
+        // so whatever an `· exit N` transition does to a pane's marks,
+        // this does too — which is the point: the two badges sit beside
+        // each other and must not behave differently. On an unchanged
+        // body that is: no gutter mark at all, because marks are diffed
+        // over the BODY and the chrome row is not in it.
+        let body = vec!["steady".to_string()];
+        let t0 = ago(60);
+        let at = ago(30);
+
+        let mut failing = SourceRuntime::for_test();
+        record_output(&mut failing, body.clone(), t0);
+        failing.failure = Some("exit 3".to_string());
+        record_output(&mut failing, body.clone(), at);
+
+        let mut rt = vec![SourceRuntime::for_test()];
+        record_output(&mut rt[0], body.clone(), t0);
+        apply_verdict(&mut rt, &[SourceId(0)], true, at);
+
+        assert_eq!(failing.changed_at, at, "the failure badge re-dates");
+        assert_eq!(rt[0].changed_at, at, "and so does the looping badge");
+        assert_eq!(rt[0].marks, failing.marks, "one marks path, not two");
+        assert!(
+            failing.marks.iter().all(|m| !m.changed),
+            "an unchanged body marks nothing — asserted, not assumed"
+        );
+        assert_eq!(rt[0].previous.as_deref(), Some(&body[..]));
+    }
+
+    #[test]
+    fn a_repainted_verdict_carries_the_frames_stamp_to_the_panes() {
+        // The badge's arrival is the newest change on screen, so the
+        // footer names it — exactly as it would have had an outcome
+        // carried the change through the drain. A frame left on the old
+        // stamp would say the surface has been still since before the
+        // badge that just appeared on it.
+        let t0 = ago(600);
+        let mut rt: Vec<SourceRuntime> = (0..2).map(|_| SourceRuntime::for_test()).collect();
+        for r in &mut rt {
+            record_output(r, vec!["steady".to_string()], t0);
+        }
+        let mut live = Live {
+            lines: vec!["steady".to_string()],
+            hash: 0,
+            changed_at: t0,
+            since: local_hms(t0),
+            panes: None,
+        };
+        let at = ago(5);
+        apply_verdict(&mut rt, &[SourceId(1)], true, at);
+        restamp_live(&mut live, &rt);
+        assert_eq!(live.changed_at, at, "the newest pane change dates it");
+        assert_eq!(live.since, local_hms(at));
+        assert_eq!(live.hash, combined_hash(&rt), "and the key follows");
+    }
+
+    #[test]
+    fn a_verdict_with_nothing_to_repaint_still_records_the_state() {
+        // Two cases where the badge has no surface: a pane that has not
+        // run yet has no retained body, and a plain watch has no chrome
+        // row at all. Both record the state — it folds into the hash at
+        // the pane's next `record_output` — and neither invents a body
+        // nor re-dates a pane nobody can see.
+        let mut fresh = vec![SourceRuntime::for_test()];
+        assert!(!apply_verdict(&mut fresh, &[SourceId(0)], true, ago(30)));
+        assert!(fresh[0].looping);
+        assert!(fresh[0].output.is_none(), "no body was invented");
+
+        let t0 = ago(60);
+        let mut plain = vec![SourceRuntime::for_test()];
+        record_output(&mut plain[0], vec!["steady".to_string()], t0);
+        let hash = plain[0].hash;
+        assert!(!apply_verdict(&mut plain, &[SourceId(0)], false, ago(30)));
+        assert!(plain[0].looping);
+        assert_eq!(plain[0].hash, hash, "a plain watch has no badge to paint");
+        assert_eq!(plain[0].changed_at, t0);
     }
 
     #[test]

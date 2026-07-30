@@ -758,3 +758,65 @@ fn scrub_steps_distinct_composed_frames() {
         "the dashboard should have exited on q"
     );
 }
+
+/// A cycle: each pane's command touches the file the other pane
+/// triggers on. `interval "never"` on both, and yet they spin — every
+/// run of one arms the other, forever, with no input.
+fn cycle_board(sa: &std::path::Path, sb: &std::path::Path) -> String {
+    let (sa, sb) = (sa.display(), sb.display());
+    debug_assert!(!format!("{sa}{sb}").contains('"'));
+    format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 3\n    border \"none\"\n    shell #true\n    interval \"never\"\n}}\n\n\
+         pane \"a\" {{\n    trigger \"file:{sa}\"\n    trigger-debounce \"100ms\"\n    \
+         command \"touch {sb}; echo cycle-a\"\n}}\n\n\
+         pane \"b\" {{\n    trigger \"file:{sb}\"\n    trigger-debounce \"100ms\"\n    \
+         command \"touch {sa}; echo cycle-b\"\n}}\n"
+    )
+}
+
+/// The whole signal end to end: observation, brackets, the credit rule,
+/// the verdict, and a badge reaching a real screen. Both panes print a
+/// CONSTANT line, so the composition is still — which is the hazard
+/// itself: without the badge this dashboard looks idle while it spawns a
+/// shell several times a second.
+///
+/// It costs seconds by construction, because the badge is earned rather
+/// than set: a pane needs 50 trigger-driven respawns inside a 30 s
+/// window, and each hop of the cycle costs one debounce interval.
+/// `trigger-debounce` is declared at 100 ms as the widest margin
+/// available on both axes at once — the ~10 Hz it allows is several
+/// times the ~1.7 Hz the threshold needs, while still bounding each
+/// pane's in-flight duty far below the ceiling that makes the signal
+/// abstain, which no debounce at all would not.
+#[test]
+fn a_cycle_of_two_panes_earns_the_looping_badge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sa = dir.path().join("sa");
+    let sb = dir.path().join("sb");
+    // Both trigger files exist before the baselines are taken: a path
+    // that APPEARS is itself a change, and this test is about the cycle
+    // rather than about a first appearance.
+    for stamp in [&sa, &sb] {
+        std::fs::write(stamp, b"").expect("seed the trigger file");
+    }
+    let decl = write_dashboard(dir.path(), &cycle_board(&sa, &sb));
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    // The badge, on a chrome row that names the cadence it spins at.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "· looping".as_bytes(),
+        Duration::from_secs(40),
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(5));
+    assert!(seen.is_some(), "the cycle never earned its badge");
+}

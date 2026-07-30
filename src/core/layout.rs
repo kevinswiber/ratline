@@ -30,6 +30,11 @@ pub struct PaneChrome<'a> {
     pub stamp: &'a str,
     /// "exit 3" when the pane failed.
     pub failure: Option<&'a str>,
+    /// Whether the suspicion test currently implicates this pane. A
+    /// SEPARATE slot from `failure`, never a reuse of it: that one is
+    /// outcome-derived and recomputed every tick, this one spans ticks,
+    /// and a pane can legitimately be both failing and looping.
+    pub looping: bool,
 }
 
 /// Pin one pane's output into its declared box: apply the overflow
@@ -235,24 +240,37 @@ fn beside(parts: &[PaneBlock], gap: usize) -> PaneBlock {
     out
 }
 
-/// `{cadence} · {stamp}`, plus the failure badge when the pane failed:
+/// `{cadence} · {stamp}`, plus each badge the pane currently carries:
 /// faint, right-aligned, never wider than the inner box. The stamp is
 /// the pane's last-CHANGE time — a produced-at stamp would repaint
 /// every tick and cost byte-silence. The row truncates from the right
-/// like every other line, so a pane too narrow for the badge loses the
-/// badge's tail rather than the cadence — behavior, not accident.
+/// like every other line, so a pane too narrow for the badges loses
+/// their tail rather than the cadence — behavior, not accident.
+///
+/// The word is `looping`: nine cells with its separator, the word a
+/// user would type into a search box, and confident in the way
+/// `CrashLoopBackOff` is confident over a mechanism that only counts.
+/// The hedging belongs where there is room for it — a notice row and
+/// the key reference — never in a nine-cell badge.
 fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> String {
     let mut text = format!("{} · {}", chrome.cadence, chrome.stamp);
-    if let Some(failure) = chrome.failure {
-        text.push_str(" · ");
-        text.push_str(failure);
-    }
+    push_badge(&mut text, chrome.failure);
+    push_badge(&mut text, chrome.looping.then_some("looping"));
     let faint = StyleSpec {
         faint: true,
         ..StyleSpec::default()
     };
     let text = truncate_display(&text, cols, ELLIPSIS);
     pad_display(&faint.render(&text, profile), cols, Align::Right)
+}
+
+/// One badge in the chrome row's separator form. Two of them ride this
+/// row independently, so the join is written once rather than nested.
+fn push_badge(text: &mut String, badge: Option<&str>) {
+    if let Some(badge) = badge {
+        text.push_str(" · ");
+        text.push_str(badge);
+    }
 }
 
 #[cfg(test)]
@@ -302,6 +320,7 @@ mod tests {
             cadence: "every 5s",
             stamp: "12:04:31",
             failure,
+            looping: false,
         }
     }
 
@@ -690,5 +709,84 @@ mod tests {
             .chars()
             .collect();
         assert_eq!(&stripped[3..6], &['a', 'b', 'c']);
+    }
+
+    #[test]
+    fn a_looping_pane_shows_the_badge() {
+        let row = chrome_row(
+            &PaneChrome {
+                looping: true,
+                ..chrome(None)
+            },
+            40,
+            ColorProfile::Ascii,
+        );
+        assert!(row.contains("· looping"), "got {row:?}");
+    }
+
+    #[test]
+    fn a_pane_can_be_both_failing_and_looping() {
+        // Two independent slots: one is outcome-derived and recomputed
+        // every tick, the other spans ticks. Neither replaces the other.
+        let row = chrome_row(
+            &PaneChrome {
+                looping: true,
+                ..chrome(Some("exit 3"))
+            },
+            60,
+            ColorProfile::Ascii,
+        );
+        assert!(
+            row.contains("every 5s · 12:04:31 · exit 3 · looping"),
+            "got {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_loses_the_badge_rather_than_the_cadence() {
+        // Shipped behaviour asserted rather than assumed: the row
+        // truncates from the RIGHT, so the badge's tail goes before the
+        // cadence does. `on trigger · 12:04:31 · looping` is 31 cells,
+        // which makes 31 the exact width at which the badge survives.
+        let looping = PaneChrome {
+            cadence: "on trigger",
+            looping: true,
+            ..chrome(None)
+        };
+        assert_eq!(
+            chrome_row(&looping, 31, ColorProfile::Ascii),
+            "on trigger · 12:04:31 · looping"
+        );
+        let narrow = chrome_row(&looping, 30, ColorProfile::Ascii);
+        assert!(
+            narrow.starts_with("on trigger · 12:04:31"),
+            "the cadence and the stamp survive: {narrow:?}"
+        );
+        assert!(!narrow.contains("looping"), "got {narrow:?}");
+        assert_eq!(display_width(&narrow), 30, "and the row still fits");
+    }
+
+    #[test]
+    fn a_pane_with_no_chrome_row_renders_no_badge_and_does_not_panic() {
+        // `chrome = #false` is legal and shipped, and `· exit 3` is
+        // ALREADY invisible on such a pane. The badge inherits that
+        // hole rather than opening a new one — which is exactly why a
+        // notice row that names the panes has to exist too.
+        let bare = pane(4, BorderPreset::None, Sides::default(), false);
+        let block = render_pane(
+            &lines(&["ab"]),
+            &[LineMark::default()],
+            &bare,
+            geom(&bare, 20),
+            &PaneChrome {
+                looping: true,
+                ..chrome(Some("exit 3"))
+            },
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines.len(), 4, "a chrome-less pane is all content");
+        assert!(!block.lines.iter().any(|l| l.contains("looping")));
+        assert!(!block.lines.iter().any(|l| l.contains("exit 3")));
     }
 }
