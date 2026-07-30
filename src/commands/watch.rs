@@ -537,11 +537,17 @@ pub(crate) fn run_registry(
             r.posted = true;
             drained.push(id);
             // The bracket closes with the completion. Whatever moved between
-            // its two snapshots moved while THIS child was running.
+            // its two snapshots moved while THIS child was running — and
+            // while every child that overlapped it was running too, since
+            // the snapshots place the change inside the window rather than
+            // at an instant.
             if let Some(open) = r.bracket.take()
-                && let Some(closed) = log.close_bracket(open, Instant::now(), outcome.close_stamps)
+                && let Some(closed) = log
+                    .close_bracket(open, Instant::now(), outcome.close_stamps)
+                    .cloned()
             {
-                ledger.observe_bracket(closed);
+                let others = log.overlapping(&closed);
+                ledger.observe_bracket(&closed, &others);
             }
         }
         if !drained.is_empty() {
@@ -2361,9 +2367,13 @@ fn looping_text(registry: &Registry, panes: &[SourceId]) -> String {
 /// is not a hypothetical: the end-to-end test caught it announcing `a`
 /// alone in a two-pane cycle. Announcing again as the set grows costs a
 /// second row a hop later, which REPLACES the first (the row is
-/// one-shot), so what survives on screen is the whole set. A set that
-/// shrinks says nothing: that is not news, and the badges already show
-/// it.
+/// one-shot), so what survives on screen is the whole set.
+///
+/// The latch is the panes announced during this **episode**, and only a
+/// verdict implicating NOBODY ends it. A set that merely shrinks says
+/// nothing — membership wobbles while a loop spins, and forgetting a pane
+/// the moment it drops out would re-announce it the moment it returned,
+/// which is a repaint storm reporting nothing new.
 ///
 /// An **abstention holds** the latch instead of resetting it. Declining
 /// to answer is not the same as finding nothing (`Verdict::abstained`
@@ -2374,9 +2384,17 @@ fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
     if verdict.abstained {
         return false;
     }
-    let grew = verdict.panes.iter().any(|id| !latch.contains(id));
-    latch.clear();
-    latch.extend(verdict.panes.iter().copied());
+    if verdict.panes.is_empty() {
+        latch.clear();
+        return false;
+    }
+    let mut grew = false;
+    for id in &verdict.panes {
+        if !latch.contains(id) {
+            latch.push(*id);
+            grew = true;
+        }
+    }
     grew
 }
 
@@ -4011,8 +4029,17 @@ mod tests {
             !edge(&mut latch, &[SourceId(0)], false),
             "but a set that SHRINKS says nothing; the badges show that"
         );
-        assert!(!edge(&mut latch, &[], false), "and clearing is not news");
-        assert!(edge(&mut latch, &[SourceId(0)], false), "returning is");
+        assert!(
+            !edge(&mut latch, &[SourceId(0), SourceId(1)], false),
+            "and a pane that drops out and comes back is not news TWICE — \
+             membership wobbles while a loop spins, and re-announcing it \
+             would be a repaint storm carrying nothing new"
+        );
+        assert!(!edge(&mut latch, &[], false), "clearing is not news either");
+        assert!(
+            edge(&mut latch, &[SourceId(0)], false),
+            "but a loop that returns after clearing IS a new episode"
+        );
     }
 
     #[test]
