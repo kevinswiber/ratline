@@ -27,7 +27,10 @@ use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{Composition, PaneGeometry, Registry, SourceId, SourceSpec};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
-use crate::core::trigger::{DebounceGate, MtimeWatchSet, TriggerSpec, parse_trigger};
+use crate::core::trigger::{
+    BracketId, DebounceGate, MtimeWatchSet, PathLedger, TriggerSpec, WindowLog, parse_trigger,
+    stamps,
+};
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::history::History;
@@ -251,6 +254,28 @@ pub(crate) fn run_registry(
     // `--once` arms no triggers: the run ends at the first composition,
     // so a watcher could only fire into a loop that has already left.
     let armed = !session.once;
+    // The GLOBAL union of every watched path, computed once. Global and not
+    // per-source on purpose: in a feedback loop one pane's command touches the
+    // path another pane watches, so a source-local set could never connect the
+    // two. Empty when nothing is armed, which is every `--once` run, and an
+    // empty union makes every observer call below a no-op.
+    let watched_union: Vec<std::path::PathBuf> = if armed {
+        let mut paths: Vec<std::path::PathBuf> = registry
+            .ids()
+            .flat_map(|id| file_paths(&registry.spec(id).triggers))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    } else {
+        Vec::new()
+    };
+    // The observer's own baselines, deliberately separate from every
+    // MtimeWatchSet over the same paths: sharing them would let an observer
+    // poll consume a trigger's fire, and the pane would stop refreshing.
+    let mut ledger = PathLedger::new(watched_union.clone());
+    let suspicion = crate::core::trigger::LoopSuspicion::default();
+    let mut log = WindowLog::new(suspicion.window);
     let mut runtime: Vec<SourceRuntime> = registry
         .ids()
         .map(|id| {
@@ -278,6 +303,7 @@ pub(crate) fn run_registry(
                 posted: false,
                 gate: DebounceGate::new(spec.debounce),
                 files,
+                bracket: None,
                 #[cfg(unix)]
                 readers: Vec::new(),
             }
@@ -386,15 +412,22 @@ pub(crate) fn run_registry(
                         id,
                         runtime[id.0].slot.clone(),
                         runtime[id.0].tx.clone(),
-                        // Task 2.2 passes the real watched union here.
-                        Vec::new(),
+                        watched_union.clone(),
                     )
                     .is_err();
                 }
                 if inline {
                     let command =
                         source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
-                    let _ = runtime[id.0].tx.send(run_tick(command, id, Vec::new()));
+                    let _ = runtime[id.0]
+                        .tx
+                        .send(run_tick(command, id, watched_union.clone()));
+                }
+                // The bracket opens with the child: this instant, and the
+                // union as it stands before the child can touch it.
+                if !watched_union.is_empty() {
+                    let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
+                    runtime[id.0].bracket = Some(opened);
                 }
             }
         }
@@ -487,6 +520,13 @@ pub(crate) fn run_registry(
             newest = newest.max(outcome.at);
             r.posted = true;
             drained.push(id);
+            // The bracket closes with the completion. Whatever moved between
+            // its two snapshots moved while THIS child was running.
+            if let Some(open) = r.bracket.take()
+                && let Some(closed) = log.close_bracket(open, Instant::now(), outcome.close_stamps)
+            {
+                ledger.observe_bracket(closed);
+            }
         }
         if !drained.is_empty() {
             let content = combined_hash(&runtime);
@@ -642,6 +682,15 @@ pub(crate) fn run_registry(
         // 2, at most one slice away.
         {
             let now = Instant::now();
+            // Classify at slice cadence, but ONLY while nothing is in flight.
+            // That is the idle case, and it is the only one that can produce
+            // an EXOGENOUS observation — proof that something outside the
+            // dashboard writes this path. While a child runs, attribution
+            // comes from its bracket instead; classifying here would credit
+            // the change to nobody and wrongly clear the veto.
+            if !watched_union.is_empty() && !log.any_open(now) {
+                ledger.observe(now, &[]);
+            }
             #[cfg(unix)]
             let mut ended_notices: Vec<String> = Vec::new();
             for id in registry.ids() {
@@ -664,8 +713,18 @@ pub(crate) fn run_registry(
                     // child of THIS source predates: a respawn, never a
                     // plain request.
                     r.schedule.request_respawn();
+                    // The one site where a respawn is trigger-driven. Recorded
+                    // as an EVENT, never a running count: a count that cannot
+                    // fall could never let a repaired dashboard stop being
+                    // suspected. An `interval` pane reaches its deadline
+                    // without passing through this gate, which is what excludes
+                    // a legitimately fast pane for free.
+                    log.record_respawn(id, now);
                 }
             }
+            // One eviction pass per iteration bounds every windowed quantity.
+            ledger.evict(now, suspicion.window);
+            log.evict(now);
             // Every source that ended this iteration is named in ONE
             // one-shot notice row; with no frame yet the batch drops.
             #[cfg(unix)]
@@ -2475,6 +2534,10 @@ struct SourceRuntime {
     gate: DebounceGate,
     /// The `file:` triggers it stat-polls.
     files: MtimeWatchSet,
+    /// Its open bracket, by stable id. Never a positional index: eviction
+    /// removes older brackets, which would shift an index this still holds
+    /// and close the wrong record.
+    bracket: Option<BracketId>,
     /// Its fifo/fd reader threads; dropping the runtime joins them.
     #[cfg(unix)]
     readers: Vec<ReaderSlot>,
@@ -3080,6 +3143,7 @@ mod tests {
             marks: Vec::new(),
             failure: None,
             posted: false,
+            bracket: None,
             gate: DebounceGate::new(Duration::ZERO),
             files: MtimeWatchSet::new(Vec::new()),
             #[cfg(unix)]
@@ -3441,6 +3505,7 @@ mod tests {
                 changed_at: jiff::Timestamp::now(),
                 failure: None,
                 posted: false,
+                bracket: None,
                 gate: DebounceGate::new(Duration::ZERO),
                 files: MtimeWatchSet::new(Vec::new()),
                 #[cfg(unix)]

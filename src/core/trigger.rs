@@ -176,27 +176,16 @@ impl MtimeWatchSet {
     }
 }
 
-// ── The loop-observer surface, staged ───────────────────────────────────
-//
-// Everything from here to `PathLedger` is constructed by the merged loop, not
-// by this module, and the loop does not call it YET. A bin crate's dead-code
-// check counts a pub item nobody in the binary constructs, so each carries a
-// staged allow until the wiring task lands and starts calling it. Removing
-// these allows is that task's job and one of its acceptance criteria — if any
-// survives the wiring, something the plan said would be called is not.
-
 /// One path's fingerprint as the observer carries it — including across the
 /// worker/loop boundary. A newtype over the module-private alias so a
 /// trigger's baseline can never be passed where an observer stamp belongs:
 /// the observer keeps its OWN baselines, and advancing a trigger's would
 /// swallow the fire and silently stop a pane refreshing.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[allow(dead_code)]
 pub struct PathStamp(Fingerprint);
 
 /// Stamp a path set. Taken by the loop when a bracket opens and by the
 /// worker when it closes, both over the whole watched union.
-#[allow(dead_code)]
 pub fn stamps(paths: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, PathStamp)> {
     paths
         .iter()
@@ -208,13 +197,11 @@ pub fn stamps(paths: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, PathStam
 /// an older bracket cannot shift what a live source is still holding — a
 /// positional index would, and closing it would then hit the wrong record.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[allow(dead_code)]
 pub struct BracketId(pub u64);
 
 /// One spawn-to-exit interval of one source, with the watched union stamped
 /// on both sides. `WindowLog` owns the lifecycle; `PathLedger` only reads a
 /// completed one.
-#[allow(dead_code)]
 pub struct Bracket {
     /// `WindowLog` keys its store by this and hands it back on close;
     /// `PathLedger` reads only the stamps.
@@ -228,7 +215,6 @@ pub struct Bracket {
 }
 
 /// One observed change to one watched path.
-#[allow(dead_code)]
 pub struct Change {
     pub at: std::time::Instant,
     /// The brackets this change fell inside, with each one's width. EMPTY
@@ -242,7 +228,6 @@ pub struct Change {
 ///
 /// Deliberately separate from every `MtimeWatchSet`. The two stat the same
 /// paths and must not share a baseline — see `PathStamp`.
-#[allow(dead_code)]
 pub struct PathLedger {
     /// Sorted and deduplicated, so the stat order is deterministic.
     paths: Vec<std::path::PathBuf>,
@@ -250,7 +235,6 @@ pub struct PathLedger {
     changes: std::collections::HashMap<std::path::PathBuf, Vec<Change>>,
 }
 
-#[allow(dead_code)]
 impl PathLedger {
     /// Take the baseline immediately: a path that already exists is not a
     /// change, the same rule `MtimeWatch` follows.
@@ -370,7 +354,6 @@ impl PathLedger {
 /// prints. Keying per trigger rather than per source is what lets two fifos
 /// on ONE pane be credited separately instead of merged.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-#[allow(dead_code)]
 pub struct TriggerKey(pub String);
 
 /// One reader arrival. Its covering brackets are identified when the bytes
@@ -393,7 +376,6 @@ pub struct Arrival {
 /// Every windowed quantity the suspicion test reads, in one place, all of it
 /// evicting. Nothing here is cumulative: a count that cannot fall could never
 /// let a repaired dashboard stop being suspected.
-#[allow(dead_code)]
 pub struct WindowLog {
     window: std::time::Duration,
     next_id: u64,
@@ -404,7 +386,6 @@ pub struct WindowLog {
     overflows: Vec<std::time::Instant>,
 }
 
-#[allow(dead_code)]
 impl WindowLog {
     pub fn new(window: std::time::Duration) -> WindowLog {
         WindowLog {
@@ -459,6 +440,7 @@ impl WindowLog {
     }
 
     /// A fifo/fd arrival, resolved against the brackets already owned here.
+    #[allow(dead_code)]
     pub fn observe_arrival(
         &mut self,
         source: SourceId,
@@ -483,10 +465,12 @@ impl WindowLog {
     /// treated as "no arrivals": the dropped one may have been the window's
     /// only exogenous observation, and losing it would turn a zero test into
     /// an accusation. Any window this touches abstains instead.
+    #[allow(dead_code)]
     pub fn record_overflow(&mut self, at: std::time::Instant) {
         self.overflows.push(at);
     }
 
+    #[allow(dead_code)]
     pub fn respawns_in_window(&self, source: SourceId, now: std::time::Instant) -> usize {
         let cutoff = self.cutoff(now);
         self.respawns
@@ -536,6 +520,7 @@ impl WindowLog {
     /// avoid. Ask `any_open` first — a caller that wants to classify a change
     /// as exogenous must not do so while a child is still running, or an
     /// unattributed change would wrongly clear the veto.
+    #[allow(dead_code)]
     pub fn covering(&self, at: std::time::Instant) -> Vec<(SourceId, std::time::Duration)> {
         self.brackets
             .iter()
@@ -608,7 +593,6 @@ impl WindowLog {
     }
 }
 
-#[allow(dead_code)]
 impl Bracket {
     /// Final width, or `None` while the child is still running.
     pub fn width(&self) -> Option<std::time::Duration> {
@@ -622,10 +606,17 @@ impl Bracket {
 
     /// Does this bracket cover `at`? An open bracket covers everything from
     /// its start onward.
+    #[allow(dead_code)]
     fn spans(&self, at: std::time::Instant) -> bool {
         self.opened <= at && self.closed.is_none_or(|closed| closed >= at)
     }
 }
+
+// ── The suspicion test, staged ──────────────────────────────────────────
+//
+// The loop feeds the ledger and the log already, but nothing calls the test
+// itself until the evaluation task lands. These allows go away with it; one
+// surviving means something the plan said would be called is not.
 
 /// The suspicion test's thresholds. The defaults are research starting
 /// points, not results, and none of them is user-facing: under report-only a
