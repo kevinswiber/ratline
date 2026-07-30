@@ -283,15 +283,30 @@ Write pane commands that can run at any moment and any number of times
 without it mattering — read a file, query a status, format some text.
 A command with side effects will have them again on events that have
 nothing to do with its cadence. If a pane must touch something that
-changes, make the touching idempotent, and put the part that is not
-inside a script the dashboard only *reads* the result of. The same
-applies to a nested `rat dashboard … --once`: the inner panes all run
-once per outer tick, and an inner `interval` has nothing to schedule.
+changes, have the command skip the write when nothing changed, and put
+the part that cannot be skipped inside a script the dashboard only
+*reads* the result of. Writing the same bytes again is not enough: a
+`file:` trigger fires on modification time, not content, so a command
+that rewrites a file identically — `cp`, `sed -i`, a formatter — fires
+it every time. The same applies to a nested `rat dashboard … --once`:
+the inner panes all run once per outer tick, and an inner `interval`
+has nothing to schedule.
+
+**A side effect on a watched path is a loop.** If a pane's command
+touches a file that any pane triggers on — another pane's or its own —
+then those panes drive each other for as long as the dashboard runs, at
+a rate you did not choose. Nothing on screen will say so: a pane's
+stamp moves only when its output *changes*, so a loop whose output is
+constant never repaints, and a dashboard can sit there spawning a shell
+several times a second looking perfectly still. `interval "never"` is
+not a brake — it removes the clock, and the trigger is what runs the
+command. Point a trigger at a path no pane writes.
 
 Cost, rather than correctness, has a lever: a pane declared
 `interval "never"` with a `trigger` runs only when its trigger says
 something changed, so an expensive command can sit behind a cheap file
-whose modification time is the signal.
+whose modification time is the signal — written by something outside the
+dashboard.
 
 **Authoring for panes:** a pane's child prints *content only* — boxes,
 titles, heights, and the side-by-side layout are the loop's job, so a
