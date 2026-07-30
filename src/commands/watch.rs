@@ -270,6 +270,18 @@ pub(crate) fn run_registry(
     } else {
         Vec::new()
     };
+    // Per-source watched paths, kept so the evaluation can borrow them rather
+    // than rebuild a Vec per iteration at 20 Hz.
+    let per_source_watched: Vec<Vec<std::path::PathBuf>> = registry
+        .ids()
+        .map(|id| {
+            if armed {
+                file_paths(&registry.spec(id).triggers)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
     // The observer's own baselines, deliberately separate from every
     // MtimeWatchSet over the same paths: sharing them would let an observer
     // poll consume a trigger's fire, and the pane would stop refreshing.
@@ -303,6 +315,7 @@ pub(crate) fn run_registry(
                 posted: false,
                 gate: DebounceGate::new(spec.debounce),
                 files,
+                looping: false,
                 bracket: None,
                 #[cfg(unix)]
                 readers: Vec::new(),
@@ -725,6 +738,26 @@ pub(crate) fn run_registry(
             // One eviction pass per iteration bounds every windowed quantity.
             ledger.evict(now, suspicion.window);
             log.evict(now);
+            // Then one evaluation, for the whole dashboard: the graph it tests
+            // is a whole-dashboard object, not a per-source one.
+            if !watched_union.is_empty() {
+                let panes: Vec<crate::core::trigger::PaneWindow<'_>> = registry
+                    .ids()
+                    .map(|id| crate::core::trigger::PaneWindow {
+                        source: id,
+                        // Read from the window, never from a stored counter: a
+                        // count that cannot fall could never let a repaired
+                        // dashboard stop being suspected.
+                        trigger_respawns: log.respawns_in_window(id, now),
+                        watched: &per_source_watched[id.0],
+                        readers: &[],
+                    })
+                    .collect();
+                let verdict = suspicion.evaluate(now, &ledger, &log, &panes);
+                for id in registry.ids() {
+                    runtime[id.0].looping = verdict.panes.contains(&id);
+                }
+            }
             // Every source that ended this iteration is named in ONE
             // one-shot notice row; with no frame yet the batch drops.
             #[cfg(unix)]
@@ -2534,6 +2567,11 @@ struct SourceRuntime {
     gate: DebounceGate,
     /// The `file:` triggers it stat-polls.
     files: MtimeWatchSet,
+    /// Whether the suspicion test currently implicates this pane. Separate
+    /// from `failure` on purpose: that is outcome-derived and recomputed on
+    /// every tick, while this is signal-derived and spans ticks — and a pane
+    /// can legitimately be both failing and looping.
+    looping: bool,
     /// Its open bracket, by stable id. Never a positional index: eviction
     /// removes older brackets, which would shift an index this still holds
     /// and close the wrong record.
@@ -3143,6 +3181,7 @@ mod tests {
             marks: Vec::new(),
             failure: None,
             posted: false,
+            looping: false,
             bracket: None,
             gate: DebounceGate::new(Duration::ZERO),
             files: MtimeWatchSet::new(Vec::new()),
@@ -3505,6 +3544,7 @@ mod tests {
                 changed_at: jiff::Timestamp::now(),
                 failure: None,
                 posted: false,
+                looping: false,
                 bracket: None,
                 gate: DebounceGate::new(Duration::ZERO),
                 files: MtimeWatchSet::new(Vec::new()),
