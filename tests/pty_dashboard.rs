@@ -790,7 +790,7 @@ fn cycle_board(sa: &std::path::Path, sb: &std::path::Path) -> String {
 /// pane's in-flight duty far below the ceiling that makes the signal
 /// abstain, which no debounce at all would not.
 #[test]
-fn a_cycle_of_two_panes_earns_the_looping_badge() {
+fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     let dir = tempfile::tempdir().expect("tempdir");
     let sa = dir.path().join("sa");
     let sb = dir.path().join("sb");
@@ -809,14 +809,34 @@ fn a_cycle_of_two_panes_earns_the_looping_badge() {
         wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5)),
         "the first composition never painted"
     );
-    // The badge, on a chrome row that names the cadence it spins at.
+    // Wait on the NOTICE rather than the badge: both land in the same
+    // repaint at the rising edge, and the one-shot row is painted after
+    // the frame, so seeing it means the frame's bytes are already in
+    // hand — which lets one 8.5 s run assert both surfaces.
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        "· looping".as_bytes(),
+        "trigger loop suspected:".as_bytes(),
         Duration::from_secs(40),
     );
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(5));
-    assert!(seen.is_some(), "the cycle never earned its badge");
+    let seen = seen.expect("the cycle never earned its report");
+    // Badge = state, notice = event, and both surfaces carry it.
+    assert!(
+        contains(&seen, "· looping".as_bytes()),
+        "the badge never reached a chrome row: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // The evidence is named, so the claim can be argued with.
+    assert!(
+        contains(&seen, b"file:") && contains(&seen, b"? help"),
+        "the notice must name the watched paths and where to read more"
+    );
+    // NOTE: the needle is deliberately not `a, b:`. The report names
+    // whichever panes the verdict implicates, and today's verdict does
+    // NOT reliably name both panes of a two-pane cycle — it oscillates
+    // with the parity of the change count, for a reason that lives in
+    // the credit rule rather than in these two surfaces. Asserting the
+    // full set here would be asserting a fix that has not been made.
 }
