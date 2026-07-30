@@ -6,6 +6,8 @@
 
 use anyhow::{anyhow, bail};
 
+use crate::core::registry::SourceId;
+
 /// One parsed `--trigger` source.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TriggerSpec {
@@ -171,6 +173,182 @@ impl MtimeWatchSet {
             any |= watch.fired();
         }
         any
+    }
+}
+
+// ── The loop-observer surface, staged ───────────────────────────────────
+//
+// Everything from here to `PathLedger` is constructed by the merged loop, not
+// by this module, and the loop does not call it YET. A bin crate's dead-code
+// check counts a pub item nobody in the binary constructs, so each carries a
+// staged allow until the wiring task lands and starts calling it. Removing
+// these allows is that task's job and one of its acceptance criteria — if any
+// survives the wiring, something the plan said would be called is not.
+
+/// One path's fingerprint as the observer carries it — including across the
+/// worker/loop boundary. A newtype over the module-private alias so a
+/// trigger's baseline can never be passed where an observer stamp belongs:
+/// the observer keeps its OWN baselines, and advancing a trigger's would
+/// swallow the fire and silently stop a pane refreshing.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+pub struct PathStamp(Fingerprint);
+
+/// Stamp a path set. Taken by the loop when a bracket opens and by the
+/// worker when it closes, both over the whole watched union.
+#[allow(dead_code)]
+pub fn stamps(paths: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, PathStamp)> {
+    paths
+        .iter()
+        .map(|path| (path.clone(), PathStamp(fingerprint(path))))
+        .collect()
+}
+
+/// A stable handle to one bracket. Monotonic and never reused, so evicting
+/// an older bracket cannot shift what a live source is still holding — a
+/// positional index would, and closing it would then hit the wrong record.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[allow(dead_code)]
+pub struct BracketId(pub u64);
+
+/// One spawn-to-exit interval of one source, with the watched union stamped
+/// on both sides. `WindowLog` owns the lifecycle; `PathLedger` only reads a
+/// completed one.
+#[allow(dead_code)]
+pub struct Bracket {
+    /// `WindowLog` keys its store by this and hands it back on close;
+    /// `PathLedger` reads only the stamps.
+    pub id: BracketId,
+    pub source: SourceId,
+    pub opened: std::time::Instant,
+    /// `None` while the child is still running.
+    pub closed: Option<std::time::Instant>,
+    pub open_stamps: Vec<(std::path::PathBuf, PathStamp)>,
+    pub close_stamps: Vec<(std::path::PathBuf, PathStamp)>,
+}
+
+/// One observed change to one watched path.
+#[allow(dead_code)]
+pub struct Change {
+    pub at: std::time::Instant,
+    /// The brackets this change fell inside, with each one's width. EMPTY
+    /// means no child was in flight — which is what makes the change
+    /// EXOGENOUS, and one exogenous observation is what clears suspicion.
+    pub containing: Vec<(SourceId, std::time::Duration)>,
+}
+
+/// The observer's view of the watched union: its own baseline per path, and
+/// the changes it has seen inside the window.
+///
+/// Deliberately separate from every `MtimeWatchSet`. The two stat the same
+/// paths and must not share a baseline — see `PathStamp`.
+#[allow(dead_code)]
+pub struct PathLedger {
+    /// Sorted and deduplicated, so the stat order is deterministic.
+    paths: Vec<std::path::PathBuf>,
+    seen: std::collections::HashMap<std::path::PathBuf, PathStamp>,
+    changes: std::collections::HashMap<std::path::PathBuf, Vec<Change>>,
+}
+
+#[allow(dead_code)]
+impl PathLedger {
+    /// Take the baseline immediately: a path that already exists is not a
+    /// change, the same rule `MtimeWatch` follows.
+    pub fn new(paths: Vec<std::path::PathBuf>) -> PathLedger {
+        let mut paths = paths;
+        paths.sort();
+        paths.dedup();
+        let seen = stamps(&paths).into_iter().collect();
+        PathLedger {
+            paths,
+            seen,
+            changes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Stat the union and record one change per path that moved. `brackets`
+    /// is who was in flight over the interval since the last call; empty
+    /// means the dashboard was idle.
+    pub fn observe(
+        &mut self,
+        now: std::time::Instant,
+        brackets: &[(SourceId, std::time::Duration)],
+    ) {
+        for (path, stamp) in stamps(&self.paths) {
+            if self.moved(&path, stamp) {
+                self.record(path, now, brackets.to_vec());
+            }
+        }
+    }
+
+    /// Read a completed bracket: any path differing between its two
+    /// snapshots changed while that source's child was running.
+    pub fn observe_bracket(&mut self, bracket: &Bracket) {
+        let Some(closed) = bracket.closed else {
+            return; // still running: there is no width yet, so nothing to say
+        };
+        let width = closed.saturating_duration_since(bracket.opened);
+        let before: std::collections::HashMap<_, _> = bracket
+            .open_stamps
+            .iter()
+            .map(|(path, stamp)| (path.clone(), *stamp))
+            .collect();
+        for (path, stamp) in &bracket.close_stamps {
+            if before.get(path) == Some(stamp) {
+                continue;
+            }
+            if self.moved(path, *stamp) {
+                self.record(path.clone(), closed, vec![(bracket.source, width)]);
+            }
+        }
+    }
+
+    /// Drop changes older than the window, so a count means NOW.
+    pub fn evict(&mut self, now: std::time::Instant, window: std::time::Duration) {
+        let Some(cutoff) = now.checked_sub(window) else {
+            return;
+        };
+        for changes in self.changes.values_mut() {
+            changes.retain(|change| change.at >= cutoff);
+        }
+    }
+
+    /// Changes to this path with no child in flight over them.
+    pub fn exogenous(&self, path: &std::path::Path) -> usize {
+        self.changes(path)
+            .iter()
+            .filter(|change| change.containing.is_empty())
+            .count()
+    }
+
+    /// Every change to this path still inside the window — the credit rule's
+    /// per-path input.
+    pub fn changes(&self, path: &std::path::Path) -> &[Change] {
+        self.changes.get(path).map_or(&[], Vec::as_slice)
+    }
+
+    /// Has this path moved since the observer last looked? Advances the
+    /// observer's own baseline, never a trigger's.
+    fn moved(&mut self, path: &std::path::Path, stamp: PathStamp) -> bool {
+        match self.seen.get(path) {
+            Some(last) if *last == stamp => false,
+            _ => {
+                self.seen.insert(path.to_path_buf(), stamp);
+                true
+            }
+        }
+    }
+
+    fn record(
+        &mut self,
+        path: std::path::PathBuf,
+        at: std::time::Instant,
+        containing: Vec<(SourceId, std::time::Duration)>,
+    ) {
+        self.changes
+            .entry(path)
+            .or_default()
+            .push(Change { at, containing });
     }
 }
 
@@ -383,5 +561,209 @@ mod tests {
             let err = parse_trigger(spec).unwrap_err().to_string();
             assert!(err.contains("file:"), "{err}");
         }
+    }
+
+    // ── PathLedger (plan task 1.1) ──────────────────────────────────────
+    //
+    // The observer's own view of the watched set. It answers ONE question per
+    // observed change: was any child in flight when it happened? A change
+    // with no bracket over it is EXOGENOUS, and one exogenous observation is
+    // what clears suspicion.
+
+    /// The union as the loop builds it, with a baseline already taken.
+    fn ledger_over(paths: &[&Path]) -> PathLedger {
+        PathLedger::new(paths.iter().map(PathBuf::from).collect())
+    }
+
+    /// A fixed mtime base, so nothing depends on filesystem granularity.
+    fn mtime_base() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    #[test]
+    fn a_change_with_no_bracket_over_it_is_exogenous() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        ledger.observe(t, &[]); // nothing in flight
+
+        assert_eq!(ledger.exogenous(&f), 1);
+    }
+
+    #[test]
+    fn a_change_inside_a_bracket_is_endogenous() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        ledger.observe(t, &[(SourceId(0), Duration::from_millis(7))]);
+
+        assert_eq!(ledger.exogenous(&f), 0);
+        assert_eq!(ledger.changes(&f).len(), 1);
+    }
+
+    #[test]
+    fn the_first_stat_only_establishes_a_baseline() {
+        // The rule MtimeWatch already follows: a path that exists at
+        // construction is not a change.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+
+        let mut ledger = ledger_over(&[&f]);
+        ledger.observe(Instant::now(), &[]);
+
+        assert_eq!(ledger.exogenous(&f), 0);
+    }
+
+    #[test]
+    fn an_absent_path_is_stable_and_its_appearance_is_one_change() {
+        // Three of the four paths on a real dogfooding dashboard did not
+        // exist, so this is the common case rather than an edge case.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("not-yet");
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        ledger.observe(t, &[]); // still absent: stable
+        assert_eq!(ledger.exogenous(&f), 0);
+
+        std::fs::write(&f, b"here").unwrap();
+        ledger.observe(t + Duration::from_millis(50), &[]);
+        assert_eq!(ledger.exogenous(&f), 1);
+    }
+
+    #[test]
+    fn observe_bracket_credits_the_source_whose_bracket_it_was() {
+        // A bracket carries its OWN two snapshots, the close one taken on the
+        // worker, so a change during the child is endogenous even though the
+        // loop only hears about it a slice later.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        let open = stamps(std::slice::from_ref(&f));
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        let close = stamps(std::slice::from_ref(&f));
+
+        ledger.observe_bracket(&Bracket {
+            id: BracketId(0),
+            source: SourceId(3),
+            opened: t,
+            closed: Some(t + Duration::from_millis(9)),
+            open_stamps: open,
+            close_stamps: close,
+        });
+
+        assert_eq!(ledger.exogenous(&f), 0);
+        let c = ledger.changes(&f);
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].containing,
+            vec![(SourceId(3), Duration::from_millis(9))]
+        );
+    }
+
+    #[test]
+    fn a_bracket_that_moved_nothing_records_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        let snap = stamps(std::slice::from_ref(&f));
+        ledger.observe_bracket(&Bracket {
+            id: BracketId(0),
+            source: SourceId(0),
+            opened: t,
+            closed: Some(t + Duration::from_millis(5)),
+            open_stamps: snap.clone(),
+            close_stamps: snap,
+        });
+        assert!(ledger.changes(&f).is_empty());
+    }
+
+    #[test]
+    fn a_bracket_advances_the_baseline_so_one_change_is_not_counted_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        let open = stamps(std::slice::from_ref(&f));
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        let close = stamps(std::slice::from_ref(&f));
+        ledger.observe_bracket(&Bracket {
+            id: BracketId(0),
+            source: SourceId(0),
+            opened: t,
+            closed: Some(t + Duration::from_millis(5)),
+            open_stamps: open,
+            close_stamps: close,
+        });
+        assert_eq!(ledger.changes(&f).len(), 1);
+
+        ledger.observe(t + Duration::from_millis(60), &[]);
+        assert_eq!(
+            ledger.changes(&f).len(),
+            1,
+            "the same change must not be counted twice"
+        );
+    }
+
+    #[test]
+    fn eviction_drops_changes_older_than_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        ledger.observe(t, &[]);
+        assert_eq!(ledger.exogenous(&f), 1);
+
+        ledger.evict(t + Duration::from_secs(31), Duration::from_secs(30));
+        assert_eq!(ledger.exogenous(&f), 0, "the window must mean NOW");
+    }
+
+    #[test]
+    fn the_ledger_never_swallows_a_trigger_set_fire() {
+        // I-60, asserted structurally: an MtimeWatchSet over the same path
+        // still fires after the ledger has stat'd it repeatedly. If the two
+        // shared baseline state, the fire would be swallowed and the pane
+        // would silently stop refreshing — which is the suppression design
+        // this work rejects, arrived at by accident.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut set = MtimeWatchSet::new(vec![f.clone()]);
+        assert!(!set.fired(), "baseline");
+        let mut ledger = ledger_over(&[&f]);
+
+        let t = Instant::now();
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        ledger.observe(t, &[]);
+        ledger.observe(t + Duration::from_millis(50), &[]);
+
+        assert!(set.fired(), "the trigger must still see its own change");
     }
 }
