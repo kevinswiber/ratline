@@ -665,10 +665,9 @@ pub struct Verdict {
     #[allow(dead_code)]
     pub ordered: Option<Vec<SourceId>>,
     /// The test declined to answer. Distinct from an empty `panes`:
-    /// abstaining is not the same as finding nothing. Staged: an abstention
-    /// implicates nobody, so the badge already follows it through `panes`;
-    /// the notice is where the difference could be said out loud.
-    #[allow(dead_code)]
+    /// abstaining is not the same as finding nothing — and that difference
+    /// is load-bearing, because it is what stops a busy dashboard from
+    /// re-announcing one unbroken loop every time it goes quiet again.
     pub abstained: bool,
 }
 impl LoopSuspicion {

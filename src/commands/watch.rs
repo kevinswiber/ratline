@@ -28,8 +28,8 @@ use crate::core::registry::{Composition, PaneGeometry, Registry, SourceId, Sourc
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::core::trigger::{
-    BracketId, DebounceGate, MtimeWatchSet, PathLedger, TriggerSpec, WindowLog, parse_trigger,
-    stamps,
+    BracketId, DebounceGate, MtimeWatchSet, PathLedger, TriggerSpec, Verdict, WindowLog,
+    parse_trigger, stamps,
 };
 use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
@@ -288,6 +288,9 @@ pub(crate) fn run_registry(
     let mut ledger = PathLedger::new(watched_union.clone());
     let suspicion = crate::core::trigger::LoopSuspicion::default();
     let mut log = WindowLog::new(suspicion.window);
+    // The panes the notice has already announced — its latch, so one
+    // loop announces itself once and a repaired one can announce again.
+    let mut suspected: Vec<SourceId> = Vec::new();
     let mut runtime: Vec<SourceRuntime> = registry
         .ids()
         .map(|id| {
@@ -704,8 +707,15 @@ pub(crate) fn run_registry(
             if !watched_union.is_empty() && !log.any_open(now) {
                 ledger.observe(now, &[]);
             }
-            #[cfg(unix)]
-            let mut ended_notices: Vec<String> = Vec::new();
+            // Whether a badge moved this iteration, so the one paint
+            // below knows it has something to show even with no notice.
+            let mut badge_moved = false;
+            // The iteration's one-shot rows, batched into ONE notice.
+            // PORTABLE, unlike the reader end-of-life lines it collects:
+            // only fifo/fd readers can end, but a `file:` trigger loops
+            // on every platform, so a `cfg(unix)` batch would lose the
+            // loop report on Windows entirely.
+            let mut notices: Vec<String> = Vec::new();
             for id in registry.ids() {
                 let r = &mut runtime[id.0];
                 #[cfg(unix)]
@@ -715,7 +725,7 @@ pub(crate) fn run_registry(
                     }
                     if !slot.ended_seen && slot.reader.ended().load(Ordering::SeqCst) {
                         slot.ended_seen = true; // rising edge, per reader
-                        ended_notices.push(ended_text(&registry, id, &slot.spec));
+                        notices.push(ended_text(&registry, id, &slot.spec));
                     }
                 }
                 if r.files.fired() {
@@ -756,15 +766,11 @@ pub(crate) fn run_registry(
                 let verdict = suspicion.evaluate(now, &ledger, &log, &panes);
                 // A badge appearing or clearing is a displayed change,
                 // and it is decided HERE — with no outcome to ride. So
-                // the transition recomposes from the retained outputs
-                // and paints in place, taking the key the paint
-                // returned: the content key is output-derived, and the
-                // pane hashes this just moved are exactly what it is
-                // over, so the gate would let it through anyway — but
-                // the notice arm's pattern keeps the two in step.
-                if apply_verdict(&mut runtime, &verdict.panes, !plain, jiff::Timestamp::now())
-                    && is_tty
-                {
+                // the transition recomposes from the retained outputs,
+                // and the paint below puts it on screen.
+                badge_moved =
+                    apply_verdict(&mut runtime, &verdict.panes, !plain, jiff::Timestamp::now());
+                if badge_moved {
                     recompose_live(
                         &mut live,
                         &registry,
@@ -777,31 +783,22 @@ pub(crate) fn run_registry(
                     if let Some(l) = live.as_mut() {
                         restamp_live(l, &runtime);
                     }
-                    if let Some(l) = live.as_ref() {
-                        previous_key = Some(repaint(
-                            &mut renderer,
-                            pause.as_ref(),
-                            live_scroll,
-                            l,
-                            &live_tail,
-                            &palette,
-                            view,
-                            None,
-                            crossterm::terminal::size().unwrap_or((80, 24)),
-                            session.max_height,
-                            &faint,
-                            profile,
-                            &history,
-                        )?);
-                    }
+                }
+                // Badge = state, notice = event. The row is one-shot —
+                // the next in-place repaint drops it — which is the
+                // wrong home for a state and the right one for an event,
+                // so only the RISING edge speaks.
+                if rising_edge(&mut suspected, &verdict) {
+                    notices.push(looping_text(&registry, &verdict.panes));
                 }
             }
-            // Every source that ended this iteration is named in ONE
-            // one-shot notice row; with no frame yet the batch drops.
-            #[cfg(unix)]
-            if let (false, Some(l)) = (ended_notices.is_empty(), live.as_ref()) {
-                let notice = ended_notices.join(" · ");
-                let size = crossterm::terminal::size().unwrap_or((80, 24));
+            // One paint for the iteration's out-of-band changes: the
+            // batched one-shot rows, a badge that moved, or both. With
+            // no frame yet there is nothing to paint over and the batch
+            // drops. Piped output is left alone entirely — a notice is
+            // chrome, and the piped contract is frame lines. (The badge
+            // still reaches a piped dashboard: it is IN those lines.)
+            if is_tty && let (true, Some(l)) = (!notices.is_empty() || badge_moved, live.as_ref()) {
                 previous_key = Some(repaint(
                     &mut renderer,
                     pause.as_ref(),
@@ -810,8 +807,8 @@ pub(crate) fn run_registry(
                     &live_tail,
                     &palette,
                     view,
-                    Some(notice),
-                    size,
+                    (!notices.is_empty()).then(|| notices.join(" · ")),
+                    crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
                     &faint,
                     profile,
@@ -2303,6 +2300,84 @@ fn ended_text(registry: &Registry, id: SourceId, spec: &TriggerSpec) -> String {
         Some(_) => format!("{}: trigger ended: {spec}", registry.spec(id).name),
         None => format!("trigger ended: {spec}"),
     }
+}
+
+/// The one-shot line for a suspected trigger loop: the panes, what is
+/// suspected, and the evidence.
+///
+/// Unlike `ended_text` this has callers on EVERY platform — only
+/// fifo/fd readers can end, but a `file:` trigger loops anywhere — so it
+/// carries no `cfg` of any kind, deliberately.
+///
+/// **`suspected` is the load-bearing word.** rat observes that watched
+/// paths change while it is busy and never while it is idle, which is
+/// what a loop looks like rather than proof of one. The badge is
+/// confident because nine cells cannot hold a hedge; this row has the
+/// room, so it does the hedging for both.
+///
+/// The paths are what make the claim falsifiable — a user who knows the
+/// accusation is wrong can see what rat is reading and carry on, because
+/// nothing has been stopped. They are named as a SET and deduplicated:
+/// two panes watching one path name it once, and no ordering is implied
+/// anywhere in the sentence, because concurrent children make direction
+/// unavailable even as coincidence.
+fn looping_text(registry: &Registry, panes: &[SourceId]) -> String {
+    let names: Vec<&str> = panes
+        .iter()
+        .filter(|id| registry.pane(**id).is_some())
+        .map(|id| registry.spec(*id).name.as_str())
+        .collect();
+    let mut watched: Vec<String> = Vec::new();
+    for spec in panes.iter().map(|id| registry.spec(*id)) {
+        for trigger in &spec.triggers {
+            let text = trigger.to_string();
+            if !watched.contains(&text) {
+                watched.push(text);
+            }
+        }
+    }
+    // With no pane there is no name to lead with, so the sentence starts
+    // at the suspicion — the rule `ended_text` already follows.
+    let who = if names.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", names.join(", "))
+    };
+    format!(
+        "{who}trigger loop suspected: {} — ? help",
+        watched.join(", ")
+    )
+}
+
+/// Whether this verdict implicates a pane the last one did not — the
+/// notice's edge. The latch is the previously announced set, carried by
+/// the caller and updated here.
+///
+/// **The edge is over the SET, not over "anyone at all".** The panes of
+/// one cycle cross the respawn threshold a hop apart, not together, so
+/// an empty→non-empty latch would fire while the set held only whichever
+/// pane got there first — and then stay silent as the rest arrived,
+/// leaving a one-shot row naming half a loop and half its evidence. That
+/// is not a hypothetical: the end-to-end test caught it announcing `a`
+/// alone in a two-pane cycle. Announcing again as the set grows costs a
+/// second row a hop later, which REPLACES the first (the row is
+/// one-shot), so what survives on screen is the whole set. A set that
+/// shrinks says nothing: that is not news, and the badges already show
+/// it.
+///
+/// An **abstention holds** the latch instead of resetting it. Declining
+/// to answer is not the same as finding nothing (`Verdict::abstained`
+/// exists to tell them apart), and a busy dashboard abstains — so a
+/// reset would re-announce one unbroken loop every time the dashboard
+/// got busy and then quiet again.
+fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
+    if verdict.abstained {
+        return false;
+    }
+    let grew = verdict.panes.iter().any(|id| !latch.contains(id));
+    latch.clear();
+    latch.extend(verdict.panes.iter().copied());
+    grew
 }
 
 /// The looping spawn-error wording. `rat watch` passes `"watch"` and
@@ -3819,6 +3894,144 @@ mod tests {
             "an unchanged body marks nothing — asserted, not assumed"
         );
         assert_eq!(rt[0].previous.as_deref(), Some(&body[..]));
+    }
+
+    /// Two panes, each triggering on a path — the notice's subject.
+    fn two_triggered_panes(a: &str, b: &str) -> Registry {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let spec = |name: &str, path: &str| SourceSpec {
+            name: name.to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval: None,
+            triggers: vec![TriggerSpec::File(std::path::PathBuf::from(path))],
+            debounce: Duration::from_millis(250),
+        };
+        let pane = || PaneBox {
+            height: 5,
+            width: PaneWidth::Weight(1),
+            overflow: Overflow::KeepTop,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: true,
+        };
+        Registry::panes(
+            vec![spec("a", a), spec("b", b)],
+            vec![pane(), pane()],
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            1,
+            0,
+        )
+        .expect("a valid two-pane registry")
+    }
+
+    /// One evaluation's worth of latch input.
+    fn edge(latch: &mut Vec<SourceId>, panes: &[SourceId], abstained: bool) -> bool {
+        rising_edge(
+            latch,
+            &Verdict {
+                panes: panes.to_vec(),
+                ordered: None,
+                abstained,
+            },
+        )
+    }
+
+    #[test]
+    fn the_notice_names_every_pane_in_the_set_and_the_watched_paths() {
+        // Panes first, then what is suspected, then the evidence — the
+        // house shape: name the thing, name the place, show the fix. The
+        // paths are what make the claim FALSIFIABLE: a user who knows
+        // the accusation is wrong can see why rat thinks otherwise, and
+        // carry on, because nothing has been stopped.
+        let registry = two_triggered_panes("./sa", "./sb");
+        assert_eq!(
+            looping_text(&registry, &[SourceId(0), SourceId(1)]),
+            "a, b: trigger loop suspected: file:./sa, file:./sb — ? help"
+        );
+    }
+
+    #[test]
+    fn the_notice_claims_no_direction_and_never_repeats_a_shared_path() {
+        // No arrow, ever: with children overlapping, direction is not
+        // available even as coincidence, so the text reads as a SET. The
+        // evidence is a set too — two panes watching ONE path name it
+        // once.
+        let registry = two_triggered_panes("./same", "./same");
+        let text = looping_text(&registry, &[SourceId(0), SourceId(1)]);
+        assert_eq!(text, "a, b: trigger loop suspected: file:./same — ? help");
+        assert!(!text.contains("->") && !text.contains('→'));
+    }
+
+    #[test]
+    fn a_plain_watch_names_no_pane_but_still_shows_its_evidence() {
+        // A single source triggering on a path its own command writes is
+        // a one-pane self-cycle, and `rat watch` can be it. With no pane
+        // there is no name to lead with, so the sentence starts at the
+        // suspicion rather than at an empty label — the rule `ended_text`
+        // already follows.
+        let registry = Registry::single(
+            SourceSpec {
+                name: "watch".to_string(),
+                command: vec!["true".to_string()],
+                shell: false,
+                interval: None,
+                triggers: vec![TriggerSpec::File(std::path::PathBuf::from("./stamp"))],
+                debounce: Duration::from_millis(250),
+            },
+            None,
+        );
+        assert_eq!(
+            looping_text(&registry, &[SourceId(0)]),
+            "trigger loop suspected: file:./stamp — ? help"
+        );
+    }
+
+    #[test]
+    fn the_notice_fires_once_per_rising_edge_and_re_arms_after_clearing() {
+        // A latch, not a once-per-process flag. The condition holds for
+        // as long as the loop spins, and a row repeated every 50 ms
+        // would be useless and a repaint storm — but a dashboard that is
+        // repaired and breaks again is news again.
+        let mut latch = Vec::new();
+        assert!(edge(&mut latch, &[SourceId(0)], false), "the loop began");
+        assert!(!edge(&mut latch, &[SourceId(0)], false), "and it holds");
+        assert!(
+            edge(&mut latch, &[SourceId(0), SourceId(1)], false),
+            "a pane the last row did not name IS news — the panes of one \
+             cycle cross the threshold a hop apart, and a row naming half \
+             a loop is the failure this replaces"
+        );
+        assert!(
+            !edge(&mut latch, &[SourceId(0)], false),
+            "but a set that SHRINKS says nothing; the badges show that"
+        );
+        assert!(!edge(&mut latch, &[], false), "and clearing is not news");
+        assert!(edge(&mut latch, &[SourceId(0)], false), "returning is");
+    }
+
+    #[test]
+    fn an_abstention_holds_the_latch_rather_than_re_arming_it() {
+        // Declining to answer is not the same as finding nothing. A busy
+        // dashboard abstains, and if that RESET the latch, one unbroken
+        // loop would re-announce itself every time the dashboard got
+        // busy and then quiet again.
+        let mut latch = Vec::new();
+        assert!(edge(&mut latch, &[SourceId(0)], false));
+        assert!(!edge(&mut latch, &[], true), "abstaining says nothing");
+        assert!(
+            !edge(&mut latch, &[SourceId(0)], false),
+            "still the same loop"
+        );
+        // And an abstention before anything was suspected cannot arm it.
+        let mut fresh = Vec::new();
+        assert!(!edge(&mut fresh, &[], true));
+        assert!(edge(&mut fresh, &[SourceId(0)], false));
     }
 
     #[test]
