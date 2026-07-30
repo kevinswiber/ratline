@@ -271,6 +271,28 @@ reference with each pane's cadence listed. `--once` runs every pane
 once in parallel, prints one frame, and exits; piped output degrades to
 plain text with each pane's stderr folded into its own box.
 
+**Panes are for watching, not for doing.** A pane's command runs again
+and again, and its declared interval is a floor rather than the whole
+story — a pane also re-runs on every trigger that fires, on a debounced
+respawn after the terminal is resized, and when the terminal switches
+between light and dark, because a child already in flight was told the
+old appearance. So "every 60s" is not 60 runs an hour; it is at least
+that, on a schedule the dashboard controls and the command cannot see.
+
+Write pane commands that can run at any moment and any number of times
+without it mattering — read a file, query a status, format some text.
+A command with side effects will have them again on events that have
+nothing to do with its cadence. If a pane must touch something that
+changes, make the touching idempotent, and put the part that is not
+inside a script the dashboard only *reads* the result of. The same
+applies to a nested `rat dashboard … --once`: the inner panes all run
+once per outer tick, and an inner `interval` has nothing to schedule.
+
+Cost, rather than correctness, has a lever: a pane declared
+`interval "never"` with a `trigger` runs only when its trigger says
+something changed, so an expensive command can sit behind a cheap file
+whose modification time is the signal.
+
 **Authoring for panes:** a pane's child prints *content only* — boxes,
 titles, heights, and the side-by-side layout are the loop's job, so a
 child that draws its own border just gets another drawn around it.
