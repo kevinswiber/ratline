@@ -202,6 +202,10 @@ pub struct BracketId(pub u64);
 /// One spawn-to-exit interval of one source, with the watched union stamped
 /// on both sides. `WindowLog` owns the lifecycle; `PathLedger` only reads a
 /// completed one.
+///
+/// `Clone` so a caller can take the completed record and then ask the log
+/// which other brackets overlapped it, without holding a borrow across both.
+#[derive(Clone)]
 pub struct Bracket {
     /// `WindowLog` keys its store by this and hands it back on close;
     /// `PathLedger` reads only the stamps.
@@ -267,11 +271,42 @@ impl PathLedger {
 
     /// Read a completed bracket: any path differing between its two
     /// snapshots changed while that source's child was running.
-    pub fn observe_bracket(&mut self, bracket: &Bracket) {
+    ///
+    /// `others` is every OTHER child running over the same window
+    /// (`WindowLog::overlapping`), and they are credited too. The snapshots
+    /// prove only that the path moved SOMEWHERE inside this bracket, so
+    /// every child covering that window is a candidate writer — which is
+    /// what `Change::containing` holds and what the credit rule's first
+    /// stage is written over.
+    ///
+    /// Crediting only the observing bracket is not merely incomplete, it is
+    /// unstable: two overlapping children then SPLIT a path's changes
+    /// between them, roughly evenly, because whichever bracket is drained
+    /// first advances the baseline and claims the change. Stage one's
+    /// strict majority sits exactly on that split, so it passes at an odd
+    /// change count and fails at an even one, and the verdict flips with
+    /// the parity — measured on the canonical two-pane cycle, where a
+    /// perfectly steady loop was reported as both panes, then nobody,
+    /// several times a second.
+    pub fn observe_bracket(
+        &mut self,
+        bracket: &Bracket,
+        others: &[(SourceId, std::time::Duration)],
+    ) {
         let Some(closed) = bracket.closed else {
             return; // still running: there is no width yet, so nothing to say
         };
         let width = closed.saturating_duration_since(bracket.opened);
+        // The observing bracket leads: it is the one the snapshots prove.
+        // A source appears once — it runs one child at a time, so a repeat
+        // means this bracket outlived several of that source's runs, and
+        // the first is the one that shares the most of this window.
+        let mut containing = vec![(bracket.source, width)];
+        for (source, other) in others {
+            if !containing.iter().any(|(s, _)| s == source) {
+                containing.push((*source, *other));
+            }
+        }
         let before: std::collections::HashMap<_, _> = bracket
             .open_stamps
             .iter()
@@ -282,7 +317,7 @@ impl PathLedger {
                 continue;
             }
             if self.moved(path, *stamp) {
-                self.record(path.clone(), closed, vec![(bracket.source, width)]);
+                self.record(path.clone(), closed, containing.clone());
             }
         }
     }
@@ -534,6 +569,28 @@ impl WindowLog {
     }
 
     /// Is any bracket still open over `at`?
+    /// Every OTHER closed bracket whose run overlaps `bracket`'s, with its
+    /// width: the children that could equally have written a change this
+    /// bracket observed, since the snapshots place the change inside the
+    /// window rather than at an instant. Touching at an edge counts — a
+    /// child that exited exactly as this one started was running when this
+    /// one opened.
+    ///
+    /// Open brackets are withheld for the same reason `covering` withholds
+    /// them: their width is not final, and elapsed-so-far would credit a
+    /// long-running child as artificially tight.
+    pub fn overlapping(&self, bracket: &Bracket) -> Vec<(SourceId, std::time::Duration)> {
+        let Some(closed) = bracket.closed else {
+            return Vec::new();
+        };
+        self.brackets
+            .iter()
+            .filter(|b| b.id != bracket.id)
+            .filter(|b| b.closed.is_some_and(|end| end >= bracket.opened) && b.opened <= closed)
+            .map(|b| (b.source, b.width().unwrap_or_default()))
+            .collect()
+    }
+
     pub fn any_open(&self, at: std::time::Instant) -> bool {
         self.brackets
             .iter()
@@ -1113,6 +1170,12 @@ mod tests {
     // what clears suspicion.
 
     /// The union as the loop builds it, with a baseline already taken.
+    /// A bracket observed with nothing else running — the shape every
+    /// test predating overlapping attribution assumed.
+    fn observe_alone(ledger: &mut PathLedger, bracket: &Bracket) {
+        ledger.observe_bracket(bracket, &[]);
+    }
+
     fn ledger_over(paths: &[&Path]) -> PathLedger {
         PathLedger::new(paths.iter().map(PathBuf::from).collect())
     }
@@ -1200,14 +1263,17 @@ mod tests {
         touch_at(&f, mtime_base() + Duration::from_secs(1));
         let close = stamps(std::slice::from_ref(&f));
 
-        ledger.observe_bracket(&Bracket {
-            id: BracketId(0),
-            source: SourceId(3),
-            opened: t,
-            closed: Some(t + Duration::from_millis(9)),
-            open_stamps: open,
-            close_stamps: close,
-        });
+        observe_alone(
+            &mut ledger,
+            &Bracket {
+                id: BracketId(0),
+                source: SourceId(3),
+                opened: t,
+                closed: Some(t + Duration::from_millis(9)),
+                open_stamps: open,
+                close_stamps: close,
+            },
+        );
 
         assert_eq!(ledger.exogenous(&f), 0);
         let c = ledger.changes(&f);
@@ -1215,6 +1281,91 @@ mod tests {
         assert_eq!(
             c[0].containing,
             vec![(SourceId(3), Duration::from_millis(9))]
+        );
+    }
+
+    #[test]
+    fn a_change_is_credited_to_every_bracket_that_could_have_contained_it() {
+        // The stamps prove only that the path moved SOMEWHERE inside this
+        // bracket's run, so every child running over that window is a
+        // candidate writer — which is what `Change::containing` has always
+        // said it holds, and what the credit rule's first stage is written
+        // over ("in flight for more than half of that path's changes").
+        //
+        // Crediting only the bracket that happened to observe the change
+        // makes two overlapping children SPLIT a path's changes between
+        // them, roughly evenly, which puts stage one's strict majority on a
+        // knife-edge: the exact symmetric case this signal exists to detect
+        // then flips with the parity of the change count.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut ledger = ledger_over(&[&f]);
+        let t = Instant::now();
+        let open = stamps(std::slice::from_ref(&f));
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        let close = stamps(std::slice::from_ref(&f));
+
+        ledger.observe_bracket(
+            &Bracket {
+                id: BracketId(0),
+                source: SourceId(3),
+                opened: t,
+                closed: Some(t + Duration::from_millis(9)),
+                open_stamps: open,
+                close_stamps: close,
+            },
+            &[(SourceId(1), Duration::from_millis(7))],
+        );
+
+        let c = ledger.changes(&f);
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].containing,
+            vec![
+                (SourceId(3), Duration::from_millis(9)),
+                (SourceId(1), Duration::from_millis(7)),
+            ],
+            "the observing bracket first, then whoever else was running"
+        );
+        assert_eq!(ledger.exogenous(&f), 0, "still not exogenous");
+    }
+
+    #[test]
+    fn overlapping_reports_the_other_closed_brackets_that_ran_over_this_one() {
+        // Who else could have written it. Touching at the edges counts: a
+        // child that exited exactly as this one started was running when
+        // this bracket opened.
+        let mut log = WindowLog::new(Duration::from_secs(30));
+        let t = Instant::now();
+        let mine = log.open_bracket(SourceId(0), t + Duration::from_millis(10), Vec::new());
+        // Overlaps from the left, touching the open instant exactly.
+        let left = log.open_bracket(SourceId(1), t, Vec::new());
+        log.close_bracket(left, t + Duration::from_millis(10), Vec::new());
+        // Wholly inside.
+        let inside = log.open_bracket(SourceId(2), t + Duration::from_millis(12), Vec::new());
+        log.close_bracket(inside, t + Duration::from_millis(14), Vec::new());
+        // Entirely after: never overlaps.
+        let after = log.open_bracket(SourceId(3), t + Duration::from_millis(40), Vec::new());
+        log.close_bracket(after, t + Duration::from_millis(50), Vec::new());
+        // Still running, so it has NO final width — and a provisional one
+        // would credit a long child as artificially tight, the exact
+        // mis-credit the median-width stage exists to prevent.
+        log.open_bracket(SourceId(4), t + Duration::from_millis(11), Vec::new());
+
+        let closed = log
+            .close_bracket(mine, t + Duration::from_millis(30), Vec::new())
+            .expect("still live")
+            .clone();
+        assert_eq!(
+            log.overlapping(&closed),
+            vec![
+                (SourceId(1), Duration::from_millis(10)),
+                (SourceId(2), Duration::from_millis(2)),
+            ],
+            "never itself, never one that did not overlap, never an open one"
         );
     }
 
@@ -1227,14 +1378,17 @@ mod tests {
         let mut ledger = ledger_over(&[&f]);
         let t = Instant::now();
         let snap = stamps(std::slice::from_ref(&f));
-        ledger.observe_bracket(&Bracket {
-            id: BracketId(0),
-            source: SourceId(0),
-            opened: t,
-            closed: Some(t + Duration::from_millis(5)),
-            open_stamps: snap.clone(),
-            close_stamps: snap,
-        });
+        observe_alone(
+            &mut ledger,
+            &Bracket {
+                id: BracketId(0),
+                source: SourceId(0),
+                opened: t,
+                closed: Some(t + Duration::from_millis(5)),
+                open_stamps: snap.clone(),
+                close_stamps: snap,
+            },
+        );
         assert!(ledger.changes(&f).is_empty());
     }
 
@@ -1250,14 +1404,17 @@ mod tests {
         let open = stamps(std::slice::from_ref(&f));
         touch_at(&f, mtime_base() + Duration::from_secs(1));
         let close = stamps(std::slice::from_ref(&f));
-        ledger.observe_bracket(&Bracket {
-            id: BracketId(0),
-            source: SourceId(0),
-            opened: t,
-            closed: Some(t + Duration::from_millis(5)),
-            open_stamps: open,
-            close_stamps: close,
-        });
+        observe_alone(
+            &mut ledger,
+            &Bracket {
+                id: BracketId(0),
+                source: SourceId(0),
+                opened: t,
+                closed: Some(t + Duration::from_millis(5)),
+                open_stamps: open,
+                close_stamps: close,
+            },
+        );
         assert_eq!(ledger.changes(&f).len(), 1);
 
         ledger.observe(t + Duration::from_millis(60), &[]);
