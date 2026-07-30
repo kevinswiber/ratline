@@ -294,6 +294,7 @@ pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
             }
             "defaults" => {
                 declared_once("defaults", &mut settings)?;
+                refuse_annotation(node.ty(), "defaults", "defaults")?;
                 if !positional(node).is_empty() {
                     bail!("defaults takes no name — it holds the keys every pane inherits");
                 }
@@ -359,6 +360,7 @@ fn inline_node(
         panes.push(pane_block(node, Some(name.clone()), default_shell)?);
         return Ok(LayoutDecl::Pane(name));
     }
+    refuse_annotation(node.ty(), kind, label)?;
     refuse_container_properties(node, label, container_kind(node))?;
     // A bare name here would be the old spelling leaking in: this row's
     // cells ARE the panes, and accepting a name would put one pane's
@@ -598,7 +600,18 @@ fn as_written(value: &kdl::KdlValue) -> String {
 /// internal handle — it renders as the box title and reaches the child
 /// as `RAT_PANE` — so a second name or a number cannot be dropped.
 fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
-    if let Some(ty) = node.ty() {
+    // Either position: `(u8)pane "log"` and `pane (name)"log"` are both
+    // a token that reaches nothing (D-7).
+    let annotation = std::iter::once(node.ty())
+        .chain(
+            node.entries()
+                .iter()
+                .filter(|entry| entry.name().is_none())
+                .map(kdl::KdlEntry::ty),
+        )
+        .flatten()
+        .next();
+    if let Some(ty) = annotation {
         bail!(
             "{label}: the ({}) type annotation on a pane has no meaning here — remove it",
             ty.value()
@@ -1182,6 +1195,38 @@ pane "all" {
                 )),
                 wanted
             );
+        }
+    }
+
+    /// D-7 has no exceptions: an annotation means nothing to this
+    /// grammar on ANY node, and a container or a name is a node like the
+    /// rest. The key nodes were covered first and these were not, which
+    /// is the same hole in a different position.
+    #[test]
+    fn an_annotation_is_refused_on_a_container_or_a_name() {
+        for (text, wanted) in [
+            (
+                "(u8)row {\n    pane \"a\" { height 3; command \"date\" }\n}\n",
+                "row #1: the (u8) type annotation on `row` has no meaning here — remove it",
+            ),
+            (
+                "row {\n    (u8)column { pane \"a\" { height 3; command \"date\" } }\n}\n",
+                "row #1 > column #1: the (u8) type annotation on `column` has no meaning here — remove it",
+            ),
+            (
+                "(u8)defaults { height 3 }\npane \"a\" { command \"date\" }\n",
+                "defaults: the (u8) type annotation on `defaults` has no meaning here — remove it",
+            ),
+            (
+                "pane (name)\"x\" {\n    height 3\n    command \"date\"\n}\n",
+                "pane #1: the (name) type annotation on a pane has no meaning here — remove it",
+            ),
+            (
+                "row {\n    pane (name)\"x\" { height 3; command \"date\" }\n}\n",
+                "row #1 > pane #1: the (name) type annotation on a pane has no meaning here — remove it",
+            ),
+        ] {
+            assert_eq!(container_err(text), wanted);
         }
     }
 
