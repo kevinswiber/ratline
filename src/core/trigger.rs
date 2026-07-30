@@ -352,6 +352,269 @@ impl PathLedger {
     }
 }
 
+/// Which trigger an observation came from. A `file:` source is keyed by its
+/// path; a reader route by its spec's canonical string (`fifo:/tmp/x`,
+/// `fd:3`) — the same text `TriggerSpec`'s `Display` produces and the notice
+/// prints. Keying per trigger rather than per source is what lets two fifos
+/// on ONE pane be credited separately instead of merged.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[allow(dead_code)]
+pub struct TriggerKey(pub String);
+
+/// One reader arrival. Its covering brackets are identified when the bytes
+/// arrive; their WIDTHS are resolved later.
+///
+/// Storing widths here would be wrong: an arrival is commonly recorded while
+/// its covering child is still running, when the final width does not exist
+/// and elapsed-so-far would make a long-running child look artificially
+/// tight — the mis-credit the median-width rule exists to prevent.
+#[allow(dead_code)]
+pub struct Arrival {
+    pub source: SourceId,
+    pub trigger: TriggerKey,
+    pub at: std::time::Instant,
+    /// The brackets covering `at`, by id. EMPTY means nothing was in flight,
+    /// which is knowable immediately and is all the veto needs.
+    pub containing: Vec<BracketId>,
+}
+
+/// Every windowed quantity the suspicion test reads, in one place, all of it
+/// evicting. Nothing here is cumulative: a count that cannot fall could never
+/// let a repaired dashboard stop being suspected.
+#[allow(dead_code)]
+pub struct WindowLog {
+    window: std::time::Duration,
+    next_id: u64,
+    /// Keyed by id, never by position — see `BracketId`.
+    brackets: Vec<Bracket>,
+    respawns: Vec<(SourceId, std::time::Instant)>,
+    arrivals: Vec<Arrival>,
+    overflows: Vec<std::time::Instant>,
+}
+
+#[allow(dead_code)]
+impl WindowLog {
+    pub fn new(window: std::time::Duration) -> WindowLog {
+        WindowLog {
+            window,
+            next_id: 0,
+            brackets: Vec::new(),
+            respawns: Vec::new(),
+            arrivals: Vec::new(),
+            overflows: Vec::new(),
+        }
+    }
+
+    pub fn open_bracket(
+        &mut self,
+        source: SourceId,
+        at: std::time::Instant,
+        open_stamps: Vec<(std::path::PathBuf, PathStamp)>,
+    ) -> BracketId {
+        let id = BracketId(self.next_id);
+        self.next_id += 1;
+        self.brackets.push(Bracket {
+            id,
+            source,
+            opened: at,
+            closed: None,
+            open_stamps,
+            close_stamps: Vec::new(),
+        });
+        id
+    }
+
+    /// Close a bracket and hand back the completed record, which the loop
+    /// feeds to `PathLedger::observe_bracket`. `None` when the id has already
+    /// been evicted — a long child whose bracket aged out is ordinary, not an
+    /// error.
+    pub fn close_bracket(
+        &mut self,
+        id: BracketId,
+        at: std::time::Instant,
+        close_stamps: Vec<(std::path::PathBuf, PathStamp)>,
+    ) -> Option<&Bracket> {
+        let bracket = self.brackets.iter_mut().find(|b| b.id == id)?;
+        bracket.closed = Some(at);
+        bracket.close_stamps = close_stamps;
+        Some(bracket)
+    }
+
+    /// A trigger-driven respawn EVENT. Counted per window on demand, so the
+    /// count falls again as evidence expires.
+    pub fn record_respawn(&mut self, source: SourceId, at: std::time::Instant) {
+        self.respawns.push((source, at));
+    }
+
+    /// A fifo/fd arrival, resolved against the brackets already owned here.
+    pub fn observe_arrival(
+        &mut self,
+        source: SourceId,
+        trigger: TriggerKey,
+        at: std::time::Instant,
+    ) {
+        let containing = self
+            .brackets
+            .iter()
+            .filter(|b| b.spans(at))
+            .map(|b| b.id)
+            .collect();
+        self.arrivals.push(Arrival {
+            source,
+            trigger,
+            at,
+            containing,
+        });
+    }
+
+    /// A reader's queue overflowed, so arrivals were LOST. That cannot be
+    /// treated as "no arrivals": the dropped one may have been the window's
+    /// only exogenous observation, and losing it would turn a zero test into
+    /// an accusation. Any window this touches abstains instead.
+    pub fn record_overflow(&mut self, at: std::time::Instant) {
+        self.overflows.push(at);
+    }
+
+    pub fn respawns_in_window(&self, source: SourceId, now: std::time::Instant) -> usize {
+        let cutoff = self.cutoff(now);
+        self.respawns
+            .iter()
+            .filter(|(id, at)| *id == source && cutoff.is_none_or(|c| *at >= c))
+            .count()
+    }
+
+    /// Fraction of the window during which ANY child was in flight, with
+    /// overlapping brackets UNIONED rather than summed. Summing would report
+    /// roughly double for the measured repro, whose panes overlap almost
+    /// entirely, and could push a cheap loop over the abstention ceiling —
+    /// turning a detectable loop into a silence.
+    pub fn busy_fraction(&self, now: std::time::Instant) -> f64 {
+        let Some(start) = self.cutoff(now) else {
+            return 0.0;
+        };
+        let mut spans: Vec<(std::time::Instant, std::time::Instant)> = self
+            .brackets
+            .iter()
+            .map(|b| (b.opened.max(start), b.end_or(now).min(now)))
+            .filter(|(from, to)| to > from)
+            .collect();
+        spans.sort_by_key(|(from, _)| *from);
+        let mut busy = std::time::Duration::ZERO;
+        let mut merged: Option<(std::time::Instant, std::time::Instant)> = None;
+        for (from, to) in spans {
+            match merged {
+                Some((m_from, m_to)) if from <= m_to => merged = Some((m_from, m_to.max(to))),
+                Some((m_from, m_to)) => {
+                    busy += m_to.duration_since(m_from);
+                    merged = Some((from, to));
+                }
+                None => merged = Some((from, to)),
+            }
+        }
+        if let Some((m_from, m_to)) = merged {
+            busy += m_to.duration_since(m_from);
+        }
+        busy.as_secs_f64() / self.window.as_secs_f64()
+    }
+
+    /// CLOSED brackets containing `at`, with their final widths.
+    ///
+    /// Open brackets are deliberately absent: their width is not final, and
+    /// reporting elapsed-so-far is the mis-credit this design exists to
+    /// avoid. Ask `any_open` first — a caller that wants to classify a change
+    /// as exogenous must not do so while a child is still running, or an
+    /// unattributed change would wrongly clear the veto.
+    pub fn covering(&self, at: std::time::Instant) -> Vec<(SourceId, std::time::Duration)> {
+        self.brackets
+            .iter()
+            .filter(|b| b.closed.is_some() && b.spans(at))
+            .map(|b| (b.source, b.width().unwrap_or_default()))
+            .collect()
+    }
+
+    /// Is any bracket still open over `at`?
+    pub fn any_open(&self, at: std::time::Instant) -> bool {
+        self.brackets
+            .iter()
+            .any(|b| b.closed.is_none() && b.opened <= at)
+    }
+
+    /// Arrivals for one trigger still inside the window.
+    pub fn arrivals(&self, trigger: &TriggerKey) -> Vec<&Arrival> {
+        self.arrivals
+            .iter()
+            .filter(|a| a.trigger == *trigger)
+            .collect()
+    }
+
+    /// Resolve an arrival's covering brackets to final widths. `None` while
+    /// any of them is still open: such an arrival is deferred from the credit
+    /// stage — it resolves once the bracket closes — while still counting for
+    /// the veto, which needs only whether `containing` was empty.
+    pub fn widths(&self, arrival: &Arrival) -> Option<Vec<(SourceId, std::time::Duration)>> {
+        arrival
+            .containing
+            .iter()
+            .map(|id| {
+                let bracket = self.brackets.iter().find(|b| b.id == *id)?;
+                Some((bracket.source, bracket.width()?))
+            })
+            .collect()
+    }
+
+    /// True when a reader lost arrivals inside the current window.
+    pub fn evidence_lost(&self, now: std::time::Instant) -> bool {
+        let cutoff = self.cutoff(now);
+        self.overflows
+            .iter()
+            .any(|at| cutoff.is_none_or(|c| *at >= c))
+    }
+
+    /// Drop what the window no longer covers. A bracket a live arrival still
+    /// references is RETAINED even when it would otherwise age out, or that
+    /// arrival's widths would become unresolvable and the credit rule would
+    /// silently lose its input. Keying by id rather than position is what
+    /// makes retaining a subset safe.
+    pub fn evict(&mut self, now: std::time::Instant) {
+        let Some(cutoff) = self.cutoff(now) else {
+            return;
+        };
+        self.respawns.retain(|(_, at)| *at >= cutoff);
+        self.overflows.retain(|at| *at >= cutoff);
+        self.arrivals.retain(|a| a.at >= cutoff);
+        let referenced: std::collections::HashSet<BracketId> = self
+            .arrivals
+            .iter()
+            .flat_map(|a| a.containing.iter().copied())
+            .collect();
+        self.brackets
+            .retain(|b| b.end_or(now) >= cutoff || referenced.contains(&b.id));
+    }
+
+    fn cutoff(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+        now.checked_sub(self.window)
+    }
+}
+
+#[allow(dead_code)]
+impl Bracket {
+    /// Final width, or `None` while the child is still running.
+    pub fn width(&self) -> Option<std::time::Duration> {
+        Some(self.closed?.saturating_duration_since(self.opened))
+    }
+
+    /// When this bracket ends, treating a live child as ending now.
+    fn end_or(&self, now: std::time::Instant) -> std::time::Instant {
+        self.closed.unwrap_or(now)
+    }
+
+    /// Does this bracket cover `at`? An open bracket covers everything from
+    /// its start onward.
+    fn spans(&self, at: std::time::Instant) -> bool {
+        self.opened <= at && self.closed.is_none_or(|closed| closed >= at)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -765,5 +1028,288 @@ mod tests {
         ledger.observe(t + Duration::from_millis(50), &[]);
 
         assert!(set.fired(), "the trigger must still see its own change");
+    }
+
+    // ── WindowLog (plan task 1.3) ───────────────────────────────────────
+    //
+    // The one windowed store. Everything in it expires, because a count that
+    // cannot fall could never let a repaired dashboard stop being suspected.
+
+    const W: Duration = Duration::from_secs(30);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn a_windowed_respawn_count_falls_as_evidence_expires() {
+        // The property the whole design turns on. A cumulative counter would
+        // pass the first assertion and fail the second, and self-clearing
+        // would be impossible.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        for i in 0..50 {
+            log.record_respawn(SourceId(0), t0 + Duration::from_millis(i * 10));
+        }
+        assert_eq!(log.respawns_in_window(SourceId(0), t0 + secs(1)), 50);
+        assert_eq!(log.respawns_in_window(SourceId(0), t0 + secs(40)), 0);
+    }
+
+    #[test]
+    fn respawns_are_counted_per_source() {
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        log.record_respawn(SourceId(0), t0);
+        log.record_respawn(SourceId(1), t0);
+        log.record_respawn(SourceId(1), t0);
+        assert_eq!(log.respawns_in_window(SourceId(0), t0 + secs(1)), 1);
+        assert_eq!(log.respawns_in_window(SourceId(1), t0 + secs(1)), 2);
+    }
+
+    #[test]
+    fn busy_fraction_unions_overlapping_brackets_rather_than_summing() {
+        // The measured repro's panes overlap almost entirely. Summing would
+        // report double and could push a cheap loop over the abstention
+        // ceiling, turning a detectable loop into a silence.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let a = log.open_bracket(SourceId(0), t0, Vec::new());
+        let b = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(a, t0 + secs(1), Vec::new());
+        log.close_bracket(b, t0 + secs(1), Vec::new());
+
+        let f = log.busy_fraction(t0 + secs(10));
+        assert!(
+            (f - 0.1).abs() < 0.01,
+            "two overlapping 1s brackets in 10s is 10%, not 20% — got {f}"
+        );
+    }
+
+    #[test]
+    fn busy_fraction_sums_disjoint_brackets() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let a = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(a, t0 + secs(1), Vec::new());
+        let b = log.open_bracket(SourceId(1), t0 + secs(5), Vec::new());
+        log.close_bracket(b, t0 + secs(6), Vec::new());
+
+        let f = log.busy_fraction(t0 + secs(10));
+        assert!(
+            (f - 0.2).abs() < 0.01,
+            "two disjoint 1s brackets in 10s is 20% — got {f}"
+        );
+    }
+
+    #[test]
+    fn an_open_bracket_counts_as_busy_up_to_now() {
+        // Treating a live child as zero-width would make a long-running pane
+        // look idle, which is exactly backwards.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        log.open_bracket(SourceId(0), t0 + secs(9), Vec::new());
+        let f = log.busy_fraction(t0 + secs(10));
+        assert!(
+            (f - 0.1).abs() < 0.01,
+            "a still-open 1s bracket is 10% — got {f}"
+        );
+    }
+
+    #[test]
+    fn close_bracket_returns_the_completed_record() {
+        // The loop hands it straight to PathLedger::observe_bracket, so a
+        // unit return would leave that seam unreachable through this API.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(2), t0, Vec::new());
+        let closed = log.close_bracket(id, t0 + Duration::from_millis(7), Vec::new());
+        let closed = closed.expect("a live id must close");
+        assert_eq!(closed.source, SourceId(2));
+        assert_eq!(closed.width(), Some(Duration::from_millis(7)));
+    }
+
+    #[test]
+    fn an_evicted_bracket_never_shifts_a_live_bracket_id() {
+        // The correctness test behind BracketId. With positional indices,
+        // evicting the older bracket would shift the index the second source
+        // still holds, and this close would land on the wrong record.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let old = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(old, t0 + secs(1), Vec::new());
+        let live = log.open_bracket(SourceId(7), t0 + secs(9), Vec::new());
+
+        log.evict(t0 + secs(20)); // the old bracket is now outside the window
+
+        let closed = log
+            .close_bracket(live, t0 + secs(20), Vec::new())
+            .expect("the live bracket must still be closeable");
+        assert_eq!(closed.source, SourceId(7), "closed the wrong record");
+    }
+
+    #[test]
+    fn closing_an_evicted_id_is_a_no_op_returning_none() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + secs(1), Vec::new());
+        log.evict(t0 + secs(30));
+        assert!(log.close_bracket(id, t0 + secs(30), Vec::new()).is_none());
+    }
+
+    #[test]
+    fn covering_reports_closed_brackets_with_final_widths() {
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(4), t0, Vec::new());
+        log.close_bracket(id, t0 + Duration::from_millis(20), Vec::new());
+
+        let over = log.covering(t0 + Duration::from_millis(10));
+        assert_eq!(over, vec![(SourceId(4), Duration::from_millis(20))]);
+        assert!(log.covering(t0 + secs(5)).is_empty(), "outside the bracket");
+    }
+
+    #[test]
+    fn covering_withholds_an_open_bracket_and_any_open_reports_it() {
+        // Reporting elapsed-so-far as a width is the mis-credit this design
+        // exists to avoid, so `covering` withholds an open bracket entirely
+        // and a caller asks `any_open` before treating a change as exogenous.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        log.open_bracket(SourceId(0), t0, Vec::new());
+        assert!(log.covering(t0 + Duration::from_millis(5)).is_empty());
+        assert!(log.any_open(t0 + Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn an_arrival_with_nothing_in_flight_is_exogenous_immediately() {
+        // Emptiness needs no width, so the veto never waits on one.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        let key = TriggerKey("fifo:/tmp/a".into());
+        let arrivals = log.arrivals(&key);
+        assert_eq!(arrivals.len(), 1);
+        assert!(arrivals[0].containing.is_empty());
+    }
+
+    #[test]
+    fn an_arrival_captures_bracket_identity_at_record_time_and_widths_later() {
+        // Identity must be captured immediately, or eviction could remove the
+        // brackets that gave the arrival meaning. Width must NOT be: an
+        // arrival recorded during an open child would freeze elapsed-so-far
+        // and credit a long child as artificially tight.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.observe_arrival(
+            SourceId(1),
+            TriggerKey("fifo:/tmp/a".into()),
+            t0 + Duration::from_millis(3),
+        );
+
+        let key = TriggerKey("fifo:/tmp/a".into());
+        {
+            let arrivals = log.arrivals(&key);
+            assert_eq!(arrivals[0].containing, vec![id], "identity is captured now");
+            assert!(log.widths(arrivals[0]).is_none(), "width is not final yet");
+        }
+
+        log.close_bracket(id, t0 + Duration::from_millis(40), Vec::new());
+        let arrivals = log.arrivals(&key);
+        assert_eq!(
+            log.widths(arrivals[0]),
+            Some(vec![(SourceId(1), Duration::from_millis(40))]),
+            "the FINAL width, not elapsed-so-far"
+        );
+    }
+
+    #[test]
+    fn two_triggers_on_one_pane_are_kept_separate_not_merged() {
+        // Without per-trigger identity the credit rule has nothing to apply
+        // itself to on the reader route.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/b".into()), t0);
+        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/b".into()), t0);
+
+        assert_eq!(log.arrivals(&TriggerKey("fifo:/tmp/a".into())).len(), 1);
+        assert_eq!(log.arrivals(&TriggerKey("fifo:/tmp/b".into())).len(), 2);
+    }
+
+    #[test]
+    fn an_overflow_forces_abstention_for_any_window_it_touches() {
+        // Missing evidence is not absent evidence: the dropped arrival may
+        // have been the window's only exogenous observation.
+        let mut log = WindowLog::new(W);
+        let t0 = Instant::now();
+        log.record_overflow(t0);
+        assert!(log.evidence_lost(t0 + secs(1)));
+        assert!(
+            !log.evidence_lost(t0 + secs(40)),
+            "and it expires with the window"
+        );
+    }
+
+    #[test]
+    fn eviction_drops_brackets_respawns_arrivals_and_overflows_alike() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + Duration::from_millis(5), Vec::new());
+        log.record_respawn(SourceId(0), t0);
+        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        log.record_overflow(t0);
+
+        log.evict(t0 + secs(30));
+
+        assert_eq!(log.respawns_in_window(SourceId(0), t0 + secs(30)), 0);
+        assert!(log.arrivals(&TriggerKey("fifo:/tmp/a".into())).is_empty());
+        assert!(!log.evidence_lost(t0 + secs(30)));
+        assert!((log.busy_fraction(t0 + secs(30)) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eviction_keeps_a_bracket_that_still_overlaps_the_window() {
+        // A bracket that opened before the cutoff but closed inside it still
+        // contributes duty; dropping it by open time alone would silently
+        // under-report a long child.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + secs(6), Vec::new());
+
+        log.evict(t0 + secs(11)); // cutoff is t0 + 1s: opened before, closed after
+
+        let f = log.busy_fraction(t0 + secs(11));
+        assert!(
+            f > 0.0,
+            "a bracket overlapping the window must survive — got {f}"
+        );
+    }
+
+    #[test]
+    fn eviction_retains_a_bracket_a_live_arrival_still_references() {
+        // Otherwise the arrival's widths become unresolvable and the credit
+        // rule silently loses its input.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + Duration::from_millis(5), Vec::new());
+        // The arrival is recent; its bracket is old.
+        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        log.arrivals(&TriggerKey("fifo:/tmp/a".into()));
+
+        log.evict(t0 + Duration::from_millis(500));
+
+        let key = TriggerKey("fifo:/tmp/a".into());
+        let arrivals = log.arrivals(&key);
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(
+            log.widths(arrivals[0]),
+            Some(vec![(SourceId(0), Duration::from_millis(5))]),
+            "the referenced bracket must have been retained"
+        );
     }
 }
