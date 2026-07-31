@@ -2282,8 +2282,14 @@ mod matrix {
     /// respawns while producing 5 changes, which made every pane a candidate
     /// while leaving the dashboard almost idle — a combination the loop cannot
     /// reach, and it manufactured failures that said nothing about main.
-    /// Above `min_respawns` (50) so every pane is a candidate honestly.
-    const CHANGES: usize = 55;
+    /// Kept small, with `min_respawns` lowered to match: the shipped
+    /// threshold of 50 would make this matrix 8x its size and it timed out
+    /// on CI at 20 s. Condition 1 is a candidate FILTER and is not what this
+    /// matrix tests — it is satisfied by construction, with the respawn
+    /// count and the change count still the same events.
+    const CHANGES: usize = 7;
+    /// Condition 1's threshold for this matrix only. `CHANGES` clears it.
+    const MIN_RESPAWNS: usize = 6;
     /// SAMPLED axis. Straddles the measured anchors: merging is correct at
     /// 1.0-1.1x and wrong at 25.9x, with nothing measured in between.
     const RATIOS: [u32; 3] = [1, 5, 25];
@@ -2475,16 +2481,23 @@ mod matrix {
         let mut log = WindowLog::new(W);
         let t0 = std::time::Instant::now();
 
-        let step = std::time::Duration::from_millis(450);
-        // De-phased panes must not overlap, so one round holds n slots wide
-        // enough for the widest child.
-        let spread = step / (n as u32 + 1);
         let close_slop = if case.close == Close::Drain {
             SLICE
         } else {
             std::time::Duration::ZERO
         };
-
+        // DERIVED, never hardcoded. A de-phased pane must not overlap the
+        // next one, so a slot has to hold the widest child plus whatever the
+        // close side adds. A fixed 90 ms slot silently failed this at ratio
+        // 25 with a drain-side close — 50 ms of child plus 50 ms of slop —
+        // so the "de-phased" cells were quietly overlapping and reported a
+        // false positive that said nothing about main.
+        let widest = (0..n)
+            .map(|pane| width_of(pane, case.ratio))
+            .max()
+            .unwrap_or(BASE);
+        let spread = widest + close_slop + std::time::Duration::from_millis(20);
+        let step = spread * (n as u32 + 1);
         for c in 0..CHANGES {
             let round = t0 + step * (c as u32);
             // A respawn per round per pane: the count and the evidence are the
@@ -2594,7 +2607,12 @@ mod matrix {
                 readers: &[],
             })
             .collect();
-        LoopSuspicion::default().evaluate(now, &ledger, &log, &panes)
+        LoopSuspicion {
+            window: W,
+            min_respawns: MIN_RESPAWNS,
+            abstain_at_or_above: LoopSuspicion::default().abstain_at_or_above,
+        }
+        .evaluate(now, &ledger, &log, &panes)
     }
 
     fn all_cases() -> Vec<(String, Shape)> {
