@@ -123,9 +123,6 @@ pub struct TickOutcome {
     /// fits, which is nearly all of them, and zero when nothing ran.
     /// Read by the loop, which is what makes a truncation visible
     /// instead of silent.
-    // The loop reads it once there is a surface to say it on; until
-    // then only the tests do.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub dropped: usize,
 }
 
