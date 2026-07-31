@@ -21,6 +21,27 @@
 
 use std::collections::VecDeque;
 
+/// The most bytes one line may hold, terminator aside, before it is
+/// dropped whole.
+///
+/// A line bound does not bound memory on its own: a child emitting one
+/// endless line with no newline in it defeats a count of lines, and the
+/// buffer assembling that line grows until the process dies — the same
+/// exhaustion by a different door.
+///
+/// **The over-long line is dropped whole, never truncated**, and that is
+/// a correctness rule rather than a preference. The change marks index
+/// into the retained body by character position, so a body holding half
+/// a line would carry marks pointing into text the user cannot see.
+/// Truncating within a line means changing that contract first.
+///
+/// 64 KiB sits far above any line a terminal renders — a thousand-column
+/// line with a style sequence on every cell is an order of magnitude
+/// under it, and 64 KiB is some eight hundred rows of an 80-column
+/// terminal. It is a **secondary** ceiling: the line count is the bound,
+/// and this only catches the shape the line count cannot express.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
 /// Which end of an over-long stream survives.
 ///
 /// The two are not symmetric implementations of one idea:
@@ -49,6 +70,10 @@ pub struct LineCap {
     /// the `\n` — so a chunk boundary is not a line boundary and treating
     /// it as one would both corrupt the content and inflate the count.
     partial: Vec<u8>,
+    /// The line in progress passed the byte backstop, so it is being
+    /// discarded whole and its bytes are being skipped until the next
+    /// `\n`. It has already been counted.
+    overlong: bool,
 }
 
 impl LineCap {
@@ -60,6 +85,7 @@ impl LineCap {
             retained: VecDeque::new(),
             dropped: 0,
             partial: Vec::new(),
+            overlong: false,
         }
     }
 
@@ -70,17 +96,11 @@ impl LineCap {
     pub fn feed(&mut self, chunk: &[u8]) {
         let mut rest = chunk;
         while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
-            let (line, tail) = rest.split_at(nl + 1);
-            if self.partial.is_empty() {
-                self.accept(line);
-            } else {
-                self.partial.extend_from_slice(line);
-                let joined = std::mem::take(&mut self.partial);
-                self.accept(&joined);
-            }
-            rest = tail;
+            self.extend_line(&rest[..nl]);
+            self.end_line();
+            rest = &rest[nl + 1..];
         }
-        self.partial.extend_from_slice(rest);
+        self.extend_line(rest);
     }
 
     /// Consume, flushing any unterminated trailing line, and yield the
@@ -95,11 +115,49 @@ impl LineCap {
             // render path splits on `\n` after trimming one trailing
             // terminator, so dropping this would eat output that fits.
             // No terminator is invented for it — the retained bytes stay
-            // exactly what the child wrote.
+            // exactly what the child wrote. An over-long line cannot
+            // reach here: it was counted and released when it passed the
+            // backstop.
             let last = std::mem::take(&mut self.partial);
             self.accept(&last);
         }
         (self.retained.into(), self.dropped)
+    }
+
+    /// Add bytes to the line in progress. `bytes` never holds a `\n`.
+    ///
+    /// This is the one place that decides a line is over: past the
+    /// backstop it is counted once, released, and its remaining bytes
+    /// are skipped rather than buffered.
+    fn extend_line(&mut self, bytes: &[u8]) {
+        if self.overlong {
+            return;
+        }
+        if self.partial.len() + bytes.len() > MAX_LINE_BYTES {
+            self.overlong = true;
+            self.dropped += 1;
+            // Release rather than clear: a monster's capacity is the
+            // memory this backstop exists to give back.
+            self.partial = Vec::new();
+            return;
+        }
+        self.partial.extend_from_slice(bytes);
+    }
+
+    /// The line in progress ended at a `\n`.
+    fn end_line(&mut self) {
+        if self.overlong {
+            // Already counted; the split resynchronizes here, so the
+            // next line is an ordinary line.
+            self.overlong = false;
+            return;
+        }
+        let mut line = std::mem::take(&mut self.partial);
+        line.push(b'\n');
+        self.accept(&line);
+        // Hand the buffer back so the next line reuses its capacity.
+        line.clear();
+        self.partial = line;
     }
 
     /// Offer one line, terminator included, to the retained window.
@@ -223,14 +281,67 @@ mod tests {
     #[test]
     fn many_tiny_feeds_bound_the_partial_buffer_too() {
         // A child emitting one enormous line with no newline defeats a LINE
-        // bound. This pins that assembling it is at least not quadratic;
-        // bounding it is a separate concern.
+        // bound. This pins that assembling it is at least not quadratic.
+        // The 50 KB it assembles sits deliberately under the byte
+        // backstop, so this stays a test about assembling rather than
+        // about dropping.
         let mut cap = LineCap::new(4, Keep::Bottom);
         for _ in 0..50_000 {
             cap.feed(b"x");
         }
         let (lines, _) = cap.finish();
         assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn one_enormous_line_does_not_grow_without_limit() {
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        for _ in 0..(MAX_LINE_BYTES / 8 + 100) {
+            cap.feed(b"xxxxxxxx");
+        }
+        let (lines, dropped) = cap.finish();
+        assert!(
+            lines.iter().all(|l| l.len() <= MAX_LINE_BYTES + 1),
+            "a line grew past the backstop"
+        );
+        assert!(dropped > 0, "an over-long line must be counted as dropped");
+    }
+
+    #[test]
+    fn an_over_long_line_counts_once_however_many_reads_it_spans() {
+        // `dropped` is a line count everywhere, so a monster weighs one —
+        // not its byte weight, and not once per read that carried it.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        for _ in 0..40 {
+            cap.feed(&vec![b'x'; MAX_LINE_BYTES / 2]);
+        }
+        cap.feed(b"\n");
+        let (lines, dropped) = cap.finish();
+        assert!(lines.is_empty());
+        assert_eq!(dropped, 1);
+    }
+
+    #[test]
+    fn a_line_at_exactly_the_backstop_is_kept_whole() {
+        // The eviction unit is a LINE. A line that fits is never cut.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(&vec![b'x'; MAX_LINE_BYTES]);
+        cap.feed(b"\n");
+        let (lines, dropped) = cap.finish();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), MAX_LINE_BYTES + 1); // + its terminator
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn the_line_after_an_over_long_one_is_unaffected() {
+        // Dropping a monster must not desynchronize the split — the next
+        // line is an ordinary line.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(&vec![b'x'; MAX_LINE_BYTES * 2]);
+        cap.feed(b"\nafter\n");
+        let (lines, _) = cap.finish();
+        assert_eq!(lines.last().unwrap(), b"after\n");
     }
 
     #[test]
