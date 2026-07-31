@@ -19,12 +19,13 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
-use crate::core::child::{ChildSlot, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
+use crate::core::child::{ChildSlot, Retention, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
 use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{Composition, PaneGeometry, Registry, SourceId, SourceSpec};
+use crate::core::retain::Keep;
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::core::trigger::{
@@ -458,6 +459,14 @@ pub(crate) fn run_registry(
                     let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
                     runtime[id.0].bracket = Some(opened);
                 }
+                // One fixed policy for every source until the pane's own
+                // direction resolves it — both spawn paths must carry
+                // the SAME one, or a test would prove something the
+                // binary does not do.
+                let retention = Retention {
+                    max_lines: 1000,
+                    keep: Keep::Bottom,
+                };
                 let mut inline = session.once && plain;
                 if !inline {
                     let command =
@@ -468,15 +477,19 @@ pub(crate) fn run_registry(
                         runtime[id.0].slot.clone(),
                         runtime[id.0].tx.clone(),
                         watched_union.clone(),
+                        retention,
                     )
                     .is_err();
                 }
                 if inline {
                     let command =
                         source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
-                    let _ = runtime[id.0]
-                        .tx
-                        .send(run_tick(command, id, watched_union.clone()));
+                    let _ = runtime[id.0].tx.send(run_tick(
+                        command,
+                        id,
+                        watched_union.clone(),
+                        retention,
+                    ));
                 }
             }
         }
