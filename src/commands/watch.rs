@@ -515,7 +515,13 @@ pub(crate) fn run_registry(
                                 .into_bytes(),
                             Vec::new(),
                         ),
-                        None => (outcome.stdout, outcome.stderr),
+                        // The retained lines concatenated: the composer
+                        // decodes the WHOLE stream, so it must be handed
+                        // one. Decoding line by line would render an
+                        // empty stream as no rows instead of one, and
+                        // keep a run of trailing blank lines the
+                        // composer collapses.
+                        None => (outcome.stdout.concat(), outcome.stderr.concat()),
                     };
                     let mut combined = stdout.clone();
                     combined.extend_from_slice(&stderr);
@@ -541,9 +547,11 @@ pub(crate) fn run_registry(
                     // stamp move only on a distinct output.
                     let spec = registry.spec(id);
                     let program = spec.command.first().map_or("", String::as_str);
+                    // Concatenated for the same reason as the plain path
+                    // above: the body is decoded whole, never per line.
                     let lines = pane_body(
-                        &outcome.stdout,
-                        &outcome.stderr,
+                        &outcome.stdout.concat(),
+                        &outcome.stderr.concat(),
                         outcome.spawn_error.as_ref(),
                         &spec.name,
                         program,
@@ -3366,6 +3374,45 @@ mod tests {
         assert_eq!(
             compose_frame(Some(&title), b"a\nb\n", b"boom\n", false),
             vec!["T", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn empty_output_still_renders_one_empty_line() {
+        // Whole-stream semantics: an empty stream is ONE empty body line,
+        // not zero. A renderer that decoded a retained set element by
+        // element would yield nothing here and every empty pane would
+        // lose a row.
+        assert_eq!(
+            output_lines(&Vec::<Vec<u8>>::new().concat(), b""),
+            vec![String::new()]
+        );
+    }
+
+    #[test]
+    fn trailing_blank_lines_collapse_exactly_as_they_do_today() {
+        // The trim eats the whole RUN of newlines, not one — which a
+        // per-element decode would preserve as separate empty lines.
+        let retained = [b"a\n".to_vec(), b"\n".to_vec(), b"\n".to_vec()];
+        assert_eq!(output_lines(&retained.concat(), b""), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn the_plain_path_renders_a_capped_body_exactly_as_an_uncapped_one() {
+        // The other render path does its own whole-stream decode, so the
+        // pane test above does not cover it. Identity is the assertion:
+        // retained-then-concatenated must equal the raw bytes it came
+        // from, for every caller of either renderer.
+        let raw = b"a\n\n\n".to_vec();
+        let retained = [b"a\n".to_vec(), b"\n".to_vec(), b"\n".to_vec()];
+        assert_eq!(
+            compose_frame(None, &retained.concat(), b"", false),
+            compose_frame(None, &raw, b"", false),
+        );
+        // And the empty case, where the two representations diverge most.
+        assert_eq!(
+            compose_frame(None, &Vec::<Vec<u8>>::new().concat(), b"", false),
+            compose_frame(None, b"", b"", false),
         );
     }
 
