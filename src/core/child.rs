@@ -89,6 +89,12 @@ pub struct TickOutcome {
     /// sleep up to one slice between the child's exit and the drain, and that
     /// slop widens the attribution window enough to matter.
     pub close_stamps: Vec<(std::path::PathBuf, crate::core::trigger::PathStamp)>,
+    /// The monotonic instant the child was reaped — the closing side of its
+    /// bracket, taken beside `close_stamps` and for the same reason. The
+    /// bracket's WIDTH and its overlap window are both measured from this,
+    /// so a drain-time instant would inflate every child's apparent width
+    /// and widen who is credited with running over it.
+    pub closed_at: std::time::Instant,
     /// The child's exit status, for the per-pane failure row. Absent
     /// when nothing ran: a spawn error, or a child reclaimed by a
     /// shutdown kill — a defaulted `exit 0` would read as a healthy
@@ -173,6 +179,7 @@ fn run_parked(
         stdout: out,
         stderr: err,
         at: jiff::Timestamp::now(),
+        closed_at: std::time::Instant::now(),
         spawn_error: None,
         status,
         close_stamps,
@@ -181,6 +188,7 @@ fn run_parked(
 
 fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
     TickOutcome {
+        closed_at: std::time::Instant::now(),
         source,
         stdout: Vec::new(),
         stderr: Vec::new(),
@@ -270,6 +278,32 @@ mod tests {
         let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()]);
         assert_eq!(outcome.close_stamps.len(), 1);
         assert_eq!(outcome.close_stamps[0].0, f);
+    }
+
+    #[test]
+    fn the_bracket_closes_on_the_worker_not_at_the_drain() {
+        // The closing STAMPS were already taken here; the closing INSTANT
+        // was not, and the bracket's width and overlap window are measured
+        // from it. The loop can sleep up to a slice before it drains, so a
+        // drain-time instant inflates every child's apparent width and
+        // widens who is credited with overlapping it — the same slop the
+        // stamps are taken here to avoid.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+
+        let before = std::time::Instant::now();
+        let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()]);
+        let drained = std::time::Instant::now();
+
+        assert!(
+            outcome.closed_at >= before,
+            "the child cannot have finished before it started"
+        );
+        assert!(
+            outcome.closed_at <= drained,
+            "and it must be stamped by the worker, before the caller sees it"
+        );
     }
 
     #[test]
