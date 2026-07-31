@@ -1148,14 +1148,15 @@ fn scrubbing_from_an_old_freeze_steps_backward_not_forward() {
 
     // Wait past the first few frames so the frozen value has a
     // predecessor to step back to.
-    assert!(
-        wait_for(&session, &mut terminal, b"v000003", Duration::from_secs(3)),
-        "expected the counter to reach three"
-    );
-    // The frozen copy is always the last value PAINTED: keep everything
-    // seen up to the freeze row, since a freeze whose copy matches the
-    // screen rewrites only the status row.
-    let mut all = drain_for(&session, Duration::from_millis(300));
+    // Kept, not just awaited. The frozen copy is the last value PAINTED,
+    // and neither source below is guaranteed to carry one: every frame
+    // costs a shell spawn, so on a loaded machine the drain can span no
+    // frame at all, and a freeze whose copy already matches the screen
+    // rewrites ONLY the status row by design. Starting the accumulation
+    // here means there is always at least this frame to fall back on.
+    let mut all = wait_for_bytes(&session, &mut terminal, b"v000003", Duration::from_secs(3))
+        .expect("expected the counter to reach three");
+    all.extend(drain_for(&session, Duration::from_millis(300)));
     session.write_bytes(b"p");
     all.extend(
         wait_for_bytes(
