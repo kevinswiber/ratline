@@ -301,7 +301,15 @@ pub(crate) fn run_registry(
             }
         })
         .collect();
-    let observing = !watched_union.is_empty();
+    // Whether this dashboard has ANY trigger evidence to collect. It must
+    // span both routes: `watched_union` is a `file:`-only quantity, so gating
+    // the observation on it alone left a fifo-only dashboard opening no
+    // brackets and never evaluating — every arrival then read as exogenous,
+    // because nothing had been recorded as covering it, and the veto silently
+    // held forever. A cycle spinning at ~9 Hz went unreported for that reason
+    // and no test noticed, because the unit tests supply a window directly.
+    let observing =
+        !watched_union.is_empty() || per_source_readers.iter().any(|keys| !keys.is_empty());
     // The observer's own baselines, deliberately separate from every
     // MtimeWatchSet over the same paths: sharing them would let an observer
     // poll consume a trigger's fire, and the pane would stop refreshing.

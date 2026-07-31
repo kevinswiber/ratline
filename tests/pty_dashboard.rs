@@ -840,3 +840,84 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     // pane happened to overlap more. Weakening this needle would let that
     // back in silently.
 }
+
+fn mkfifo(path: &std::path::Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {} failed", path.display());
+}
+
+/// The same cycle over the reader route. Each pane's command writes a
+/// byte into the fifo the other pane reads, so the loop closes through
+/// pipes rather than through mtimes.
+fn fifo_cycle_board(fa: &std::path::Path, fb: &std::path::Path) -> String {
+    let (fa, fb) = (fa.display(), fb.display());
+    debug_assert!(!format!("{fa}{fb}").contains('"'));
+    format!(
+        "row-gap 0\n\n\
+         defaults {{\n    height 3\n    border \"none\"\n    shell #true\n    interval \"never\"\n}}\n\n\
+         pane \"a\" {{\n    trigger \"fifo:{fa}\"\n    trigger-debounce \"100ms\"\n    \
+         command \"printf x > {fb}; echo cycle-a\"\n}}\n\n\
+         pane \"b\" {{\n    trigger \"fifo:{fb}\"\n    trigger-debounce \"100ms\"\n    \
+         command \"printf x > {fa}; echo cycle-b\"\n}}\n"
+    )
+}
+
+/// The reader route, end to end — and the reason it exists as a separate
+/// test rather than as confidence borrowed from the `file:` one.
+///
+/// The two routes share the credit rule, the graph test and both report
+/// surfaces, but they reach them by entirely different evidence: a
+/// `file:` change is placed inside a window by stat'ing a path either
+/// side of a child, while a fifo has nothing to stat and is placed by
+/// the instant its bytes arrived. Everything between the reader thread
+/// and the window is code the `file:` test never executes — so with the
+/// drain unwired, the whole suite passed and only this fails.
+///
+/// The hazard is also worse here, which is why the route is worth the
+/// seconds: a reader posts an early wake, so the 50 ms loop slice is not
+/// a ceiling; bytes in a pipe cannot be missed the way an unmoved mtime
+/// can; and there is no EOF escape, because the reader holds its own
+/// write end open by design.
+#[test]
+fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fa = dir.path().join("fa");
+    let fb = dir.path().join("fb");
+    // Both fifos must exist before rat opens its readers; a missing one
+    // is a startup error, not a trigger that fires later.
+    for f in [&fa, &fb] {
+        mkfifo(f);
+    }
+    let decl = write_dashboard(dir.path(), &fifo_cycle_board(&fa, &fb));
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "a, b: trigger loop suspected:".as_bytes(),
+        Duration::from_secs(40),
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(5));
+    let seen = seen.expect("the fifo cycle never earned its report");
+    assert!(
+        contains(&seen, "· looping".as_bytes()),
+        "the badge never reached a chrome row: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // `fifo:` and not `file:` — the evidence named must be the evidence
+    // actually used, or the notice would be describing the other route.
+    assert!(
+        contains(&seen, b"fifo:") && contains(&seen, b"? help"),
+        "the notice must name the watched fifos and where to read more"
+    );
+}
