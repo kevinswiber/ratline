@@ -410,6 +410,59 @@ mod tests {
     }
 
     #[test]
+    fn a_child_that_outruns_its_cap_still_exits_and_posts() {
+        // Far more output than any pipe buffer holds: this is the test
+        // that catches a reader which stops at its bound.
+        //
+        // FALSIFIED, and the result is worth recording because it is not
+        // what one would predict. Giving the read loop an early exit
+        // once the bound fills does NOT hang here — `read_all` drops the
+        // pipe as it returns, closing the read end before anyone waits,
+        // so the child dies of SIGPIPE (measured: unix wait status 13)
+        // rather than blocking in `write`. What actually goes wrong is
+        // quieter: `dropped` came back 0 while some 199,950 lines were
+        // lost, so the count lies about the loss, and the exit is no
+        // longer clean. Two of the three assertions below fire, in
+        // 0.02 s.
+        //
+        // The rule stands whatever the symptom: never stop draining.
+        // Just do not expect a hang to be how you find out.
+        let outcome = run_tick(
+            flooder(200_000),
+            SourceId(0),
+            Vec::new(),
+            Retention {
+                max_lines: 50,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(outcome.stdout.len(), 50);
+        assert!(outcome.dropped >= 199_950);
+        assert!(
+            outcome.status.is_some_and(|status| status.success()),
+            "the child never exited cleanly"
+        );
+    }
+
+    #[test]
+    fn the_retained_window_is_the_tail_under_keep_bottom() {
+        // Not incidental: keeping the head would silently defeat a pane
+        // that declared keep-bottom, which is the mode people reach for
+        // with exactly the commands that provoke this.
+        let outcome = run_tick(
+            flooder(1_000),
+            SourceId(0),
+            Vec::new(),
+            Retention {
+                max_lines: 3,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(line_text(outcome.stdout.last().unwrap()), "999");
+        assert_eq!(line_text(outcome.stdout.first().unwrap()), "997");
+    }
+
+    #[test]
     fn a_command_inside_its_bound_reports_zero_dropped() {
         // The common case, and the one that must stay boring.
         let outcome = run_tick(
