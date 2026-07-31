@@ -220,11 +220,18 @@ pub struct Bracket {
 
 /// One observed change to one watched path.
 pub struct Change {
-    pub at: std::time::Instant,
-    /// The brackets this change fell inside, with each one's width. EMPTY
-    /// means no child was in flight — which is what makes the change
-    /// EXOGENOUS, and one exogenous observation is what clears suspicion.
-    pub containing: Vec<(SourceId, std::time::Duration)>,
+    /// Every child that could have written it, with its width where that
+    /// is known yet. EMPTY means no child was in flight — which is what
+    /// makes the change EXOGENOUS, and one exogenous observation is what
+    /// clears suspicion.
+    ///
+    /// A `None` width means that child was still RUNNING when this was
+    /// read. It counts for coverage, which asks only who was in flight,
+    /// and is withheld from the tightness stage, which needs a final
+    /// width — the same split the reader route already makes, and for the
+    /// same reason: elapsed-so-far would credit a long child as
+    /// artificially tight. It resolves by itself once the child exits.
+    pub containing: Vec<(SourceId, Option<std::time::Duration>)>,
 }
 
 /// The observer's view of the watched union: its own baseline per path, and
@@ -236,7 +243,18 @@ pub struct PathLedger {
     /// Sorted and deduplicated, so the stat order is deterministic.
     paths: Vec<std::path::PathBuf>,
     seen: std::collections::HashMap<std::path::PathBuf, PathStamp>,
-    changes: std::collections::HashMap<std::path::PathBuf, Vec<Change>>,
+    changes: std::collections::HashMap<std::path::PathBuf, Vec<Observed>>,
+}
+
+/// One observation as the ledger holds it: when, and who could have written
+/// it BY BRACKET ID. Widths are deliberately not stored — a covering child
+/// is very often still running when the change is seen, so its width does
+/// not exist yet. `changes()` resolves them against the log on read, which
+/// is what lets a still-running child count for coverage immediately and
+/// gain its width later, without ever being credited an elapsed-so-far one.
+struct Observed {
+    at: std::time::Instant,
+    containing: Vec<(SourceId, BracketId)>,
 }
 
 impl PathLedger {
@@ -257,11 +275,7 @@ impl PathLedger {
     /// Stat the union and record one change per path that moved. `brackets`
     /// is who was in flight over the interval since the last call; empty
     /// means the dashboard was idle.
-    pub fn observe(
-        &mut self,
-        now: std::time::Instant,
-        brackets: &[(SourceId, std::time::Duration)],
-    ) {
+    pub fn observe(&mut self, now: std::time::Instant, brackets: &[(SourceId, BracketId)]) {
         for (path, stamp) in stamps(&self.paths) {
             if self.moved(&path, stamp) {
                 self.record(path, now, brackets.to_vec());
@@ -288,20 +302,15 @@ impl PathLedger {
     /// the parity — measured on the canonical two-pane cycle, where a
     /// perfectly steady loop was reported as both panes, then nobody,
     /// several times a second.
-    pub fn observe_bracket(
-        &mut self,
-        bracket: &Bracket,
-        others: &[(SourceId, std::time::Duration)],
-    ) {
+    pub fn observe_bracket(&mut self, bracket: &Bracket, others: &[(SourceId, BracketId)]) {
         let Some(closed) = bracket.closed else {
-            return; // still running: there is no width yet, so nothing to say
+            return; // still running: it has not observed anything yet
         };
-        let width = closed.saturating_duration_since(bracket.opened);
         // The observing bracket leads: it is the one the snapshots prove.
         // A source appears once — it runs one child at a time, so a repeat
         // means this bracket outlived several of that source's runs, and
         // the first is the one that shares the most of this window.
-        let mut containing = vec![(bracket.source, width)];
+        let mut containing = vec![(bracket.source, bracket.id)];
         for (source, other) in others {
             if !containing.iter().any(|(s, _)| s == source) {
                 containing.push((*source, *other));
@@ -332,17 +341,34 @@ impl PathLedger {
         }
     }
 
-    /// Changes to this path with no child in flight over them.
+    /// Changes to this path with no child in flight over them. Read from
+    /// the raw store: emptiness is knowable the moment it is recorded and
+    /// never waits on a width, which is what lets the veto answer at once.
     pub fn exogenous(&self, path: &std::path::Path) -> usize {
-        self.changes(path)
+        self.raw(path)
             .iter()
             .filter(|change| change.containing.is_empty())
             .count()
     }
 
-    /// Every change to this path still inside the window — the credit rule's
-    /// per-path input.
-    pub fn changes(&self, path: &std::path::Path) -> &[Change] {
+    /// Every change to this path still inside the window, with each covering
+    /// child's width resolved where it exists — the credit rule's per-path
+    /// input. A child still running (or one whose bracket has aged out)
+    /// carries `None`: present for coverage, absent from tightness.
+    pub fn changes(&self, path: &std::path::Path, log: &WindowLog) -> Vec<Change> {
+        self.raw(path)
+            .iter()
+            .map(|observed| Change {
+                containing: observed
+                    .containing
+                    .iter()
+                    .map(|(source, id)| (*source, log.width_of(*id)))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    fn raw(&self, path: &std::path::Path) -> &[Observed] {
         self.changes.get(path).map_or(&[], Vec::as_slice)
     }
 
@@ -365,7 +391,7 @@ impl PathLedger {
         &mut self,
         path: &std::path::Path,
         at: std::time::Instant,
-        containing: Vec<(SourceId, std::time::Duration)>,
+        containing: Vec<(SourceId, BracketId)>,
     ) {
         self.record(path.to_path_buf(), at, containing);
     }
@@ -374,12 +400,12 @@ impl PathLedger {
         &mut self,
         path: std::path::PathBuf,
         at: std::time::Instant,
-        containing: Vec<(SourceId, std::time::Duration)>,
+        containing: Vec<(SourceId, BracketId)>,
     ) {
         self.changes
             .entry(path)
             .or_default()
-            .push(Change { at, containing });
+            .push(Observed { at, containing });
     }
 }
 
@@ -569,26 +595,40 @@ impl WindowLog {
     }
 
     /// Is any bracket still open over `at`?
-    /// Every OTHER closed bracket whose run overlaps `bracket`'s, with its
-    /// width: the children that could equally have written a change this
-    /// bracket observed, since the snapshots place the change inside the
-    /// window rather than at an instant. Touching at an edge counts — a
-    /// child that exited exactly as this one started was running when this
-    /// one opened.
+    /// Every OTHER child running over `bracket`'s window, BY ID: the ones
+    /// that could equally have written a change this bracket observed,
+    /// since the snapshots place the change inside the window rather than
+    /// at an instant. Touching at an edge counts — a child that exited
+    /// exactly as this one started was running when this one opened.
     ///
-    /// Open brackets are withheld for the same reason `covering` withholds
-    /// them: their width is not final, and elapsed-so-far would credit a
-    /// long-running child as artificially tight.
-    pub fn overlapping(&self, bracket: &Bracket) -> Vec<(SourceId, std::time::Duration)> {
+    /// **A child still running is included, and that is the whole point.**
+    /// In a cycle the true writer is very often still in flight when
+    /// another pane's bracket notices the change, and the observing bracket
+    /// advances the baseline — so a writer left out here is left out
+    /// permanently, and the coverage its exclusion invents is what put the
+    /// credit rule's first stage on a knife-edge.
+    ///
+    /// Only identities are returned. Widths are resolved later, by
+    /// `width_of`, so an unfinished child is never credited an
+    /// elapsed-so-far width — the mis-credit the tightness stage exists to
+    /// prevent.
+    pub fn overlapping(&self, bracket: &Bracket) -> Vec<(SourceId, BracketId)> {
         let Some(closed) = bracket.closed else {
             return Vec::new();
         };
         self.brackets
             .iter()
             .filter(|b| b.id != bracket.id)
-            .filter(|b| b.closed.is_some_and(|end| end >= bracket.opened) && b.opened <= closed)
-            .map(|b| (b.source, b.width().unwrap_or_default()))
+            .filter(|b| b.closed.is_none_or(|end| end >= bracket.opened) && b.opened <= closed)
+            .map(|b| (b.source, b.id))
             .collect()
+    }
+
+    /// A bracket's final width, or `None` while it is still running — and
+    /// also `None` once it has been evicted, which reads the same way to
+    /// every caller: no width, so no claim about tightness.
+    pub fn width_of(&self, id: BracketId) -> Option<std::time::Duration> {
+        self.brackets.iter().find(|b| b.id == id)?.width()
     }
 
     pub fn any_open(&self, at: std::time::Instant) -> bool {
@@ -765,7 +805,7 @@ impl LoopSuspicion {
         let mut merged: Vec<Vec<SourceId>> = Vec::new();
         for pane in &candidates {
             for path in pane.watched {
-                let credited = credit(ledger.changes(path));
+                let credited = credit(&ledger.changes(path, log));
                 Self::add(&mut edges, &mut merged, &credited, pane.source);
             }
             for key in pane.readers {
@@ -813,8 +853,11 @@ impl LoopSuspicion {
             .iter()
             .filter_map(|arrival| {
                 Some(Change {
-                    at: arrival.at,
-                    containing: log.widths(arrival)?,
+                    containing: log
+                        .widths(arrival)?
+                        .into_iter()
+                        .map(|(source, width)| (source, Some(width)))
+                        .collect(),
                 })
             })
             .collect()
@@ -878,7 +921,7 @@ fn credit(changes: &[Change]) -> Vec<SourceId> {
     // Stage two.
     let medians: Vec<(SourceId, std::time::Duration)> = eligible
         .into_iter()
-        .map(|id| (id, median_width(changes, id)))
+        .filter_map(|id| median_width(changes, id).map(|width| (id, width)))
         .collect();
     let tightest = medians
         .iter()
@@ -891,13 +934,18 @@ fn credit(changes: &[Change]) -> Vec<SourceId> {
         .map(|(id, _)| id)
         .collect()
 }
-fn median_width(changes: &[Change], id: SourceId) -> std::time::Duration {
+/// This source's median containing-bracket width, or `None` when not one of
+/// its covering children has finished yet. `None` means "no claim", never
+/// "infinitely tight": defaulting to zero would make an unfinished child the
+/// tightest thing in the window and win the stage outright.
+fn median_width(changes: &[Change], id: SourceId) -> Option<std::time::Duration> {
     let mut widths: Vec<std::time::Duration> = changes
         .iter()
-        .filter_map(|c| c.containing.iter().find(|(s, _)| *s == id).map(|(_, w)| *w))
+        .filter_map(|c| c.containing.iter().find(|(s, _)| *s == id))
+        .filter_map(|(_, width)| *width)
         .collect();
     widths.sort();
-    widths.get(widths.len() / 2).copied().unwrap_or_default()
+    widths.get(widths.len() / 2).copied()
 }
 
 /// Panes lying on a cycle of the observed graph. A merged group is one node,
@@ -1176,6 +1224,22 @@ mod tests {
         ledger.observe_bracket(bracket, &[]);
     }
 
+    /// A log holding one CLOSED bracket per (source, width) asked for, so a
+    /// ledger test can resolve widths through the same path production
+    /// uses. A `None` width leaves the child still running.
+    fn log_with(entries: &[(SourceId, BracketId, Option<Duration>)]) -> WindowLog {
+        let mut log = WindowLog::new(Duration::from_secs(30));
+        let t = Instant::now();
+        for (source, want, width) in entries {
+            let id = log.open_bracket(*source, t, Vec::new());
+            assert_eq!(id, *want, "ids are handed out in order");
+            if let Some(w) = width {
+                log.close_bracket(id, t + *w, Vec::new());
+            }
+        }
+        log
+    }
+
     fn ledger_over(paths: &[&Path]) -> PathLedger {
         PathLedger::new(paths.iter().map(PathBuf::from).collect())
     }
@@ -1210,10 +1274,11 @@ mod tests {
         let mut ledger = ledger_over(&[&f]);
         let t = Instant::now();
         touch_at(&f, mtime_base() + Duration::from_secs(1));
-        ledger.observe(t, &[(SourceId(0), Duration::from_millis(7))]);
+        let log = log_with(&[(SourceId(0), BracketId(0), Some(Duration::from_millis(7)))]);
+        ledger.observe(t, &[(SourceId(0), BracketId(0))]);
 
         assert_eq!(ledger.exogenous(&f), 0);
-        assert_eq!(ledger.changes(&f).len(), 1);
+        assert_eq!(ledger.changes(&f, &log).len(), 1);
     }
 
     #[test]
@@ -1276,11 +1341,107 @@ mod tests {
         );
 
         assert_eq!(ledger.exogenous(&f), 0);
-        let c = ledger.changes(&f);
+        let log = log_with(&[(SourceId(9), BracketId(0), Some(Duration::from_millis(9)))]);
+        let c = ledger.changes(&f, &log);
         assert_eq!(c.len(), 1);
         assert_eq!(
             c[0].containing,
-            vec![(SourceId(3), Duration::from_millis(9))]
+            vec![(SourceId(3), Some(Duration::from_millis(9)))]
+        );
+    }
+
+    #[test]
+    fn overlapping_includes_a_child_that_is_still_running() {
+        // The child most likely to have written a change is very often
+        // STILL RUNNING when another pane's bracket observes it — in a
+        // cycle that is the normal case, not the exception. Withholding
+        // open brackets dropped the true writer PERMANENTLY: the observing
+        // bracket advances the baseline, so the writer's own bracket sees
+        // no diff when it finally closes and can never claim the change.
+        // Measured on the repro: the writer covered 22 of the 50 changes to
+        // a path it had written every one of.
+        //
+        // Only the identity is taken here, never a width — an open bracket
+        // has no final width, and elapsed-so-far would credit a long child
+        // as artificially tight.
+        let mut log = WindowLog::new(Duration::from_secs(30));
+        let t = Instant::now();
+        let mine = log.open_bracket(SourceId(0), t + Duration::from_millis(10), Vec::new());
+        let running = log.open_bracket(SourceId(4), t + Duration::from_millis(11), Vec::new());
+        // Opened after this bracket closed: not running over it at all.
+        log.open_bracket(SourceId(5), t + Duration::from_millis(40), Vec::new());
+
+        let closed = log
+            .close_bracket(mine, t + Duration::from_millis(30), Vec::new())
+            .expect("still live")
+            .clone();
+        assert_eq!(
+            log.overlapping(&closed),
+            vec![(SourceId(4), running)],
+            "the child still running is named; the later one is not"
+        );
+        assert_eq!(log.width_of(running), None, "and it has no width yet");
+    }
+
+    #[test]
+    fn a_still_running_child_counts_for_coverage_but_not_for_tightness() {
+        // The asymmetry the reader route already documents, applied to this
+        // one: the veto and the coverage stage ask only WHO was in flight,
+        // which is knowable the instant it happens. Only the median-width
+        // stage needs a final width, so only it waits.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sa");
+        std::fs::write(&f, b"0").unwrap();
+        touch_at(&f, mtime_base());
+
+        let mut log = WindowLog::new(Duration::from_secs(30));
+        let t = Instant::now();
+        let done = log.open_bracket(SourceId(3), t, Vec::new());
+        log.close_bracket(done, t + Duration::from_millis(9), Vec::new());
+        let running = log.open_bracket(SourceId(1), t, Vec::new());
+
+        let mut ledger = ledger_over(&[&f]);
+        let open = stamps(std::slice::from_ref(&f));
+        touch_at(&f, mtime_base() + Duration::from_secs(1));
+        let close = stamps(std::slice::from_ref(&f));
+        ledger.observe_bracket(
+            &Bracket {
+                id: done,
+                source: SourceId(3),
+                opened: t,
+                closed: Some(t + Duration::from_millis(9)),
+                open_stamps: open,
+                close_stamps: close,
+            },
+            &[(SourceId(1), running)],
+        );
+
+        let c = ledger.changes(&f, &log);
+        assert_eq!(c.len(), 1);
+        assert_eq!(
+            c[0].containing,
+            vec![
+                (SourceId(3), Some(Duration::from_millis(9))),
+                (SourceId(1), None),
+            ],
+            "both cover it; only the finished one has a width"
+        );
+        assert_eq!(ledger.exogenous(&f), 0, "and it is not exogenous");
+
+        // Coverage counts it, tightness cannot.
+        assert_eq!(median_width(&c, SourceId(1)), None);
+        assert_eq!(
+            median_width(&c, SourceId(3)),
+            Some(Duration::from_millis(9))
+        );
+
+        // Once the child finishes, the SAME change resolves — nothing was
+        // recorded twice and nothing was lost.
+        log.close_bracket(running, t + Duration::from_millis(20), Vec::new());
+        let c = ledger.changes(&f, &log);
+        assert_eq!(
+            c[0].containing[1],
+            (SourceId(1), Some(Duration::from_millis(20)))
         );
     }
 
@@ -1317,16 +1478,20 @@ mod tests {
                 open_stamps: open,
                 close_stamps: close,
             },
-            &[(SourceId(1), Duration::from_millis(7))],
+            &[(SourceId(1), BracketId(1))],
         );
 
-        let c = ledger.changes(&f);
+        let log = log_with(&[
+            (SourceId(3), BracketId(0), Some(Duration::from_millis(9))),
+            (SourceId(1), BracketId(1), Some(Duration::from_millis(7))),
+        ]);
+        let c = ledger.changes(&f, &log);
         assert_eq!(c.len(), 1);
         assert_eq!(
             c[0].containing,
             vec![
-                (SourceId(3), Duration::from_millis(9)),
-                (SourceId(1), Duration::from_millis(7)),
+                (SourceId(3), Some(Duration::from_millis(9))),
+                (SourceId(1), Some(Duration::from_millis(7))),
             ],
             "the observing bracket first, then whoever else was running"
         );
@@ -1350,10 +1515,9 @@ mod tests {
         // Entirely after: never overlaps.
         let after = log.open_bracket(SourceId(3), t + Duration::from_millis(40), Vec::new());
         log.close_bracket(after, t + Duration::from_millis(50), Vec::new());
-        // Still running, so it has NO final width — and a provisional one
-        // would credit a long child as artificially tight, the exact
-        // mis-credit the median-width stage exists to prevent.
-        log.open_bracket(SourceId(4), t + Duration::from_millis(11), Vec::new());
+        // Still running: reported too, because it could have written the
+        // change — its WIDTH is what waits, not its identity.
+        let running = log.open_bracket(SourceId(4), t + Duration::from_millis(11), Vec::new());
 
         let closed = log
             .close_bracket(mine, t + Duration::from_millis(30), Vec::new())
@@ -1362,11 +1526,15 @@ mod tests {
         assert_eq!(
             log.overlapping(&closed),
             vec![
-                (SourceId(1), Duration::from_millis(10)),
-                (SourceId(2), Duration::from_millis(2)),
+                (SourceId(1), left),
+                (SourceId(2), inside),
+                (SourceId(4), running),
             ],
-            "never itself, never one that did not overlap, never an open one"
+            "never itself and never one that did not overlap — but a child \
+             still running is exactly the one most likely to be the writer"
         );
+        assert_eq!(log.width_of(inside), Some(Duration::from_millis(2)));
+        assert_eq!(log.width_of(running), None, "no final width yet");
     }
 
     #[test]
@@ -1389,7 +1557,7 @@ mod tests {
                 close_stamps: snap,
             },
         );
-        assert!(ledger.changes(&f).is_empty());
+        assert!(ledger.changes(&f, &log_with(&[])).is_empty());
     }
 
     #[test]
@@ -1415,11 +1583,12 @@ mod tests {
                 close_stamps: close,
             },
         );
-        assert_eq!(ledger.changes(&f).len(), 1);
+        let log = log_with(&[(SourceId(0), BracketId(0), Some(Duration::from_millis(5)))]);
+        assert_eq!(ledger.changes(&f, &log).len(), 1);
 
         ledger.observe(t + Duration::from_millis(60), &[]);
         assert_eq!(
-            ledger.changes(&f).len(),
+            ledger.changes(&f, &log).len(),
             1,
             "the same change must not be counted twice"
         );
@@ -1758,13 +1927,14 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// `n` changes, each covered by the given (source, width) pairs.
+    /// `n` changes, each covered by the given (source, width) pairs — all
+    /// of them finished, which is the ordinary case by evaluation time.
     fn changes_all(n: usize, containing: &[(SourceId, Duration)]) -> Vec<Change> {
-        let t = Instant::now();
+        let resolved: Vec<(SourceId, Option<Duration>)> =
+            containing.iter().map(|(s, w)| (*s, Some(*w))).collect();
         (0..n)
-            .map(|i| Change {
-                at: t + ms(i as u64),
-                containing: containing.to_vec(),
+            .map(|_| Change {
+                containing: resolved.clone(),
             })
             .collect()
     }
@@ -1831,12 +2001,32 @@ mod tests {
         }
     }
 
-    /// A ledger holding exactly the changes given, with no filesystem.
-    fn ledger_with(entries: &[(&std::path::Path, Vec<Change>)]) -> PathLedger {
+    /// A ledger holding exactly the changes given, with no filesystem. Each
+    /// covering child becomes a REAL bracket in `log` of the width asked
+    /// for — a `None` width leaves it running — so the fixtures resolve
+    /// through the same path production does rather than around it.
+    fn ledger_with(log: &mut WindowLog, entries: &[(&std::path::Path, Vec<Change>)]) -> PathLedger {
         let mut ledger = PathLedger::new(Vec::new());
+        let t = Instant::now();
+        let mut ids: std::collections::HashMap<(usize, Option<Duration>), BracketId> =
+            std::collections::HashMap::new();
         for (path, changes) in entries {
             for change in changes {
-                ledger.inject(path, change.at, change.containing.clone());
+                let containing: Vec<(SourceId, BracketId)> = change
+                    .containing
+                    .iter()
+                    .map(|(source, width)| {
+                        let id = *ids.entry((source.0, *width)).or_insert_with(|| {
+                            let id = log.open_bracket(*source, t, Vec::new());
+                            if let Some(w) = width {
+                                log.close_bracket(id, t + *w, Vec::new());
+                            }
+                            id
+                        });
+                        (*source, id)
+                    })
+                    .collect();
+                ledger.inject(path, t, containing);
             }
         }
         ledger
@@ -1849,8 +2039,11 @@ mod tests {
         let a = std::path::PathBuf::from("/sa");
         let b = std::path::PathBuf::from("/sb");
         let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
-        let ledger = ledger_with(&[(&a, changes_all(10, &both)), (&b, changes_all(10, &both))]);
-        let log = WindowLog::new(secs(30));
+        let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(
+            &mut log,
+            &[(&a, changes_all(10, &both)), (&b, changes_all(10, &both))],
+        );
         let (wa, wb) = (vec![a.clone()], vec![b.clone()]);
         let none: Vec<TriggerKey> = Vec::new();
         let panes = [pane(0, &wa, &none), pane(1, &wb, &none)];
@@ -1866,8 +2059,8 @@ mod tests {
         // a claim the observation cannot support.
         let a = std::path::PathBuf::from("/sa");
         let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
-        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
-        let log = WindowLog::new(secs(30));
+        let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(&mut log, &[(&a, changes_all(10, &both))]);
         let wa = vec![a.clone()];
         let none: Vec<TriggerKey> = Vec::new();
         let panes = [pane(0, &wa, &none), pane(1, &wa, &none)];
@@ -1883,8 +2076,11 @@ mod tests {
         // Pane 0 writes /data; pane 1 watches it; nobody writes anything of
         // pane 0's.
         let data = std::path::PathBuf::from("/data");
-        let ledger = ledger_with(&[(&data, changes_all(10, &[(SourceId(0), ms(6))]))]);
-        let log = WindowLog::new(secs(30));
+        let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(
+            &mut log,
+            &[(&data, changes_all(10, &[(SourceId(0), ms(6))]))],
+        );
         let watched1 = vec![data.clone()];
         let watched0: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/upstream")];
         let none: Vec<TriggerKey> = Vec::new();
@@ -1910,14 +2106,17 @@ mod tests {
         // on purpose, so only the credit rule can save it.
         let d1 = std::path::PathBuf::from("/d1"); // A writes, B watches
         let d2 = std::path::PathBuf::from("/d2"); // B writes, C watches
-        let ledger = ledger_with(&[
-            (&d1, changes_all(10, &[(SourceId(0), ms(168))])),
-            (
-                &d2,
-                changes_all(10, &[(SourceId(0), ms(168)), (SourceId(1), ms(6))]),
-            ),
-        ]);
-        let log = WindowLog::new(secs(30));
+        let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(
+            &mut log,
+            &[
+                (&d1, changes_all(10, &[(SourceId(0), ms(168))])),
+                (
+                    &d2,
+                    changes_all(10, &[(SourceId(0), ms(168)), (SourceId(1), ms(6))]),
+                ),
+            ],
+        );
         let (wa, wb, wc) = (
             vec![std::path::PathBuf::from("/upstream")],
             vec![d1.clone()],
@@ -1945,8 +2144,8 @@ mod tests {
         // count stays zero however fast it runs.
         let a = std::path::PathBuf::from("/sa");
         let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
-        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
-        let log = WindowLog::new(secs(30));
+        let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(&mut log, &[(&a, changes_all(10, &both))]);
         let wa = vec![a.clone()];
         let none: Vec<TriggerKey> = Vec::new();
         let mut slow = pane(0, &wa, &none);
@@ -1964,11 +2163,10 @@ mod tests {
         let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
         let mut changes = changes_all(10, &both);
         changes.push(Change {
-            at: Instant::now(),
             containing: Vec::new(), // nothing in flight: an outside writer
         });
-        let ledger = ledger_with(&[(&a, changes)]);
-        let log = WindowLog::new(secs(30));
+        let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(&mut log, &[(&a, changes)]);
         let wa = vec![a.clone()];
         let none: Vec<TriggerKey> = Vec::new();
         let panes = [pane(0, &wa, &none), pane(1, &wa, &none)];
@@ -1996,8 +2194,8 @@ mod tests {
         // cycle observations, with brackets that nearly fill the window.
         let a = std::path::PathBuf::from("/sa");
         let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
-        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
         let mut log = WindowLog::new(secs(10));
+        let ledger = ledger_with(&mut log, &[(&a, changes_all(10, &both))]);
         let t0 = Instant::now();
         let id = log.open_bracket(SourceId(0), t0, Vec::new());
         log.close_bracket(id, t0 + secs(9), Vec::new());
@@ -2016,8 +2214,8 @@ mod tests {
         // the veto cannot be trusted for this window.
         let a = std::path::PathBuf::from("/sa");
         let both = [(SourceId(0), ms(22)), (SourceId(1), ms(24))];
-        let ledger = ledger_with(&[(&a, changes_all(10, &both))]);
         let mut log = WindowLog::new(secs(30));
+        let ledger = ledger_with(&mut log, &[(&a, changes_all(10, &both))]);
         let t0 = Instant::now();
         log.record_overflow(t0);
 

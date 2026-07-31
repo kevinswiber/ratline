@@ -816,7 +816,7 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        "trigger loop suspected:".as_bytes(),
+        "a, b: trigger loop suspected:".as_bytes(),
         Duration::from_secs(40),
     );
     session.write_bytes(b"q");
@@ -833,10 +833,10 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
         contains(&seen, b"file:") && contains(&seen, b"? help"),
         "the notice must name the watched paths and where to read more"
     );
-    // NOTE: the needle is deliberately not `a, b:`. The report names
-    // whichever panes the verdict implicates, and today's verdict does
-    // NOT reliably name both panes of a two-pane cycle — it oscillates
-    // with the parity of the change count, for a reason that lives in
-    // the credit rule rather than in these two surfaces. Asserting the
-    // full set here would be asserting a fix that has not been made.
+    // The needle names BOTH panes on purpose. A report that names half a
+    // cycle is the failure this suite exists to catch, and it took two
+    // goes to earn: crediting a change only to the bracket that observed
+    // it left the true writer uncredited, so the report named whichever
+    // pane happened to overlap more. Weakening this needle would let that
+    // back in silently.
 }
