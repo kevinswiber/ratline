@@ -24,7 +24,7 @@ use crate::core::duration::parse_interval;
 use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
-use crate::core::registry::{Composition, PaneGeometry, Registry, SourceId, SourceSpec};
+use crate::core::registry::{Composition, Overflow, PaneGeometry, Registry, SourceId, SourceSpec};
 use crate::core::retain::Keep;
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
@@ -459,14 +459,12 @@ pub(crate) fn run_registry(
                     let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
                     runtime[id.0].bracket = Some(opened);
                 }
-                // One fixed policy for every source until the pane's own
-                // direction resolves it — both spawn paths must carry
-                // the SAME one, or a test would prove something the
-                // binary does not do.
-                let retention = Retention {
-                    max_lines: 1000,
-                    keep: Keep::Bottom,
-                };
+                // Resolved once per spawn and shared by both paths: two
+                // resolutions are two chances to disagree, and the
+                // threaded path and the inline fallback disagreeing is
+                // how a test ends up proving something the binary does
+                // not do.
+                let retention = retention_for(&registry, id);
                 let mut inline = session.once && plain;
                 if !inline {
                     let command =
@@ -2215,6 +2213,38 @@ fn build_source_command(
     command
 }
 
+/// How many lines any one source retains.
+///
+/// Measured rather than picked: a thousand lines is about 2% of a loop
+/// slice to diff and some 76 KB of memory — three orders of magnitude
+/// above any pane's height, and three below the point where a single
+/// emission eats a whole slice. It is not declarable per pane, and that
+/// is deliberate: a bound nobody has hit does not need a knob, and
+/// adding one later is additive where removing one is not.
+const MAX_RETAINED_LINES: usize = 1000;
+
+/// The policy for one source: how much it retains, and which end.
+///
+/// **This is the one place the declaration's vocabulary and the
+/// worker's meet.** The worker knows nothing about panes, so the
+/// mapping cannot live there; the loop knows both, so it lives here.
+///
+/// A source with no pane box is `rat watch`, which has no declared
+/// overflow at all. It keeps the tail — a watch is for what its command
+/// is printing now, and its frame is already a tail with scrollback
+/// behind it. Note that this is a visible change for a watch whose
+/// command floods: it used to retain everything.
+fn retention_for(registry: &Registry, id: SourceId) -> Retention {
+    let keep = match registry.pane(id).map(|pane| pane.overflow) {
+        Some(Overflow::KeepTop) => Keep::Top,
+        Some(Overflow::KeepBottom) | None => Keep::Bottom,
+    };
+    Retention {
+        max_lines: MAX_RETAINED_LINES,
+        keep,
+    }
+}
+
 /// `build_source_command` plus the pane identity, which only exists
 /// under a declared layout: `Registry::pane` answers `None` without
 /// one, so no RAT_PANE is ever exported to a plain watch child.
@@ -3388,6 +3418,88 @@ mod tests {
             compose_frame(Some(&title), b"a\nb\n", b"boom\n", false),
             vec!["T", "a", "b"]
         );
+    }
+
+    /// Two panes that disagree about which end they keep, so one
+    /// registry exercises both mappings.
+    fn panes_keeping_opposite_ends() -> Registry {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let spec = |name: &str| SourceSpec {
+            name: name.to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval: Some(Duration::from_secs(3600)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+        };
+        let pane = |overflow| PaneBox {
+            height: 5,
+            width: PaneWidth::Weight(1),
+            overflow,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: true,
+        };
+        Registry::panes(
+            vec![spec("tail"), spec("head")],
+            vec![pane(Overflow::KeepBottom), pane(Overflow::KeepTop)],
+            LayoutNode::Column(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            0,
+            0,
+        )
+        .expect("a valid two-pane registry")
+    }
+
+    #[test]
+    fn a_keep_bottom_pane_retains_its_tail() {
+        let registry = panes_keeping_opposite_ends();
+        assert_eq!(retention_for(&registry, SourceId(0)).keep, Keep::Bottom);
+    }
+
+    #[test]
+    fn a_keep_top_pane_retains_its_head() {
+        // The default overflow, so this is the common case and it must
+        // not be an afterthought.
+        let registry = panes_keeping_opposite_ends();
+        assert_eq!(retention_for(&registry, SourceId(1)).keep, Keep::Top);
+    }
+
+    #[test]
+    fn every_source_gets_a_bound_and_none_is_unbounded() {
+        // The property that closes the issue: no configuration reaches
+        // the worker without one.
+        let registry = panes_keeping_opposite_ends();
+        for id in registry.ids() {
+            assert!(retention_for(&registry, id).max_lines > 0);
+        }
+    }
+
+    #[test]
+    fn a_watch_session_with_no_pane_still_gets_a_policy() {
+        // `rat watch` builds a single-source registry with no pane box,
+        // so the lookup finds nothing. It must neither panic nor fall
+        // back to unbounded — and it keeps the tail, because a watch is
+        // for what its command is printing now.
+        let registry = Registry::single(
+            SourceSpec {
+                name: "watch".to_string(),
+                command: vec!["true".to_string()],
+                shell: false,
+                interval: Some(Duration::from_secs(2)),
+                triggers: Vec::new(),
+                debounce: Duration::from_millis(250),
+            },
+            None,
+        );
+        assert!(registry.pane(SourceId(0)).is_none());
+        let r = retention_for(&registry, SourceId(0));
+        assert_eq!(r.keep, Keep::Bottom);
+        assert!(r.max_lines > 0);
     }
 
     #[test]

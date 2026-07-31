@@ -52,9 +52,6 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Keep {
     /// Keep the oldest lines; discard everything after the bound.
-    // Reached once a pane's declared overflow direction chooses it; for
-    // now only the tests do.
-    #[cfg_attr(not(test), allow(dead_code))]
     Top,
     /// Keep the newest lines; evict the oldest to make room.
     Bottom,
