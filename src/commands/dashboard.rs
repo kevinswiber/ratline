@@ -63,5 +63,144 @@ fn pane_help(registry: &Registry) -> Vec<String> {
             lines.push(format!("      {trigger}"));
         }
     }
+    if registry
+        .ids()
+        .any(|id| !registry.spec(id).triggers.is_empty())
+    {
+        lines.extend(LOOPING_HELP.iter().map(|l| (*l).to_string()));
+    }
     lines
+}
+
+/// What `· looping` means, and what to do about it.
+///
+/// **Static, and it does not name the looping panes.** `pane_help` is
+/// called once at startup and its result is stored in the session, so
+/// `?` cannot report live state without making help dynamic — a bigger
+/// change than this earns. The live naming is the notice row's job; it
+/// already names the panes and the paths. This is a deliberate
+/// departure from the sketch, which showed `?` listing the specific
+/// panes, and it is recorded here so it does not read as an oversight.
+///
+/// The last sentence is the load-bearing one and is not guessable:
+/// `fingerprint` is mtime-only, so a command that rewrites a file with
+/// identical bytes still fires the trigger. Guarding the *change*
+/// rather than the *write* is the mistake that produces exactly this
+/// badge, and it is a real reported confusion elsewhere, not a
+/// hypothetical one.
+///
+/// Wrapped by hand: `?` pages plain grouped text through the pager, so
+/// there is no wrapping engine to lean on, and nothing here may exceed
+/// the width the key table already sets.
+const LOOPING_HELP: &[&str] = &[
+    "",
+    "  looping panes:",
+    "    A pane marked `· looping` is still running — nothing has been",
+    "    stopped. rat cannot see who writes a file, only that a watched",
+    "    path changes while the dashboard is busy and never while it is",
+    "    idle, which is what a pane whose own command touches another",
+    "    pane's trigger looks like.",
+    "",
+    "    The fix is in the declaration: give the command a guard so it",
+    "    writes only when the content changed, or point the trigger at a",
+    "    path no pane writes. A trigger fires on mtime, not on content,",
+    "    so writing identical bytes still fires — the guard has to skip",
+    "    the write, not just the change.",
+];
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::core::box_model::{BorderPreset, Sides};
+    use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth, SourceId, SourceSpec};
+    use crate::core::trigger::TriggerSpec;
+
+    fn registry(triggers: bool) -> Registry {
+        let spec = |name: &str, path: &str| SourceSpec {
+            name: name.to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval: (!triggers).then(|| Duration::from_secs(5)),
+            triggers: if triggers {
+                vec![TriggerSpec::File(std::path::PathBuf::from(path))]
+            } else {
+                Vec::new()
+            },
+            debounce: Duration::from_millis(250),
+        };
+        let pane = || PaneBox {
+            height: 5,
+            width: PaneWidth::Weight(1),
+            overflow: Overflow::KeepTop,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: true,
+        };
+        Registry::panes(
+            vec![spec("a", "./sa"), spec("b", "./sb")],
+            vec![pane(), pane()],
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            1,
+            0,
+        )
+        .expect("a valid two-pane registry")
+    }
+
+    #[test]
+    fn the_help_explains_the_badge_and_names_the_fix() {
+        // De-wrapped before matching. The section is wrapped by hand,
+        // so a phrase the reader sees as one sentence can straddle a
+        // line break — asserting on the wrapped bytes would pin the
+        // wrap POINTS rather than the claim, and would fail on any
+        // future rewrap that changed nothing a user can perceive. The
+        // width is pinned separately, below, because that is a
+        // different property.
+        let lines = pane_help(&registry(true));
+        let text = lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        assert!(text.contains("looping"), "got {text}");
+        // The two facts a user cannot guess: that the pane was left
+        // running, and that a trigger fires on the timestamp rather
+        // than on the bytes — so writing identical content still fires.
+        assert!(text.contains("nothing has been stopped"), "got {text}");
+        assert!(text.contains("mtime, not on content"), "got {text}");
+    }
+
+    #[test]
+    fn the_help_stays_inside_the_width_the_key_table_already_sets() {
+        // `?` pages plain grouped text through the pager with no
+        // wrapping engine behind it, so a line wider than the shipped
+        // key table is one the pager has to chop. 74 is the widest row
+        // that ships (`p  freeze the frame in place …`); this section
+        // may reach it and must not pass it.
+        for line in pane_help(&registry(true)) {
+            assert!(
+                line.chars().count() <= 74,
+                "{} cells: {line:?}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_is_unchanged_when_no_pane_has_a_trigger() {
+        // Byte-identity for the common case, asserted against the
+        // literal shipped block rather than against a recomputation of
+        // it: a dashboard with no triggers gains no help text at all,
+        // and cannot gain any by a later edit without failing here.
+        assert_eq!(
+            pane_help(&registry(false)),
+            vec![
+                String::new(),
+                "  panes:".to_string(),
+                "    a  every 5s".to_string(),
+                "    b  every 5s".to_string(),
+            ]
+        );
+    }
 }
