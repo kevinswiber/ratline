@@ -4,9 +4,22 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run this workflow on demand, against any ref. Without it, a branch has
+  # no way to reach CI at all — push only fires on main, so the only other
+  # vehicle is opening a pull request.
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# Supersede a pull request's own earlier runs, so pushing a correction does
+# not leave a stale three-OS run grinding beside it. Keyed on the branch for
+# a pull request and on the run id otherwise, which means pushes to main
+# never cancel each other: every commit on main gets its own verdict, and
+# the release flow depends on that being true.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
