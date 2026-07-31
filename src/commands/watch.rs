@@ -419,6 +419,17 @@ pub(crate) fn run_registry(
                 // tick. It stays a single-source detour: N sources run
                 // inline would cost the sum of their runtimes, not the
                 // max.
+                // The bracket opens BEFORE the child does. Stamping after
+                // the spawn is a race the child usually loses but need not:
+                // a write landing before the opening stamp is taken is
+                // invisible to that bracket — its two snapshots agree — and
+                // the next idle poll then reports the change as EXOGENOUS,
+                // which vetoes the very pane that made it. Opening early
+                // can only widen the window, never lose a write.
+                if !watched_union.is_empty() {
+                    let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
+                    runtime[id.0].bracket = Some(opened);
+                }
                 let mut inline = session.once && plain;
                 if !inline {
                     let command =
@@ -438,12 +449,6 @@ pub(crate) fn run_registry(
                     let _ = runtime[id.0]
                         .tx
                         .send(run_tick(command, id, watched_union.clone()));
-                }
-                // The bracket opens with the child: this instant, and the
-                // union as it stands before the child can touch it.
-                if !watched_union.is_empty() {
-                    let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
-                    runtime[id.0].bracket = Some(opened);
                 }
             }
         }
@@ -543,7 +548,7 @@ pub(crate) fn run_registry(
             // at an instant.
             if let Some(open) = r.bracket.take()
                 && let Some(closed) = log
-                    .close_bracket(open, Instant::now(), outcome.close_stamps)
+                    .close_bracket(open, outcome.closed_at, outcome.close_stamps)
                     .cloned()
             {
                 let others = log.overlapping(&closed);
