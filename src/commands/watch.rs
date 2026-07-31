@@ -75,6 +75,10 @@ struct Live {
     /// chrome-bearing pane's last-change time. `None` under a plain
     /// watch, forever.
     panes: Option<PaneLive>,
+    /// What this frame's tick discarded, for the status row. Only the
+    /// plain path sets it: a pane surface says so on the pane itself,
+    /// where the reader can tell WHICH pane overflowed.
+    dropped: Option<String>,
 }
 
 /// A composed frame's retained pane surface.
@@ -344,6 +348,7 @@ pub(crate) fn run_registry(
                 previous: None,
                 marks: Vec::new(),
                 failure: None,
+                truncated: None,
                 posted: false,
                 gate: DebounceGate::new(spec.debounce),
                 files,
@@ -502,6 +507,10 @@ pub(crate) fn run_registry(
         let mut changed: Option<jiff::Timestamp> = None;
         let mut newest = jiff::Timestamp::UNIX_EPOCH;
         let mut piped_stderr: Vec<u8> = Vec::new();
+        // A piped plain run has no status row to carry the marker, and
+        // its stdout is somebody's data — so this rides stderr, beside
+        // where a spawn error already goes.
+        let mut piped_dropped: Option<String> = None;
         while let Ok(outcome) = rx.try_recv() {
             let id = outcome.source;
             let changed_now = match registry.composition() {
@@ -534,8 +543,18 @@ pub(crate) fn run_registry(
                         // composer collapses.
                         None => (outcome.stdout.concat(), outcome.stderr.concat()),
                     };
+                    let truncated = dropped_badge(outcome.dropped);
                     let mut combined = stdout.clone();
                     combined.extend_from_slice(&stderr);
+                    // The marker joins the frame's change key for the
+                    // same reason a pane's badge joins its pane's: a
+                    // command can print an identical tail and start
+                    // dropping, and a marker nothing repaints is a
+                    // marker nobody sees.
+                    if let Some(truncated) = &truncated {
+                        combined.push(b'\n');
+                        combined.extend_from_slice(truncated.as_bytes());
+                    }
                     let hash = signature(&combined);
                     let r = &mut runtime[id.0];
                     let changed_now = hash != r.hash || !r.posted;
@@ -545,6 +564,10 @@ pub(crate) fn run_registry(
                     r.output = Some(compose_frame(title_line.as_ref(), &stdout, &stderr, is_tty));
                     r.hash = hash;
                     r.changed_at = outcome.at;
+                    // Derived per outcome, exactly as a pane's badge is:
+                    // a command that stops flooding stops saying so.
+                    r.truncated = truncated.clone();
+                    piped_dropped = truncated;
                     piped_stderr = stderr;
                     changed_now
                 }
@@ -571,6 +594,7 @@ pub(crate) fn run_registry(
                     let old_hash = r.hash;
                     let was_posted = r.posted;
                     r.failure = exit_badge(outcome.status);
+                    r.truncated = dropped_badge(outcome.dropped);
                     record_output(r, lines, outcome.at);
                     r.hash != old_hash || !was_posted
                 }
@@ -659,6 +683,12 @@ pub(crate) fn run_registry(
                 changed_at,
                 since,
                 panes,
+                // Plain only: under panes the marker is on the pane that
+                // overflowed, which is the question a reader would ask.
+                dropped: match registry.composition() {
+                    Composition::Plain { .. } => runtime[0].truncated.clone(),
+                    Composition::Panes { .. } => None,
+                },
             };
             if is_tty {
                 // Every distinct frame is retained (byte-capped,
@@ -734,6 +764,18 @@ pub(crate) fn run_registry(
                     if plain && !piped_stderr.is_empty() {
                         let mut err = std::io::stderr().lock();
                         err.write_all(&piped_stderr).context("writing stderr")?;
+                        err.flush().context("flushing stderr")?;
+                    }
+                    // A drop is never silent. There is no status row
+                    // here to carry it and stdout belongs to whoever is
+                    // reading the data, so it goes where a diagnostic
+                    // goes. A plain watch always keeps the newest, so
+                    // naming which end survived costs one clause and
+                    // saves a guess.
+                    if plain && let Some(text) = &piped_dropped {
+                        let mut err = std::io::stderr().lock();
+                        writeln!(err, "rat watch: {text}; kept the last {MAX_RETAINED_LINES}")
+                            .context("writing stderr")?;
                         err.flush().context("flushing stderr")?;
                     }
                 }
@@ -1818,9 +1860,39 @@ fn help_lines(heading: &str, extra: &[String]) -> Vec<String> {
             .map(str::to_string),
         )
         .collect();
+    lines.extend(RETENTION_HELP.iter().map(|l| (*l).to_string()));
     lines.extend(extra.iter().cloned());
     lines
 }
+
+/// What `1.2k lines dropped` means.
+///
+/// Both commands bound what they retain, so this rides the shared
+/// reference rather than a per-command section. Two facts here are not
+/// guessable from the marker: the command was never stopped or slowed —
+/// rat reads to the end and stops KEEPING, which is what stops a child
+/// blocking on a pipe nobody drains — and WHICH end survives is the
+/// pane's own declaration, so a reader looking at a head where they
+/// wanted a tail is looking at a declaration, not a fault.
+///
+/// Wrapped by hand: `?` pages plain grouped text through the pager, so
+/// there is no wrapping engine to lean on, and nothing here may exceed
+/// the width the key table already sets.
+const RETENTION_HELP: &[&str] = &[
+    "",
+    "  dropped lines:",
+    "    A command keeps at most 1000 lines per run. Past that, the",
+    "    marker `1.2k lines dropped` says how many did not survive —",
+    "    on the pane that overflowed, or on the status row of a plain",
+    "    watch.",
+    "",
+    "    Nothing is stopped or slowed to make that happen: rat reads",
+    "    the command's output to the end and stops KEEPING, so a child",
+    "    never blocks writing into a pipe nobody is draining. Which",
+    "    end survives is the pane's `overflow` — the head by default,",
+    "    the tail where declared, and the tail always for a plain",
+    "    watch.",
+];
 
 /// Watch's slice of the key reference: the trigger sources it was
 /// started with. Empty when none are configured, so the reference
@@ -1857,13 +1929,24 @@ fn live_suffix(once: bool, interval: Option<&str>, triggered: bool) -> String {
 }
 
 /// The live status row: the truncation notice when rows are hidden,
-/// carrying the pre-formatted time segment.
-fn live_notice(hidden: usize, time_seg: &str) -> String {
-    if hidden > 0 {
+/// carrying the pre-formatted time segment, and the retention marker
+/// when the last tick outran what is kept.
+///
+/// The two say different things and both can be true at once. `… N more
+/// lines` is about this VIEWPORT — the rows exist and scrolling reaches
+/// them. `N lines dropped` is about the CONTENT — those lines are gone
+/// and no key will bring them back.
+fn live_notice(hidden: usize, time_seg: &str, dropped: Option<&str>) -> String {
+    let mut row = if hidden > 0 {
         format!("… {hidden} more lines · {time_seg}")
     } else {
         time_seg.to_string()
+    };
+    if let Some(dropped) = dropped {
+        row.push_str(" · ");
+        row.push_str(dropped);
     }
+    row
 }
 
 /// The consolidated in-place paint: build the key for the current
@@ -1962,6 +2045,7 @@ fn repaint(
         &time_paused,
         marks.as_deref(),
         &mark_cell,
+        live.dropped.as_deref(),
     )?;
     Ok(key)
 }
@@ -2019,6 +2103,7 @@ fn paint_frame(
     time_paused: &str,
     marks: Option<&[LineMark]>,
     mark_cell: &str,
+    dropped: Option<&str>,
 ) -> anyhow::Result<()> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
@@ -2077,7 +2162,7 @@ fn paint_frame(
     let status = match mode {
         FrameMode::Paused => paused_notice(time_paused, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => scrolled_notice(offset, kept.len(), lines.len()),
-        FrameMode::Live => live_notice(hidden, time_live),
+        FrameMode::Live => live_notice(hidden, time_live, dropped),
     };
     kept.push(faint.render(&status, profile));
     if let Some(text) = notice {
@@ -2222,6 +2307,33 @@ fn build_source_command(
 /// is deliberate: a bound nobody has hit does not need a knob, and
 /// adding one later is additive where removing one is not.
 const MAX_RETAINED_LINES: usize = 1000;
+
+/// What a tick discarded, said out loud, or `None` when it kept
+/// everything.
+///
+/// **A LINE count, never a byte figure**, because the bound is a line
+/// count — a size here would describe a limit that does not exist.
+/// Derived per outcome exactly as the exit badge is, so it clears by
+/// itself: a pane that stops flooding stops accusing itself.
+///
+/// Large counts are the normal case for anything that trips this, so
+/// the number is abbreviated to keep the marker inside a chrome row
+/// that is already carrying two other badges.
+fn dropped_badge(dropped: usize) -> Option<String> {
+    (dropped > 0).then(|| format!("{} lines dropped", compact_count(dropped)))
+}
+
+/// `90`, `1.2k`, `2.5M` — one significant decimal, and no rounding up
+/// into a unit the count has not reached.
+fn compact_count(n: usize) -> String {
+    const K: usize = 1_000;
+    const M: usize = 1_000_000;
+    match n {
+        n if n < K => n.to_string(),
+        n if n < M => format!("{}.{}k", n / K, (n % K) / 100),
+        n => format!("{}.{}M", n / M, (n % M) / 100_000),
+    }
+}
 
 /// The policy for one source: how much it retains, and which end.
 ///
@@ -2590,7 +2702,12 @@ fn exit_badge(status: Option<std::process::ExitStatus>) -> Option<String> {
 /// the badges in the pane's own hash, the composition would carry a
 /// badge nothing ever paints. The combining key stays outcome-derived
 /// and geometry-free.
-fn body_signature(lines: &[String], failure: Option<&str>, looping: bool) -> u64 {
+fn body_signature(
+    lines: &[String],
+    failure: Option<&str>,
+    looping: bool,
+    truncated: Option<&str>,
+) -> u64 {
     let mut bytes = lines.join("\n").into_bytes();
     if let Some(failure) = failure {
         bytes.push(b'\n');
@@ -2599,6 +2716,10 @@ fn body_signature(lines: &[String], failure: Option<&str>, looping: bool) -> u64
     if looping {
         bytes.push(b'\n');
         bytes.extend_from_slice(b"looping");
+    }
+    if let Some(truncated) = truncated {
+        bytes.push(b'\n');
+        bytes.extend_from_slice(truncated.as_bytes());
     }
     signature(&bytes)
 }
@@ -2611,9 +2732,14 @@ fn body_signature(lines: &[String], failure: Option<&str>, looping: bool) -> u64
 /// switched on, and per-pane diffs are strictly less work than the
 /// composed diff they replace.
 fn record_output(r: &mut SourceRuntime, lines: Vec<String>, at: jiff::Timestamp) {
-    // Both badges are part of what the pane displays, so they join this
-    // pane's hash: a badge that cannot repaint is invisible.
-    let hash = body_signature(&lines, r.failure.as_deref(), r.looping);
+    // Every badge is part of what the pane displays, so they all join
+    // this pane's hash: a badge that cannot repaint is invisible.
+    let hash = body_signature(
+        &lines,
+        r.failure.as_deref(),
+        r.looping,
+        r.truncated.as_deref(),
+    );
     if r.output.is_none() || r.hash != hash {
         r.previous = r.output.take();
         r.marks = changed_marks(r.previous.as_deref(), &lines);
@@ -2811,6 +2937,7 @@ fn compose_sources(
                 stamp: &stamp,
                 failure: source.failure.as_deref(),
                 looping: source.looping,
+                truncated: source.truncated.as_deref(),
             };
             render_pane(
                 source.output.as_deref().unwrap_or(&[]),
@@ -2899,6 +3026,11 @@ struct SourceRuntime {
     marks: Vec<LineMark>,
     /// The chrome row's failure badge ("exit 3"), derived per outcome.
     failure: Option<String>,
+    /// The chrome row's truncation marker ("1.2k lines dropped"), also
+    /// derived per outcome, so a pane that stops flooding stops saying
+    /// so. On the plain path this is what the status row and the piped
+    /// run's stderr report instead.
+    truncated: Option<String>,
     /// Whether this source has completed at least once — the once-mode
     /// exit condition at N sources.
     posted: bool,
@@ -3185,10 +3317,26 @@ mod tests {
 
     #[test]
     fn the_live_rows_carry_the_time_segment() {
-        assert_eq!(live_notice(0, "since 18:47:53"), "since 18:47:53");
+        assert_eq!(live_notice(0, "since 18:47:53", None), "since 18:47:53");
         assert_eq!(
-            live_notice(8, "changed 14s ago"),
+            live_notice(8, "changed 14s ago", None),
             "… 8 more lines · changed 14s ago"
+        );
+    }
+
+    #[test]
+    fn the_live_row_says_when_lines_were_dropped() {
+        // A plain watch has no chrome row, so this is its surface. The
+        // two counts mean different things and both can show at once:
+        // the hidden rows are still there and scrolling reaches them,
+        // the dropped ones are gone for good.
+        assert_eq!(
+            live_notice(0, "since 18:47:53", Some("2.0k lines dropped")),
+            "since 18:47:53 · 2.0k lines dropped"
+        );
+        assert_eq!(
+            live_notice(8, "since 18:47:53", Some("2.0k lines dropped")),
+            "… 8 more lines · since 18:47:53 · 2.0k lines dropped"
         );
     }
 
@@ -3456,6 +3604,41 @@ mod tests {
     }
 
     #[test]
+    fn a_truncated_pane_carries_a_marker_and_an_untruncated_one_does_not() {
+        // Both directions, because the marker must not be sticky: a pane
+        // that stops flooding would otherwise keep accusing itself. It is
+        // derived per outcome, exactly as the exit badge is, so a tick
+        // that fits produces nothing.
+        assert_eq!(dropped_badge(0), None);
+        assert_eq!(dropped_badge(90).as_deref(), Some("90 lines dropped"));
+        assert_eq!(
+            dropped_badge(1_234).as_deref(),
+            Some("1.2k lines dropped"),
+            "a flood's count has to fit a chrome row"
+        );
+        assert_eq!(
+            dropped_badge(2_500_000).as_deref(),
+            Some("2.5M lines dropped")
+        );
+    }
+
+    #[test]
+    fn the_marker_joins_the_panes_change_signature() {
+        // Or the composition carries a marker nothing ever repaints —
+        // the bug the looping badge already hit once.
+        let lines = vec!["a".to_string()];
+        assert_ne!(
+            body_signature(&lines, None, false, None),
+            body_signature(&lines, None, false, Some("90 lines dropped")),
+        );
+        // And a pane can be failing, looping and truncated at once.
+        assert_ne!(
+            body_signature(&lines, Some("exit 3"), true, None),
+            body_signature(&lines, Some("exit 3"), true, Some("90 lines dropped")),
+        );
+    }
+
+    #[test]
     fn a_keep_bottom_pane_retains_its_tail() {
         let registry = panes_keeping_opposite_ends();
         assert_eq!(retention_for(&registry, SourceId(0)).keep, Keep::Bottom);
@@ -3641,6 +3824,7 @@ mod tests {
             previous: None,
             marks: Vec::new(),
             failure: None,
+            truncated: None,
             posted: false,
             looping: false,
             bracket: None,
@@ -3833,33 +4017,42 @@ mod tests {
         // the composition would carry a badge nothing ever paints.
         let body = vec!["steady".to_string()];
         assert_ne!(
-            body_signature(&body, None, false),
-            body_signature(&body, Some("exit 3"), false)
+            body_signature(&body, None, false, None),
+            body_signature(&body, Some("exit 3"), false, None)
         );
     }
 
     #[test]
-    fn the_looping_badge_is_in_the_change_signature_too() {
-        // Both badges are chrome, and both are part of what the pane
-        // DISPLAYS — so both are in its hash, independently. All four
-        // combinations must be distinct: sharing a slot would let one
-        // badge mask the other's arrival.
+    fn every_badge_is_in_the_change_signature_independently() {
+        // The badges are chrome, and all of them are part of what the
+        // pane DISPLAYS — so each is in its hash on its own. Every
+        // combination of the three must be distinct: two sharing a slot
+        // would let one badge mask another's arrival, and enumerating
+        // the whole space is the only way to see that, since a list of
+        // the pairs someone thought of cannot find the pair they did
+        // not.
         let body = vec!["steady".to_string()];
-        let all = [
-            body_signature(&body, None, false),
-            body_signature(&body, None, true),
-            body_signature(&body, Some("exit 3"), false),
-            body_signature(&body, Some("exit 3"), true),
-        ];
+        let all: Vec<u64> = [None, Some("exit 3")]
+            .into_iter()
+            .flat_map(|failure| {
+                [false, true].into_iter().flat_map(move |looping| {
+                    [None, Some("90 lines dropped")]
+                        .into_iter()
+                        .map(move |truncated| (failure, looping, truncated))
+                })
+            })
+            .map(|(failure, looping, truncated)| body_signature(&body, failure, looping, truncated))
+            .collect();
+        assert_eq!(all.len(), 8, "the whole space, not a sample");
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a, b, "combination {i} collides");
             }
         }
-        // And the badge CLEARS back to the un-badged signature. A hash
+        // And a badge CLEARS back to the un-badged signature. A hash
         // that only ever moved forward would repaint the badge's
         // arrival and then leave it on screen for good.
-        assert_eq!(body_signature(&body, None, false), all[0]);
+        assert_eq!(body_signature(&body, None, false, None), all[0]);
     }
 
     #[test]
@@ -4028,6 +4221,7 @@ mod tests {
                 marks: Vec::new(),
                 changed_at: jiff::Timestamp::now(),
                 failure: None,
+                truncated: None,
                 posted: false,
                 looping: false,
                 bracket: None,
@@ -4348,6 +4542,7 @@ mod tests {
             changed_at: t0,
             since: local_hms(t0),
             panes: None,
+            dropped: None,
         };
         let at = ago(5);
         apply_verdict(&mut rt, &[SourceId(1)], true, at);

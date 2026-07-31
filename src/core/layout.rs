@@ -35,6 +35,11 @@ pub struct PaneChrome<'a> {
     /// outcome-derived and recomputed every tick, this one spans ticks,
     /// and a pane can legitimately be both failing and looping.
     pub looping: bool,
+    /// "1.2k lines dropped" when this tick's output outran what the
+    /// pane retains. A THIRD independent slot, for the same reason the
+    /// second one exists: a pane can fail, loop and overflow at once,
+    /// and each says something the others do not.
+    pub truncated: Option<&'a str>,
 }
 
 /// Pin one pane's output into its declared box: apply the overflow
@@ -256,6 +261,7 @@ fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> St
     let mut text = format!("{} · {}", chrome.cadence, chrome.stamp);
     push_badge(&mut text, chrome.failure);
     push_badge(&mut text, chrome.looping.then_some("looping"));
+    push_badge(&mut text, chrome.truncated);
     let faint = StyleSpec {
         faint: true,
         ..StyleSpec::default()
@@ -321,6 +327,7 @@ mod tests {
             stamp: "12:04:31",
             failure,
             looping: false,
+            truncated: None,
         }
     }
 
@@ -740,6 +747,47 @@ mod tests {
             row.contains("every 5s · 12:04:31 · exit 3 · looping"),
             "got {row:?}"
         );
+    }
+
+    #[test]
+    fn a_truncated_pane_shows_the_marker_after_the_other_badges() {
+        // A third independent slot: a pane can fail, loop and truncate
+        // at once, and the newest badge appends rather than displacing.
+        let row = chrome_row(
+            &PaneChrome {
+                looping: true,
+                truncated: Some("1.2k lines dropped"),
+                ..chrome(Some("exit 3"))
+            },
+            80,
+            ColorProfile::Ascii,
+        );
+        assert!(
+            row.contains("every 5s · 12:04:31 · exit 3 · looping · 1.2k lines dropped"),
+            "got {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_loses_the_marker_before_it_loses_the_cadence() {
+        // The same append-and-truncate-tail rule the other badges obey.
+        // `on trigger · 12:04:31 · 90 lines dropped` is 40 cells, which
+        // makes 40 the exact width at which the marker survives whole.
+        let truncated = PaneChrome {
+            cadence: "on trigger",
+            truncated: Some("90 lines dropped"),
+            ..chrome(None)
+        };
+        assert_eq!(
+            chrome_row(&truncated, 40, ColorProfile::Ascii),
+            "on trigger · 12:04:31 · 90 lines dropped"
+        );
+        let narrow = chrome_row(&truncated, 39, ColorProfile::Ascii);
+        assert!(
+            narrow.starts_with("on trigger · 12:04:31"),
+            "got {narrow:?}"
+        );
+        assert!(!narrow.contains("dropped"), "got {narrow:?}");
     }
 
     #[test]

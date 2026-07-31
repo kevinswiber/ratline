@@ -481,3 +481,46 @@ fn a_file_trigger_refreshes_a_piped_watch() {
     // The guard's Drop kills and reaps — kill only SENDS the signal, and
     // an unreaped child would zombie (unix) and race tempdir cleanup.
 }
+
+#[test]
+fn a_flooding_child_is_bounded_and_says_so_on_stderr() {
+    // The plain path has no chrome row to carry a badge, and this is
+    // the configuration the bound was reported against — so the marker
+    // has to reach somewhere, and stdout is not available: it is the
+    // data a consumer parses.
+    let assert = rat()
+        .args(["watch", "--once", "--", &rat_bin(), "__lines", "3000"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+
+    let body: Vec<&str> = stdout.lines().collect();
+    assert_eq!(body.len(), 1000, "the retained window is the bound");
+    assert_eq!(body[0], "2000", "and it is the TAIL that survived");
+    assert_eq!(body[999], "2999");
+
+    assert!(
+        stderr.contains("2.0k lines dropped"),
+        "the drop must be reported somewhere; stderr was {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("dropped"),
+        "and never in the data: {stdout:?}"
+    );
+}
+
+#[test]
+fn a_child_inside_the_bound_says_nothing_at_all() {
+    // The common case stays byte-for-byte what it was: no marker, no
+    // stderr, nothing added to a stream someone is parsing.
+    let assert = rat()
+        .args(["watch", "--once", "--", &rat_bin(), "__lines", "3"])
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stdout),
+        "0\n1\n2\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&assert.get_output().stderr), "");
+}

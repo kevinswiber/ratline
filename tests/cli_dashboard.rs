@@ -571,3 +571,60 @@ row {{
         "bottom of the column on the second grid row: {stdout:?}"
     );
 }
+
+#[test]
+fn a_flooding_pane_wears_the_marker_on_its_own_chrome_row() {
+    // The pane route's own end-to-end proof. The unit tests show the
+    // badge renders and joins the signature; only this shows the count
+    // reaching it from a real child, through the reader, the outcome
+    // and the drain. A shared decision covered on one route only is
+    // covered on neither.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = rat_bin().replace('\\', "\\\\");
+    let file = fixture(
+        dir.path(),
+        "flood.kdl",
+        &format!(
+            r#"
+defaults height=6 width="60" border="none" padding="0"
+
+pane "flood" {{
+    command "{bin}" "__lines" "1500"
+}}
+
+pane "quiet" {{
+    command "{bin}" "style" "calm"
+}}
+"#
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+
+    assert!(
+        stdout.contains("500 lines dropped"),
+        "the flooding pane must say so; got {stdout:?}"
+    );
+    // The default overflow keeps the head, so the pane retained lines
+    // 0..999 and paints the first of them. The last line the child
+    // printed is gone — the direction working, not a fault.
+    assert!(
+        stdout.starts_with('0'),
+        "a keep-top pane shows its head: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("1499"),
+        "and its tail is what went: {stdout:?}"
+    );
+    // One pane overflowed, not both: the marker is per-pane state and
+    // the quiet pane's chrome row must stay clean.
+    assert_eq!(
+        stdout.matches("lines dropped").count(),
+        1,
+        "only the flooding pane wears it: {stdout:?}"
+    );
+}

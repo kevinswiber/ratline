@@ -142,5 +142,17 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
             out.flush().context("flushing")?;
             Ok(())
         }
+        #[cfg(debug_assertions)]
+        Command::Lines(args) => {
+            use std::io::Write;
+
+            use anyhow::Context as _;
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            for i in 0..args.count {
+                writeln!(out, "{i}").context("writing")?;
+            }
+            out.flush().context("flushing")?;
+            Ok(())
+        }
     }
 }

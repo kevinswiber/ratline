@@ -89,6 +89,18 @@ pub enum Command {
     #[cfg(debug_assertions)]
     #[command(name = "__sleep", hide = true)]
     Sleep(SleepArgs),
+    /// Test harness: print the decimals `0..count`, one per line — a
+    /// portable child that outruns a retention bound.
+    #[cfg(debug_assertions)]
+    #[command(name = "__lines", hide = true)]
+    Lines(LinesArgs),
+}
+
+#[cfg(debug_assertions)]
+#[derive(clap::Args)]
+pub struct LinesArgs {
+    /// How many lines to print.
+    pub count: usize,
 }
 
 #[cfg(debug_assertions)]
