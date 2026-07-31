@@ -134,6 +134,11 @@ frame being viewed — step back to when it broke, press `S`. History
 lives in memory only while the session runs, bounded to a few MiB of
 distinct frames.
 
+Each run's output is bounded too: rat keeps the newest 1000 lines of a
+watched command and says so on the status row when it drops the rest.
+The same bound applies to every dashboard pane, where `overflow`
+decides which end survives; `rat dashboard` below states the rule.
+
 `t` flips both time rows from wall-clock stamps to counting ages,
 without changing what they mean: the live row's `since 14:03:52`
 becomes `changed 14s ago`, and the paused row's `at 14:03:52` becomes
@@ -334,6 +339,23 @@ Each child is told its pane's inner size through `RAT_WIDTH` and
 that width; height-stable output keeps repaints cheapest, which is
 equally true for plain `rat watch` scripts — a placeholder row beats a
 row that comes and goes.
+
+**A command that never stops printing is bounded.** rat keeps at most
+1000 lines of each run's output, per stream — a count of lines, never a
+size, because a thousand short lines and a thousand long ones cost
+about the same to hold and a byte budget would bound neither. Which end
+survives is the pane's `overflow`: the head by default, the tail where
+you declared `keep-bottom`. `rat watch` has no pane to declare it on and
+keeps the newest, so a watch whose command floods now shows its tail
+instead of everything it has ever printed.
+
+Past the bound, the pane says so on the chrome row where a failing pane
+shows `· exit N`: `· 1.2k lines dropped`. A plain `rat watch` puts it on
+the status row, and a piped run puts it on stderr, so the data you are
+parsing stays the data. Press `?` for what it means. **Nothing is
+stopped or slowed to make this happen** — rat reads the output to the
+end and stops *keeping*, so a command never blocks writing into a pipe
+nobody is draining.
 
 A runnable declaration lives at
 [`examples/panes.kdl`](examples/panes.kdl);
