@@ -18,6 +18,17 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::core::registry::SourceId;
+use crate::core::retain::{Keep, LineCap};
+
+/// How much of one child's output is retained, and from which end.
+///
+/// Carried by value, and deliberately not an `Option`: every source has
+/// a policy, so "unbounded" is not representable.
+#[derive(Clone, Copy)]
+pub struct Retention {
+    pub max_lines: usize,
+    pub keep: Keep,
+}
 
 /// The slot the tick in flight parks its child in, plus the shutdown
 /// bar. Cloning shares the slot.
@@ -71,8 +82,14 @@ impl Drop for ShutdownGuard {
 pub struct TickOutcome {
     /// Which source finished — the index of every per-source resource.
     pub source: SourceId,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    /// The retained lines of each stream, terminators kept, exactly as
+    /// the child wrote them. Bytes rather than text because one consumer
+    /// writes a child's stderr straight through: decoding here would
+    /// replace invalid UTF-8 irreversibly and lose the framing. A
+    /// consumer that wants a body concatenates and decodes the whole
+    /// stream, which is what the renderers already do.
+    pub stdout: Vec<Vec<u8>>,
+    pub stderr: Vec<Vec<u8>>,
     /// When the child finished — the instant this content became
     /// current. Read on the worker, because a completion can wait
     /// (behind a pager, say) before the loop composes it.
@@ -157,11 +174,19 @@ fn run_parked(
     // Both pipes drain at once: a child filling both buffers deadlocks
     // a serial reader. The helper failing to spawn drops its pipe, so
     // the child's stderr writes fail fast and the tick still finishes.
+    // One fixed policy for now; the tick carries its own next, because
+    // the direction a pane keeps is something only the loop knows.
+    let retention = Retention {
+        max_lines: 1000,
+        keep: Keep::Bottom,
+    };
     let err_reader = std::thread::Builder::new()
         .name("rat-watch-stderr".into())
-        .spawn(move || read_all(stderr));
-    let out = read_all(stdout);
-    let err = err_reader.map_or_else(|_| Vec::new(), |h| h.join().unwrap_or_default());
+        .spawn(move || read_all(stderr, retention));
+    // The drop counts ride the outcome home next; nothing reads them yet.
+    let (out, _out_dropped) = read_all(stdout, retention);
+    let (err, _err_dropped) =
+        err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
     let status = if let Some(mut child) = slot.lock().child.take() {
         // The status is no longer discarded: a pane names the code its
         // command exited with. Nobody FAILS on it — a failing child is
@@ -199,14 +224,35 @@ fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
     }
 }
 
-fn read_all<R: Read>(pipe: Option<R>) -> Vec<u8> {
-    let mut buf = Vec::new();
+/// Drain one pipe to EOF, retaining at most what the policy allows.
+///
+/// **The loop always runs to EOF.** There is no early exit when the
+/// bound fills — the accumulator discards, the reader keeps reading. A
+/// reader that stopped would leave the pipe full and the child blocked
+/// in `write`, so the tick would never finish: that trades a process
+/// that grows, which is at least visible and diagnosable, for one that
+/// hangs, which is neither.
+///
+/// Each pipe gets its own accumulator, which is the shipped shape, so a
+/// source flooding both is bounded at twice the line count. Bounded is
+/// the requirement; a single shared ceiling is not.
+fn read_all<R: Read>(pipe: Option<R>, retention: Retention) -> (Vec<Vec<u8>>, usize) {
+    let mut cap = LineCap::new(retention.max_lines, retention.keep);
     if let Some(mut pipe) = pipe {
-        // A read error yields whatever arrived: a partial frame beats
-        // tearing the dashboard down.
-        let _ = pipe.read_to_end(&mut buf);
+        // A read granularity, not a bound. The bound is the cap's.
+        let mut buf = [0u8; 8 * 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => cap.feed(&buf[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A read error yields whatever arrived: a partial frame
+                // beats tearing the dashboard down.
+                Err(_) => break,
+            }
+        }
     }
-    buf
+    cap.finish()
 }
 
 #[cfg(test)]
@@ -264,6 +310,144 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A pipe that delivers once and then breaks, for the rule that a
+    /// partial frame beats tearing the dashboard down.
+    struct BreaksAfterOneRead<'a> {
+        first: &'a [u8],
+        delivered: bool,
+    }
+
+    impl Read for BreaksAfterOneRead<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.delivered {
+                return Err(std::io::Error::other("the pipe broke"));
+            }
+            self.delivered = true;
+            let n = self.first.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.first[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_pipe_longer_than_the_bound_yields_only_the_bound() {
+        let body: Vec<u8> = (0..1000)
+            .flat_map(|i| format!("line{i}\n").into_bytes())
+            .collect();
+        let (lines, dropped) = read_all(
+            Some(&body[..]),
+            Retention {
+                max_lines: 10,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(lines.len(), 10);
+        assert_eq!(dropped, 990);
+        assert_eq!(lines[9], b"line999\n");
+    }
+
+    #[test]
+    fn a_pipe_under_the_bound_is_byte_identical_to_today() {
+        // The witness for every command whose output fits, which is
+        // nearly all of them.
+        let body = b"alpha\nbeta\n".to_vec();
+        let (lines, dropped) = read_all(
+            Some(&body[..]),
+            Retention {
+                max_lines: 100,
+                keep: Keep::Top,
+            },
+        );
+        assert_eq!(
+            lines.concat(),
+            body,
+            "an under-cap stream must round-trip byte-for-byte"
+        );
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn an_absent_pipe_is_empty_and_drops_nothing() {
+        let (lines, dropped) = read_all(
+            None::<&[u8]>,
+            Retention {
+                max_lines: 10,
+                keep: Keep::Top,
+            },
+        );
+        assert!(lines.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn an_under_cap_stream_round_trips_invalid_utf8_and_its_exact_framing() {
+        // The reason the payload is bytes. The plain path writes a
+        // child's stderr straight through, so any decode here is an
+        // irreversible change to what the user sees. Both halves matter:
+        // the invalid byte, and the ABSENT trailing newline.
+        let body = b"warn: \xff\nno trailing newline".to_vec();
+        let (lines, dropped) = read_all(
+            Some(&body[..]),
+            Retention {
+                max_lines: 100,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(lines.concat(), body);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn empty_input_retains_nothing_and_drops_nothing() {
+        // Pairs with the rendering regression beside `output_lines`:
+        // EMPTY here must still render as ONE empty line there.
+        let (lines, dropped) = read_all(
+            Some(&b""[..]),
+            Retention {
+                max_lines: 10,
+                keep: Keep::Top,
+            },
+        );
+        assert!(lines.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn trailing_blank_lines_survive_as_bytes() {
+        let body = b"a\n\n\n".to_vec();
+        let (lines, _) = read_all(
+            Some(&body[..]),
+            Retention {
+                max_lines: 10,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(
+            lines.concat(),
+            body,
+            "the bytes survive; collapsing is the renderer's job"
+        );
+    }
+
+    #[test]
+    fn a_read_error_yields_what_arrived_rather_than_nothing() {
+        // The shipped rule, preserved: a partial frame beats tearing the
+        // dashboard down. The bytes that arrived before the break are
+        // kept, including the line the break left unterminated.
+        let (lines, dropped) = read_all(
+            Some(BreaksAfterOneRead {
+                first: b"a\nb",
+                delivered: false,
+            }),
+            Retention {
+                max_lines: 10,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(lines.concat(), b"a\nb");
+        assert_eq!(dropped, 0);
     }
 
     #[test]
@@ -355,9 +539,9 @@ mod tests {
         let cmd = script("echo out & echo err 1>&2");
         let outcome = run_tick(cmd, SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
-        assert!(contains(&outcome.stdout, b"out"));
-        assert!(contains(&outcome.stderr, b"err"));
-        assert!(!contains(&outcome.stdout, b"err"));
+        assert!(contains(&outcome.stdout.concat(), b"out"));
+        assert!(contains(&outcome.stderr.concat(), b"err"));
+        assert!(!contains(&outcome.stdout.concat(), b"err"));
     }
 
     #[cfg(unix)]
@@ -372,8 +556,15 @@ mod tests {
         );
         let outcome = run_tick(script(&body), SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
-        assert_eq!(outcome.stdout.len(), 3000 * 101);
-        assert_eq!(outcome.stderr.len(), 3000 * 101);
+        // 3000 lines arrive on each stream and the retained window holds
+        // the bound. What this test is about is unchanged — the tick
+        // FINISHES, which is what the concurrent drain buys — but the
+        // whole 300 KB is no longer what comes back, so asserting the
+        // total would now be asserting the absence of the cap.
+        assert_eq!(outcome.stdout.len(), 1000);
+        assert_eq!(outcome.stderr.len(), 1000);
+        assert!(outcome.stdout.iter().all(|line| line.len() == 101));
+        assert!(outcome.stderr.iter().all(|line| line.len() == 101));
     }
 
     #[test]
@@ -396,7 +587,7 @@ mod tests {
         let cmd = script("echo hi & exit 3");
         let outcome = run_tick(cmd, SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
-        assert!(contains(&outcome.stdout, b"hi"));
+        assert!(contains(&outcome.stdout.concat(), b"hi"));
     }
 
     #[test]
@@ -415,7 +606,7 @@ mod tests {
         let outcome = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("one outcome");
-        assert!(contains(&outcome.stdout, b"once"));
+        assert!(contains(&outcome.stdout.concat(), b"once"));
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_err());
     }
 
@@ -496,7 +687,7 @@ mod tests {
         let cmd = script("echo hi & exit 3");
         let outcome = run_tick(cmd, SourceId(0), Vec::new());
         assert!(outcome.spawn_error.is_none());
-        assert!(contains(&outcome.stdout, b"hi"));
+        assert!(contains(&outcome.stdout.concat(), b"hi"));
         assert_eq!(outcome.status.and_then(|status| status.code()), Some(3));
     }
 
