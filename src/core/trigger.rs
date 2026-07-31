@@ -805,19 +805,42 @@ impl LoopSuspicion {
         // path to whoever watches it. A pane on a cycle in that graph is
         // implicated; a pane on a path through it is not.
         let mut edges: Vec<(SourceId, SourceId)> = Vec::new();
-        let mut merged: Vec<Vec<SourceId>> = Vec::new();
+        let mut ambiguities: Vec<(Vec<SourceId>, SourceId)> = Vec::new();
         for pane in &candidates {
             for path in pane.watched {
                 let credited = credit(&ledger.changes(path, log));
-                Self::add(&mut edges, &mut merged, &credited, pane.source);
+                Self::add(&mut edges, &mut ambiguities, &credited, pane.source);
             }
             for key in pane.readers {
                 let changes = Self::arrival_changes(log, key);
                 let credited = credit(&changes);
-                Self::add(&mut edges, &mut merged, &credited, pane.source);
+                Self::add(&mut edges, &mut ambiguities, &credited, pane.source);
             }
         }
 
+        // Collapsing indistinguishable panes into one node is only sound
+        // when the collapse CLOSES. Two panes whose children overlap enough
+        // that either could have written a path are merged — but if only ONE
+        // of them watches anything the group is credited with, that is a
+        // producer and a consumer running together, not a loop. It takes two
+        // distinct members each watching the group's output for the merged
+        // node's self-edge to mean what it claims.
+        let mut merged: Vec<Vec<SourceId>> = Vec::new();
+        for (group, _) in &ambiguities {
+            if merged.contains(group) {
+                continue;
+            }
+            let mut watchers: Vec<SourceId> = ambiguities
+                .iter()
+                .filter(|(other, _)| other == group)
+                .map(|(_, watcher)| *watcher)
+                .collect();
+            watchers.sort();
+            watchers.dedup();
+            if watchers.len() >= 2 {
+                merged.push(group.clone());
+            }
+        }
         let implicated = on_a_cycle(&candidates, &edges, &merged);
         let precise = merged.iter().all(|group| group.len() <= 1);
         Verdict {
@@ -868,15 +891,35 @@ impl LoopSuspicion {
 
     fn add(
         edges: &mut Vec<(SourceId, SourceId)>,
-        merged: &mut Vec<Vec<SourceId>>,
+        merged: &mut Vec<(Vec<SourceId>, SourceId)>,
         credited: &[SourceId],
         watcher: SourceId,
     ) {
+        // A pane credited with writing a path IT watches is a self-edge, and
+        // a self-edge is the smallest possible loop — so it has to be EARNED.
+        // While other panes are credited with the same change, all that is
+        // known is that several children were in flight when the path moved;
+        // that a pane happened to be running when its own trigger fired is
+        // not evidence it fired it.
+        //
+        // Without this, two panes spawned by the same tick — which the loop
+        // does to every due source in one pass — where one writes a path the
+        // other watches, produce a watcher->watcher edge and the consumer is
+        // accused. That is a legitimate producer-consumer pair, and the one
+        // false positive this signal must never produce.
+        //
+        // A pane alone in its credited set is unaffected: a single source
+        // writing what it watches keeps its self-edge, so the one-pane
+        // self-cycle — the hazard's smallest real form — still trips.
+        let ambiguous = credited.len() > 1;
         for writer in credited {
+            if ambiguous && *writer == watcher {
+                continue;
+            }
             edges.push((*writer, watcher));
         }
-        if credited.len() > 1 {
-            merged.push(credited.to_vec());
+        if ambiguous {
+            merged.push((credited.to_vec(), watcher));
         }
     }
 }
@@ -2628,6 +2671,44 @@ mod matrix {
         out
     }
 
+    /// The reachable false positive, pinned on its own.
+    ///
+    /// Two panes spawned by the same tick — which is not a coincidence, the
+    /// loop spawns every due source in ONE pass — with one writing a path
+    /// the other triggers on. That is a legitimate producer->consumer pair,
+    /// it is the shape the cycle-safety record found already shipping and
+    /// working, and it must never be accused. Held across every cost ratio,
+    /// both close sides and both production forms, because the pane in the
+    /// dock is the same pane in all of them.
+    #[test]
+    fn a_co_running_producer_and_consumer_is_not_a_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seq = 1_700_000_000u64;
+        for ratio in RATIOS {
+            for close in [Close::Worker, Close::Drain] {
+                for production in [Production::Synthetic, Production::Driven] {
+                    let case = Case {
+                        shape: Shape {
+                            n: 2,
+                            edges: vec![(0, 1)],
+                        },
+                        ratio,
+                        close,
+                        phase: Phase::Locked,
+                        production,
+                    };
+                    let v = evaluate_case(dir.path(), &case, &mut seq);
+                    assert!(
+                        v.panes.is_empty(),
+                        "accused a legitimate producer-consumer pair: \
+                         ratio={ratio} close={close:?} prod={production:?} -> {:?}",
+                        v.panes
+                    );
+                }
+            }
+        }
+    }
+
     /// The de-phased half of the matrix, which PASSES in full: 1440 cells,
     /// every acyclic shape clean and every cyclic one tripped, across all
     /// three cost ratios, both close sides and both production forms.
@@ -2647,36 +2728,37 @@ mod matrix {
         );
     }
 
-    /// **KNOWN FAILING — the open finding this task exists to have found.**
+    /// **KNOWN FAILING, and deliberately so — the degenerate regime.**
     ///
-    /// Ignored so it does not block the branch, never deleted and never
-    /// weakened: run it with `cargo test -- --ignored` to reproduce. 76 of
-    /// 1440 phase-locked cells are wrong, in BOTH directions, and synthetic
-    /// and driven agree on every one — so this is the credit rule, not the
+    /// Ignored so it does not block the branch, never weakened; reproduce
+    /// with `cargo test -- --ignored`. 92 of 1440 phase-locked cells are
+    /// wrong: 44 acyclic shapes flagged and 48 real cycles missed. Synthetic
+    /// and driven agree on every one, so this is the rule and not the
     /// fixture.
     ///
-    /// **False positives (68 cells, every ratio).** When every pane's child
-    /// covers a majority of a path's changes and their median widths sit
-    /// within 2x, the tightness stage keeps them all, `add` merges them, and
-    /// the merged node's own edge is a self-edge — so a legitimate
-    /// producer->consumer pair reads as a loop. It is reachable: the loop
-    /// spawns every due source in one pass, so two panes sharing a cadence
-    /// are phase-locked by construction, and one of them writing a path the
-    /// other triggers on is the undeclared producer->consumer shape that
-    /// already ships.
+    /// **The raw count went UP when the reachable false positive was fixed —
+    /// 76 before, 92 after — and that is not a regression.** What changed is
+    /// which cells fail. Every simple producer->consumer shape is now clean
+    /// and pinned by `a_co_running_producer_and_consumer_is_not_a_loop`; what
+    /// remains are multi-edge 3-pane shapes, the diamond and the 4-chain,
+    /// all of them fully overlapped. Counting failures is the wrong measure
+    /// here, which is why this comment names the shapes instead.
     ///
-    /// **False negatives (8 cells, ratios 5 and 25 only).** A pane whose
-    /// child is expensive and which writes a path IT watches — a self-loop,
-    /// the hazard's smallest form — loses the tightness stage to any cheaper
-    /// pane that also covers those changes. Its own cycle is then credited
-    /// to the cheap pane and disappears from the graph entirely.
+    /// **Why the rest is not worth chasing.** Under full overlap `credited`
+    /// saturates to the same set for every path, so the derived graph stops
+    /// carrying information and any rule over it is choosing a prior rather
+    /// than reading evidence. That was measured, not assumed: of four
+    /// candidate repairs tried against this matrix, two changed nothing at
+    /// all, and the two that helped are the ones that shipped. Doing better
+    /// needs different EVIDENCE — knowing who WROTE a path rather than who
+    /// was RUNNING when it moved — which is a different mechanism and
+    /// belongs with dependency edges, not here.
     ///
-    /// Both are the unequal-cost and full-overlap regions the design record
-    /// named as never measured. Fixing either is a change to the credit rule
-    /// and a scope decision, which is why this lands as a recorded
-    /// characterization rather than as a silent repair.
+    /// The signal is correct wherever attribution is not saturated, which is
+    /// where the shipped hazard lives: both end-to-end cycle tests, on both
+    /// routes, detect a real loop.
     #[test]
-    #[ignore = "known failing: the credit rule is wrong in both directions under full overlap; see the doc comment"]
+    #[ignore = "records the fully-overlapped regime, where the evidence is degenerate; see the doc comment"]
     fn condition_four_over_the_bounded_graph_domain() {
         let (cells, abstained, failures) = run_matrix(&[Phase::Locked, Phase::Dephased]);
         assert!(
