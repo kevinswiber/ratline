@@ -425,9 +425,6 @@ pub struct TriggerKey(pub String);
 /// and elapsed-so-far would make a long-running child look artificially
 /// tight — the mis-credit the median-width rule exists to prevent.
 pub struct Arrival {
-    /// Staged: recorded here, read when the reader route resolves arrivals.
-    #[allow(dead_code)]
-    pub source: SourceId,
     pub trigger: TriggerKey,
     pub at: std::time::Instant,
     /// The brackets covering `at`, by id. EMPTY means nothing was in flight,
@@ -502,14 +499,19 @@ impl WindowLog {
     }
 
     /// A fifo/fd arrival, resolved against the brackets already owned here.
-    /// Staged: the reader route is its only caller.
-    #[allow(dead_code)]
-    pub fn observe_arrival(
-        &mut self,
-        source: SourceId,
-        trigger: TriggerKey,
-        at: std::time::Instant,
-    ) {
+    ///
+    /// It does not record WHICH pane's reader saw it, and does not need to.
+    /// Credit goes to the brackets covering `at` — whoever was RUNNING — and
+    /// the edge terminates at whoever WATCHES the trigger, which the caller
+    /// already knows from the key it is iterating. An arrival's own source
+    /// was carried here for a while and never read once.
+    ///
+    /// Permanently allowed dead on Windows, not staged: the reader route is
+    /// `cfg(unix)` because only fifo and fd triggers can arrive, so Windows
+    /// compiles this and never calls it. Same precedent as the rest of the
+    /// unix-only live surface.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn observe_arrival(&mut self, trigger: TriggerKey, at: std::time::Instant) {
         let containing = self
             .brackets
             .iter()
@@ -517,7 +519,6 @@ impl WindowLog {
             .map(|b| b.id)
             .collect();
         self.arrivals.push(Arrival {
-            source,
             trigger,
             at,
             containing,
@@ -528,8 +529,10 @@ impl WindowLog {
     /// treated as "no arrivals": the dropped one may have been the window's
     /// only exogenous observation, and losing it would turn a zero test into
     /// an accusation. Any window this touches abstains instead.
-    /// Staged: a reader is the only thing that can overflow.
-    #[allow(dead_code)]
+    ///
+    /// Permanently allowed dead on Windows: only a reader can overflow, and
+    /// Windows opens none.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn record_overflow(&mut self, at: std::time::Instant) {
         self.overflows.push(at);
     }
@@ -1791,7 +1794,7 @@ mod tests {
         // Emptiness needs no width, so the veto never waits on one.
         let mut log = WindowLog::new(W);
         let t0 = Instant::now();
-        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
         let key = TriggerKey("fifo:/tmp/a".into());
         let arrivals = log.arrivals(&key);
         assert_eq!(arrivals.len(), 1);
@@ -1808,7 +1811,6 @@ mod tests {
         let t0 = Instant::now();
         let id = log.open_bracket(SourceId(1), t0, Vec::new());
         log.observe_arrival(
-            SourceId(1),
             TriggerKey("fifo:/tmp/a".into()),
             t0 + Duration::from_millis(3),
         );
@@ -1835,9 +1837,9 @@ mod tests {
         // itself to on the reader route.
         let mut log = WindowLog::new(W);
         let t0 = Instant::now();
-        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
-        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/b".into()), t0);
-        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/b".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/b".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/b".into()), t0);
 
         assert_eq!(log.arrivals(&TriggerKey("fifo:/tmp/a".into())).len(), 1);
         assert_eq!(log.arrivals(&TriggerKey("fifo:/tmp/b".into())).len(), 2);
@@ -1864,7 +1866,7 @@ mod tests {
         let id = log.open_bracket(SourceId(0), t0, Vec::new());
         log.close_bracket(id, t0 + Duration::from_millis(5), Vec::new());
         log.record_respawn(SourceId(0), t0);
-        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
         log.record_overflow(t0);
 
         log.evict(t0 + secs(30));
@@ -1903,7 +1905,7 @@ mod tests {
         let id = log.open_bracket(SourceId(0), t0, Vec::new());
         log.close_bracket(id, t0 + Duration::from_millis(5), Vec::new());
         // The arrival is recent; its bracket is old.
-        log.observe_arrival(SourceId(0), TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
         log.arrivals(&TriggerKey("fifo:/tmp/a".into()));
 
         log.evict(t0 + Duration::from_millis(500));
@@ -2234,7 +2236,7 @@ mod tests {
         let t0 = Instant::now();
         let key = TriggerKey("fifo:/tmp/a".into());
         log.open_bracket(SourceId(0), t0, Vec::new()); // never closed
-        log.observe_arrival(SourceId(1), key.clone(), t0 + ms(3));
+        log.observe_arrival(key.clone(), t0 + ms(3));
 
         let changes = LoopSuspicion::arrival_changes(&log, &key);
         assert!(
