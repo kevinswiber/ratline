@@ -598,8 +598,35 @@ pub struct TriggerReader {
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Staged: recorded here, drained when the loop wires this route.
+    #[allow(dead_code)]
+    arrivals: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>,
+    /// Staged: read beside the drain, in the same pass.
+    #[allow(dead_code)]
+    overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
+
+/// How many un-drained arrivals a reader holds.
+///
+/// The reader must never grow without limit and must never block — a
+/// blocked reader thread is a wedged trigger. So the queue drops the
+/// **oldest** when it is full, which is the right end to lose: the loop
+/// drains every iteration, so a full queue means the arrivals at the
+/// front are already older than the window that would read them.
+///
+/// A drop is never silent. Losing an arrival can lose a window's only
+/// **exogenous** observation, and the veto that observation feeds is a
+/// zero test — so a silent drop would not degrade the signal, it would
+/// invert it, turning "no outside writer was seen" into an accusation.
+/// The overflow flag is what makes the window abstain instead.
+///
+/// The bound is generous on purpose: at one arrival per read and a loop
+/// that drains at least every `SLICE`, reaching it means the reader is
+/// seeing arrivals faster than the loop runs, which is itself the
+/// condition worth reporting.
+#[cfg(unix)]
+pub const ARRIVAL_CAP: usize = 256;
 
 #[cfg(unix)]
 impl TriggerReader {
@@ -670,19 +697,35 @@ impl TriggerReader {
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(ARRIVAL_CAP),
+        ));
+        let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_fired = std::sync::Arc::clone(&fired);
         let thread_ended = std::sync::Arc::clone(&ended);
         let thread_shutdown = std::sync::Arc::clone(&shutdown);
+        let thread_arrivals = std::sync::Arc::clone(&arrivals);
+        let thread_overflowed = std::sync::Arc::clone(&overflowed);
         let reader = std::thread::Builder::new()
             .name("rat-trigger".to_string())
             .spawn(move || {
                 let _keep_alive = keep_alive;
-                trigger_read_loop(fd, &thread_fired, &thread_ended, &thread_shutdown, wake);
+                trigger_read_loop(
+                    fd,
+                    &thread_fired,
+                    &thread_ended,
+                    &thread_shutdown,
+                    &thread_arrivals,
+                    &thread_overflowed,
+                    wake,
+                );
             })?;
         Ok(TriggerReader {
             fired,
             ended,
             shutdown,
+            arrivals,
+            overflowed,
             reader: Some(reader),
         })
     }
@@ -693,6 +736,43 @@ impl TriggerReader {
 
     pub fn ended(&self) -> &std::sync::atomic::AtomicBool {
         &self.ended
+    }
+
+    /// Drain the arrivals recorded since the last call.
+    ///
+    /// **Deliberately separate from `fired`.** The gate swaps `fired` to
+    /// decide whether to respawn; this drains observations for the
+    /// attribution window. One arrival is one *read*, not one write —
+    /// see `trigger_read_loop` for what that does and does not
+    /// distinguish. The two must never be folded into one call: a drain
+    /// that consumed `fired` would lose a fire and the pane would
+    /// silently stop refreshing.
+    ///
+    /// Staged: the loop's trigger arm is its only caller. An allow that
+    /// survives the wiring task means something the plan said would be
+    /// called is not.
+    #[allow(dead_code)]
+    pub fn take_arrivals(&self) -> Vec<std::time::Instant> {
+        let mut queue = self
+            .arrivals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.drain(..).collect()
+    }
+
+    /// Whether arrivals were dropped since the last call — reports and
+    /// clears.
+    ///
+    /// Clearing is the point. The loop reads this once per iteration and
+    /// makes *that* window abstain; a sticky flag would make every later
+    /// window abstain too, and a badge that can never clear is the
+    /// failure this whole design is built to avoid.
+    ///
+    /// Staged: drained in the same pass as `take_arrivals`.
+    #[allow(dead_code)]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -713,12 +793,32 @@ impl Drop for TriggerReader {
 /// flag on the rising edge. End discipline: EOF (`read == 0`) or any
 /// terminal select/read error sets `ended` and exits — a dead source
 /// must never spin silently; transient EINTR/EAGAIN are retried.
+///
+/// **Why this route records an instant and the polled route records a
+/// bracket.** A `file:` trigger can be stat'd before and after a child,
+/// so a change can be placed inside a window after the fact. A fifo
+/// cannot: the bytes are drained and gone, there is no state left to
+/// compare, and nothing can reconstruct when they landed. The arrival
+/// instant is therefore the only attribution signal that exists on this
+/// route, and the reader thread is the only place that has it.
+///
+/// **One arrival is one read, not one write.** A single `read` returns
+/// whatever is queued, so writes that land between two selects are
+/// coalesced into one arrival and the reader cannot tell them apart —
+/// nothing in the pipe records how many `write` calls produced the
+/// bytes. That under-counts a tight burst and never over-counts, which
+/// is the safe direction: the veto asks whether an outside writer was
+/// *ever* seen, and a coalesced arrival still answers that with the
+/// right instant.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn trigger_read_loop(
     fd: i32,
     fired: &std::sync::atomic::AtomicBool,
     ended: &std::sync::atomic::AtomicBool,
     shutdown: &std::sync::atomic::AtomicBool,
+    arrivals: &std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    overflowed: &std::sync::atomic::AtomicBool,
     wake: Option<std::sync::mpsc::Sender<TapChunk>>,
 ) {
     use std::sync::atomic::Ordering;
@@ -772,6 +872,20 @@ fn trigger_read_loop(
             }
             ended.store(true, Ordering::SeqCst);
             return;
+        }
+        // Recorded beside the flag store, never derived from it: the
+        // flag is a rising edge the gate consumes, so an arrival keyed
+        // off it would be lost whenever the loop had not drained yet —
+        // which is exactly the burst case the window most needs.
+        {
+            let mut queue = arrivals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if queue.len() == ARRIVAL_CAP {
+                queue.pop_front();
+                overflowed.store(true, Ordering::SeqCst);
+            }
+            queue.push_back(std::time::Instant::now());
         }
         if !fired.swap(true, Ordering::SeqCst)
             && let Some(wake) = wake.as_ref()
@@ -843,6 +957,155 @@ mod trigger_reader_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("file:"), "{err}"); // S_ISREG teaches file:
+    }
+
+    /// Open a fifo reader and a writer onto it.
+    fn fifo_pair(dir: &std::path::Path) -> (TriggerReader, std::fs::File) {
+        let path = dir.join("t.fifo");
+        mkfifo(&path);
+        let reader = TriggerReader::open(&TriggerSpec::Fifo(path.clone()), None).unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        (reader, writer)
+    }
+
+    #[test]
+    fn each_fire_records_one_arrival_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        writer.write_all(b"x").unwrap();
+        assert!(
+            wait_until(|| reader.fired().load(Ordering::SeqCst)),
+            "the write never raised the flag"
+        );
+        assert_eq!(reader.take_arrivals().len(), 1);
+    }
+
+    #[test]
+    fn the_instant_is_taken_at_arrival_not_when_the_loop_drains() {
+        // The accuracy claim, and the whole reason this route is cheaper
+        // than the polled one: the reader already knows the exact
+        // instant, where a slice poll is quantised. Delaying the drain
+        // must not move the recorded time — if the instant were taken
+        // here, it would land after the sleep and this fails.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        let before = std::time::Instant::now();
+        writer.write_all(b"x").unwrap();
+        assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+        std::thread::sleep(Duration::from_millis(300));
+        let arrivals = reader.take_arrivals();
+        assert_eq!(arrivals.len(), 1);
+        let at = arrivals[0];
+        assert!(
+            at.duration_since(before) < Duration::from_millis(250),
+            "recorded {:?} after the write — taken at the drain, not at arrival",
+            at.duration_since(before)
+        );
+        assert!(
+            at.elapsed() >= Duration::from_millis(250),
+            "only {:?} before the drain; the sleep did not separate them",
+            at.elapsed()
+        );
+    }
+
+    #[test]
+    fn taking_arrivals_does_not_disturb_the_fired_flag() {
+        // The loop swaps `fired` to drive the gate. If taking arrivals
+        // consumed it, a fire would be lost and the pane would stop
+        // refreshing — the same failure mode the observer's separate
+        // baselines exist to prevent, arriving by a different door.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        writer.write_all(b"x").unwrap();
+        assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+        let _ = reader.take_arrivals();
+        assert!(
+            reader.fired().load(Ordering::SeqCst),
+            "taking arrivals cleared the gate's flag"
+        );
+    }
+
+    #[test]
+    fn every_separately_observed_write_records_its_own_arrival() {
+        // The veto counts OBSERVATIONS, not respawns: the debounce
+        // collapses a burst into one respawn, but each arrival is a
+        // distinct datum for the credit rule. Each write is awaited, so
+        // each is a separate read — see the tight-burst test below for
+        // what the reader can and cannot distinguish.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        for _ in 0..5 {
+            reader.fired().store(false, Ordering::SeqCst);
+            writer.write_all(b"x").unwrap();
+            assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+        }
+        assert_eq!(reader.take_arrivals().len(), 5);
+    }
+
+    #[test]
+    fn a_tight_burst_coalesces_and_that_is_the_safe_direction() {
+        // MEASURED, not assumed: 20 writes with no wait between them
+        // produced exactly ONE arrival. A single `read` returns whatever
+        // is queued, and nothing in a pipe records how many `write`
+        // calls produced the bytes — so this route cannot count writes
+        // and must not claim to.
+        //
+        // Pinned because the limit is load-bearing in one direction
+        // only. Coalescing UNDER-counts and can never over-count, which
+        // is the safe way round: the veto asks whether an outside writer
+        // was ever seen, and a coalesced arrival still answers that with
+        // a correct instant. Over-counting would be the dangerous error
+        // — it would manufacture exogenous observations that never
+        // happened and clear a veto that should have held.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        for _ in 0..20 {
+            writer.write_all(b"x").unwrap();
+        }
+        assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+        std::thread::sleep(Duration::from_millis(200));
+        let n = reader.take_arrivals().len();
+        assert!(
+            (1..=20).contains(&n),
+            "{n} arrivals from 20 writes — more than 20 is impossible, \
+             and zero would mean the burst was lost entirely"
+        );
+    }
+
+    #[test]
+    fn the_queue_is_bounded_and_a_drop_is_reported_not_silent() {
+        // A silent drop would corrupt a zero test: losing an arrival can
+        // lose the window's only EXOGENOUS observation, flipping the
+        // veto into a false positive. Blocking the reader is not an
+        // option either, so it drops the oldest and SAYS SO.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        for _ in 0..(ARRIVAL_CAP * 2) {
+            reader.fired().store(false, Ordering::SeqCst);
+            writer.write_all(b"x").unwrap();
+            assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+        }
+        assert!(reader.overflowed(), "a drop must be observable");
+        assert!(
+            reader.take_arrivals().len() <= ARRIVAL_CAP,
+            "the queue grew past its bound"
+        );
+    }
+
+    #[test]
+    fn overflowed_reports_and_clears() {
+        // The loop reads it once per iteration and the window abstains
+        // for THAT window; a sticky flag would make every later window
+        // abstain too, and the badge could never clear.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        for _ in 0..(ARRIVAL_CAP + 1) {
+            reader.fired().store(false, Ordering::SeqCst);
+            writer.write_all(b"x").unwrap();
+            assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+        }
+        assert!(reader.overflowed());
+        assert!(!reader.overflowed(), "the flag did not clear on read");
     }
 
     #[test]
