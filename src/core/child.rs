@@ -118,6 +118,15 @@ pub struct TickOutcome {
     /// source that printed nothing. `rat watch` still ignores it,
     /// exactly as `output()`'s status was ignored.
     pub status: Option<std::process::ExitStatus>,
+    /// How many LINES this tick discarded to stay inside its bound,
+    /// summed across both pipes. Zero for every command whose output
+    /// fits, which is nearly all of them, and zero when nothing ran.
+    /// Read by the loop, which is what makes a truncation visible
+    /// instead of silent.
+    // The loop reads it once there is a surface to say it on; until
+    // then only the tests do.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub dropped: usize,
 }
 
 /// Run one configured child to completion on this thread.
@@ -125,8 +134,9 @@ pub fn run_tick(
     command: std::process::Command,
     source: SourceId,
     union: Vec<std::path::PathBuf>,
+    retention: Retention,
 ) -> TickOutcome {
-    run_parked(command, source, &ChildSlot::default(), &union)
+    run_parked(command, source, &ChildSlot::default(), &union, retention)
 }
 
 /// Run one configured child on a worker thread, which posts exactly
@@ -138,13 +148,14 @@ pub fn spawn_tick(
     slot: ChildSlot,
     tx: std::sync::mpsc::Sender<TickOutcome>,
     union: Vec<std::path::PathBuf>,
+    retention: Retention,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("rat-watch-child".into())
         .spawn(move || {
             // On a shutdown race the receiver is already gone; the
             // failed send is the no-op it should be.
-            let _ = tx.send(run_parked(command, source, &slot, &union));
+            let _ = tx.send(run_parked(command, source, &slot, &union, retention));
         })?;
     Ok(())
 }
@@ -154,6 +165,7 @@ fn run_parked(
     source: SourceId,
     slot: &ChildSlot,
     union: &[std::path::PathBuf],
+    retention: Retention,
 ) -> TickOutcome {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     // The lock spans the spawn: shutdown() takes the same lock, so it
@@ -174,18 +186,11 @@ fn run_parked(
     // Both pipes drain at once: a child filling both buffers deadlocks
     // a serial reader. The helper failing to spawn drops its pipe, so
     // the child's stderr writes fail fast and the tick still finishes.
-    // One fixed policy for now; the tick carries its own next, because
-    // the direction a pane keeps is something only the loop knows.
-    let retention = Retention {
-        max_lines: 1000,
-        keep: Keep::Bottom,
-    };
     let err_reader = std::thread::Builder::new()
         .name("rat-watch-stderr".into())
         .spawn(move || read_all(stderr, retention));
-    // The drop counts ride the outcome home next; nothing reads them yet.
-    let (out, _out_dropped) = read_all(stdout, retention);
-    let (err, _err_dropped) =
+    let (out, out_dropped) = read_all(stdout, retention);
+    let (err, err_dropped) =
         err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
     let status = if let Some(mut child) = slot.lock().child.take() {
         // The status is no longer discarded: a pane names the code its
@@ -208,6 +213,9 @@ fn run_parked(
         spawn_error: None,
         status,
         close_stamps,
+        // Both pipes are capped separately, so what the tick lost is
+        // their sum.
+        dropped: out_dropped + err_dropped,
     }
 }
 
@@ -221,6 +229,8 @@ fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
         close_stamps: Vec::new(),
         spawn_error: Some(err),
         status: None,
+        // Nothing ran, so nothing was read and nothing was discarded.
+        dropped: 0,
     }
 }
 
@@ -312,6 +322,58 @@ mod tests {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
     }
 
+    /// A bound no fixture in this module comes near, for the tests that
+    /// are about something other than the bound. Naming it keeps those
+    /// tests from reading as if the number mattered to them.
+    fn ample() -> Retention {
+        Retention {
+            max_lines: 10_000,
+            keep: Keep::Bottom,
+        }
+    }
+
+    /// A child that prints `n` lines and exits: the decimal `i` for `i`
+    /// in `0..n`, each with the platform's native terminator, then
+    /// exit 0. `n == 0` has no contract — every caller wants output.
+    ///
+    /// Built on `script`, unlike `sleeper`, and the difference matters
+    /// before anyone unifies them: `sleeper` is spawned directly because
+    /// a shell that forks instead of execing would absorb the kill while
+    /// its child held the pipes open. This one is never killed — it runs
+    /// to completion — so the shell is harmless.
+    fn flooder(n: usize) -> std::process::Command {
+        assert!(
+            n > 0,
+            "flooder(0) has no contract; the tests all want output"
+        );
+        #[cfg(unix)]
+        {
+            // A POSIX shell counter rather than `seq`: `seq` is present
+            // on macOS and the runners, but it is not POSIX and the
+            // shell can count.
+            script(&format!(
+                "i=0; while [ $i -lt {n} ]; do echo $i; i=$((i+1)); done"
+            ))
+        }
+        #[cfg(windows)]
+        {
+            script(&format!("for /l %i in (0,1,{}) do @echo %i", n - 1))
+        }
+    }
+
+    /// The line's text, with its platform terminator removed.
+    ///
+    /// Production bytes are untouched — this normalizes the ASSERTION,
+    /// never the payload. Unix `echo` ends a line `\n` and `cmd`'s ends
+    /// it `\r\n`, and the accumulator keeps the `\r` deliberately, so a
+    /// hardcoded `b"99\n"` would pass here and fail the Windows leg.
+    fn line_text(line: &[u8]) -> &str {
+        std::str::from_utf8(line)
+            .expect("the fixture emits ASCII")
+            .trim_end_matches('\n')
+            .trim_end_matches('\r')
+    }
+
     /// A pipe that delivers once and then breaks, for the rule that a
     /// partial frame beats tearing the dashboard down.
     struct BreaksAfterOneRead<'a> {
@@ -329,6 +391,56 @@ mod tests {
             buf[..n].copy_from_slice(&self.first[..n]);
             Ok(n)
         }
+    }
+
+    #[test]
+    fn the_outcome_reports_what_it_dropped() {
+        let outcome = run_tick(
+            flooder(100),
+            SourceId(0),
+            Vec::new(),
+            Retention {
+                max_lines: 10,
+                keep: Keep::Bottom,
+            },
+        );
+        assert_eq!(outcome.dropped, 90);
+        // The fixture's contract: the last line it printed is `99`.
+        assert_eq!(line_text(outcome.stdout.last().unwrap()), "99");
+    }
+
+    #[test]
+    fn a_command_inside_its_bound_reports_zero_dropped() {
+        // The common case, and the one that must stay boring.
+        let outcome = run_tick(
+            flooder(3),
+            SourceId(0),
+            Vec::new(),
+            Retention {
+                max_lines: 100,
+                keep: Keep::Top,
+            },
+        );
+        assert_eq!(outcome.dropped, 0);
+        assert_eq!(outcome.stdout.len(), 3);
+    }
+
+    #[test]
+    fn a_spawn_error_reports_no_drops() {
+        // The outcome for a command that never started is built without
+        // reading a pipe at all, so the new field has to be zero there
+        // by construction rather than by accident.
+        let outcome = run_tick(
+            std::process::Command::new("definitely-no-such-binary-xyz"),
+            SourceId(0),
+            Vec::new(),
+            Retention {
+                max_lines: 10,
+                keep: Keep::Bottom,
+            },
+        );
+        assert!(outcome.spawn_error.is_some());
+        assert_eq!(outcome.dropped, 0);
     }
 
     #[test]
@@ -459,7 +571,7 @@ mod tests {
         let f = dir.path().join("sa");
         std::fs::write(&f, b"0").unwrap();
 
-        let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()]);
+        let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()], ample());
         assert_eq!(outcome.close_stamps.len(), 1);
         assert_eq!(outcome.close_stamps[0].0, f);
     }
@@ -477,7 +589,7 @@ mod tests {
         std::fs::write(&f, b"0").unwrap();
 
         let before = std::time::Instant::now();
-        let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()]);
+        let outcome = run_tick(script("echo hi"), SourceId(0), vec![f.clone()], ample());
         let drained = std::time::Instant::now();
 
         assert!(
@@ -504,7 +616,7 @@ mod tests {
         let cmd = script(&format!("printf 1 >> {}", f.display()));
         #[cfg(windows)]
         let cmd = script(&format!("echo 1 >> {}", f.display()));
-        let outcome = run_tick(cmd, SourceId(0), vec![f.clone()]);
+        let outcome = run_tick(cmd, SourceId(0), vec![f.clone()], ample());
 
         assert_ne!(
             outcome.close_stamps, before,
@@ -516,7 +628,7 @@ mod tests {
     fn an_empty_union_costs_no_stats_and_returns_empty() {
         // The common case, and every source under --once, where no trigger is
         // armed at all.
-        let outcome = run_tick(script("echo hi"), SourceId(0), Vec::new());
+        let outcome = run_tick(script("echo hi"), SourceId(0), Vec::new(), ample());
         assert!(outcome.close_stamps.is_empty());
     }
 
@@ -526,6 +638,7 @@ mod tests {
             std::process::Command::new("definitely-not-a-program-here"),
             SourceId(0),
             vec![std::path::PathBuf::from("/sa")],
+            ample(),
         );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.close_stamps.is_empty());
@@ -537,7 +650,7 @@ mod tests {
         let cmd = script("echo out; echo err >&2");
         #[cfg(windows)]
         let cmd = script("echo out & echo err 1>&2");
-        let outcome = run_tick(cmd, SourceId(0), Vec::new());
+        let outcome = run_tick(cmd, SourceId(0), Vec::new(), ample());
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout.concat(), b"out"));
         assert!(contains(&outcome.stderr.concat(), b"err"));
@@ -554,7 +667,15 @@ mod tests {
         let body = format!(
             "i=0; while [ $i -lt 3000 ]; do echo {line}; echo {line} >&2; i=$((i+1)); done"
         );
-        let outcome = run_tick(script(&body), SourceId(0), Vec::new());
+        let outcome = run_tick(
+            script(&body),
+            SourceId(0),
+            Vec::new(),
+            Retention {
+                max_lines: 1000,
+                keep: Keep::Bottom,
+            },
+        );
         assert!(outcome.spawn_error.is_none());
         // 3000 lines arrive on each stream and the retained window holds
         // the bound. What this test is about is unchanged — the tick
@@ -573,6 +694,7 @@ mod tests {
             std::process::Command::new("definitely-no-such-binary-xyz"),
             SourceId(0),
             Vec::new(),
+            ample(),
         );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.stdout.is_empty());
@@ -585,7 +707,7 @@ mod tests {
         let cmd = script("echo hi; exit 3");
         #[cfg(windows)]
         let cmd = script("echo hi & exit 3");
-        let outcome = run_tick(cmd, SourceId(0), Vec::new());
+        let outcome = run_tick(cmd, SourceId(0), Vec::new(), ample());
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout.concat(), b"hi"));
     }
@@ -601,6 +723,7 @@ mod tests {
             ChildSlot::default(),
             tx,
             Vec::new(),
+            ample(),
         )
         .expect("spawn worker");
         let outcome = rx
@@ -614,7 +737,15 @@ mod tests {
     fn a_parked_child_can_be_killed_from_another_thread() {
         let slot = ChildSlot::default();
         let (tx, rx) = mpsc::channel();
-        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx, Vec::new()).expect("spawn worker");
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
         wait_until_parked(&slot);
         slot.shutdown();
         // The kill closed the pipes, the drains hit EOF, the worker
@@ -634,7 +765,7 @@ mod tests {
         let cmd = script(&format!("type nul > {}", marker.display()));
         let slot = ChildSlot::default();
         slot.shutdown();
-        let outcome = run_parked(cmd, SourceId(0), &slot, &[]);
+        let outcome = run_parked(cmd, SourceId(0), &slot, &[], ample());
         let err = outcome.spawn_error.expect("barred spawn reports an error");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
         assert!(!marker.exists(), "the child must never have spawned");
@@ -644,7 +775,15 @@ mod tests {
     fn dropping_the_guard_shuts_the_slot_down() {
         let slot = ChildSlot::default();
         let (tx, rx) = mpsc::channel();
-        spawn_tick(sleeper(), SourceId(0), slot.clone(), tx, Vec::new()).expect("spawn worker");
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
         wait_until_parked(&slot);
         // The RAII half: a guard going out of scope is the shutdown.
         // (Which is why run() must HOLD its guard in a named binding —
@@ -658,7 +797,7 @@ mod tests {
         // The tag every per-source resource is indexed by: it rides the
         // outcome home, so a drain never has to guess who finished.
         // Both paths carry it — the inline one and the worker's.
-        let outcome = run_tick(script("echo tagged"), SourceId(2), Vec::new());
+        let outcome = run_tick(script("echo tagged"), SourceId(2), Vec::new(), ample());
         assert_eq!(outcome.source, SourceId(2));
 
         let (tx, rx) = mpsc::channel();
@@ -668,6 +807,7 @@ mod tests {
             ChildSlot::default(),
             tx,
             Vec::new(),
+            ample(),
         )
         .expect("spawn worker");
         let posted = rx
@@ -685,7 +825,7 @@ mod tests {
         let cmd = script("echo hi; exit 3");
         #[cfg(windows)]
         let cmd = script("echo hi & exit 3");
-        let outcome = run_tick(cmd, SourceId(0), Vec::new());
+        let outcome = run_tick(cmd, SourceId(0), Vec::new(), ample());
         assert!(outcome.spawn_error.is_none());
         assert!(contains(&outcome.stdout.concat(), b"hi"));
         assert_eq!(outcome.status.and_then(|status| status.code()), Some(3));
@@ -699,6 +839,7 @@ mod tests {
             std::process::Command::new("definitely-no-such-binary-xyz"),
             SourceId(0),
             Vec::new(),
+            ample(),
         );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.status.is_none());
