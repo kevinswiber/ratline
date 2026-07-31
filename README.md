@@ -295,12 +295,30 @@ has nothing to schedule.
 **A side effect on a watched path is a loop.** If a pane's command
 touches a file that any pane triggers on — another pane's or its own —
 then those panes drive each other for as long as the dashboard runs, at
-a rate you did not choose. Nothing on screen will say so: a pane's
+a rate you did not choose. The frame itself will not say so: a pane's
 stamp moves only when its output *changes*, so a loop whose output is
 constant never repaints, and a dashboard can sit there spawning a shell
 several times a second looking perfectly still. `interval "never"` is
 not a brake — it removes the clock, and the trigger is what runs the
 command. Point a trigger at a path no pane writes.
+
+**rat says so when it notices.** A pane it suspects of looping carries
+`· looping` on its chrome row, where a failing pane shows `· exit N`,
+and the first time a loop is noticed one row names the panes involved
+and the paths they watch, so you can check the claim against what you
+declared. **Nothing is stopped.** Those panes keep running at whatever
+rate they had — the report is a report. Press `?` for what the badge
+means and both ways to fix it.
+
+It can be wrong, and it can say nothing at all. rat cannot see who
+writes a file. What it sees is that a watched path changes while the
+dashboard is busy and never while it is idle, which is what a loop
+looks like — and also what a pane fed only by other panes looks like.
+A dashboard whose panes are busy most of the time has too little idle
+time for that test to mean anything, so rat declines to answer rather
+than guess, and a loop of slow commands is the kind it misses. Treat
+the paragraph above as the fix and the badge as a warning you might
+not get.
 
 Cost, rather than correctness, has a lever: a pane declared
 `interval "never"` with a `trigger` runs only when its trigger says
