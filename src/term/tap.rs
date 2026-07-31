@@ -947,6 +947,22 @@ mod trigger_reader_tests {
         assert!(err.contains("file:"), "{err}"); // S_ISREG teaches file:
     }
 
+    /// Await one fire with a tight poll. The overflow tests do hundreds of
+    /// round trips, and `wait_until`'s 10 ms sleep turns that into a
+    /// multi-second nap that timed out on a loaded CI runner.
+    fn poke(reader: &TriggerReader, writer: &mut std::fs::File) {
+        reader.fired().store(false, Ordering::SeqCst);
+        writer.write_all(b"x").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if reader.fired().load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        panic!("the write never reached the reader");
+    }
+
     /// Open a fifo reader and a writer onto it.
     fn fifo_pair(dir: &std::path::Path) -> (TriggerReader, std::fs::File) {
         let path = dir.join("t.fifo");
@@ -1023,9 +1039,7 @@ mod trigger_reader_tests {
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
         for _ in 0..5 {
-            reader.fired().store(false, Ordering::SeqCst);
-            writer.write_all(b"x").unwrap();
-            assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+            poke(&reader, &mut writer);
         }
         assert_eq!(reader.take_arrivals().len(), 5);
     }
@@ -1069,9 +1083,7 @@ mod trigger_reader_tests {
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
         for _ in 0..(ARRIVAL_CAP * 2) {
-            reader.fired().store(false, Ordering::SeqCst);
-            writer.write_all(b"x").unwrap();
-            assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+            poke(&reader, &mut writer);
         }
         assert!(reader.overflowed(), "a drop must be observable");
         assert!(
@@ -1088,9 +1100,7 @@ mod trigger_reader_tests {
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
         for _ in 0..(ARRIVAL_CAP + 1) {
-            reader.fired().store(false, Ordering::SeqCst);
-            writer.write_all(b"x").unwrap();
-            assert!(wait_until(|| reader.fired().load(Ordering::SeqCst)));
+            poke(&reader, &mut writer);
         }
         assert!(reader.overflowed());
         assert!(!reader.overflowed(), "the flag did not clear on read");
