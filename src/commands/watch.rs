@@ -282,6 +282,26 @@ pub(crate) fn run_registry(
             }
         })
         .collect();
+    // The same idea for the reader route: its evidence is keyed by trigger,
+    // not by path, because a fifo has nothing to stat. Empty on Windows,
+    // which keeps the crossterm pump and opens no readers at all.
+    let per_source_readers: Vec<Vec<crate::core::trigger::TriggerKey>> = registry
+        .ids()
+        .map(|id| {
+            if cfg!(unix) && armed {
+                registry
+                    .spec(id)
+                    .triggers
+                    .iter()
+                    .filter(|spec| !matches!(spec, TriggerSpec::File(_)))
+                    .map(reader_key)
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    let observing = !watched_union.is_empty();
     // The observer's own baselines, deliberately separate from every
     // MtimeWatchSet over the same paths: sharing them would let an observer
     // poll consume a trigger's fire, and the pane would stop refreshing.
@@ -426,7 +446,7 @@ pub(crate) fn run_registry(
                 // the next idle poll then reports the change as EXOGENOUS,
                 // which vetoes the very pane that made it. Opening early
                 // can only widen the window, never lose a write.
-                if !watched_union.is_empty() {
+                if observing {
                     let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
                     runtime[id.0].bracket = Some(opened);
                 }
@@ -729,6 +749,11 @@ pub(crate) fn run_registry(
             let mut notices: Vec<String> = Vec::new();
             for id in registry.ids() {
                 let r = &mut runtime[id.0];
+                // Before the gate consumes `fired`: the drain is a
+                // separate output of the same reader, and one pass over
+                // the slots touches each reader once.
+                #[cfg(unix)]
+                drain_reader_arrivals(&r.readers, &mut log, now);
                 #[cfg(unix)]
                 for slot in &mut r.readers {
                     if slot.reader.fired().swap(false, Ordering::SeqCst) {
@@ -761,7 +786,7 @@ pub(crate) fn run_registry(
             log.evict(now);
             // Then one evaluation, for the whole dashboard: the graph it tests
             // is a whole-dashboard object, not a per-source one.
-            if !watched_union.is_empty() {
+            if observing {
                 let panes: Vec<crate::core::trigger::PaneWindow<'_>> = registry
                     .ids()
                     .map(|id| crate::core::trigger::PaneWindow {
@@ -771,7 +796,7 @@ pub(crate) fn run_registry(
                         // dashboard stop being suspected.
                         trigger_respawns: log.respawns_in_window(id, now),
                         watched: &per_source_watched[id.0],
-                        readers: &[],
+                        readers: &per_source_readers[id.0],
                     })
                     .collect();
                 let verdict = suspicion.evaluate(now, &ledger, &log, &panes);
@@ -1411,6 +1436,65 @@ struct ReaderSlot {
     reader: TriggerReader,
     spec: TriggerSpec,
     ended_seen: bool,
+}
+
+/// A reader trigger's key: its spec's canonical string.
+///
+/// **One definition, deliberately.** The drain writes arrivals under this key
+/// and the evaluation looks them up under it, from two different places in the
+/// loop. Building the string independently at each end would let them drift
+/// into silent disagreement — the lookup would find nothing, the route would
+/// contribute no evidence, and NOTHING would report an error, because "this
+/// trigger saw no arrivals" is a legitimate state. That failure is invisible
+/// by construction, so the possibility is removed rather than tested for.
+///
+/// Not `cfg(unix)`, even though only unix opens readers: the evaluation builds
+/// its key list with a `cfg!(unix)` runtime test, so Windows still compiles
+/// the reference and would fail to find a compile-time-gated definition. It is
+/// permanently dead there instead, which is the same shape as the rest of the
+/// unix-only surface.
+#[cfg_attr(windows, allow(dead_code))]
+fn reader_key(spec: &TriggerSpec) -> crate::core::trigger::TriggerKey {
+    crate::core::trigger::TriggerKey(spec.to_string())
+}
+
+/// Hand this source's reader arrivals to the window, and report a lost one.
+///
+/// **Why there is no in-flight flag here.** The obvious design — a shared
+/// `AtomicBool` the reader samples to say "something was running" — is simpler
+/// and cannot work. It records *that* a child was in flight, never *which*
+/// source's bracket covered the arrival, so the per-pane coverage and
+/// median-width stages of the credit rule would have no input and this route
+/// could not feed the graph test at all. It also cannot reconstruct aggregate
+/// duty over the window when children overlap, because a boolean cannot be
+/// unioned. Do not reinvent it.
+///
+/// So the reader reports **when**, and the window decides what it means:
+/// `observe_arrival` resolves each instant against the brackets the loop
+/// already owns. Nothing is pre-judged here — an arrival older than the window
+/// is still handed over, and eviction drops it, because a drain that filtered
+/// would be a second place deciding what counts.
+///
+/// The identity is not optional. Two fifos on one pane are two separate bodies
+/// of evidence, and merging them under a source id would make the per-path
+/// stages inapplicable to this route.
+#[cfg(unix)]
+fn drain_reader_arrivals(
+    slots: &[ReaderSlot],
+    log: &mut crate::core::trigger::WindowLog,
+    now: Instant,
+) {
+    for slot in slots {
+        let key = reader_key(&slot.spec);
+        for at in slot.reader.take_arrivals() {
+            log.observe_arrival(key.clone(), at);
+        }
+        // Read every iteration, and it reports-and-clears: one lost arrival
+        // makes THIS window abstain, not every window after it.
+        if slot.reader.overflowed() {
+            log.record_overflow(now);
+        }
+    }
 }
 
 /// Which surface the loop is showing. `pause` and (later) a live window
@@ -4256,6 +4340,160 @@ mod tests {
             let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
             assert_eq!(program_of(&cmd), shell);
             assert_eq!(argv_of(&cmd), ["/C", "echo hi"]);
+        }
+    }
+
+    /// The drain seam, tested with real readers: the route is unix-only
+    /// and a fifo is what it actually reads.
+    #[cfg(unix)]
+    mod reader_arrivals {
+        use super::*;
+        use crate::core::trigger::{TriggerKey, WindowLog};
+        use crate::term::tap::TriggerReader;
+
+        fn mkfifo(path: &std::path::Path) {
+            let cpath =
+                std::ffi::CString::new(path.as_os_str().as_encoded_bytes().to_vec()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+        }
+
+        fn slot(dir: &std::path::Path, name: &str) -> (ReaderSlot, std::fs::File) {
+            let path = dir.join(name);
+            mkfifo(&path);
+            let spec = TriggerSpec::Fifo(path.clone());
+            let reader = TriggerReader::open(&spec, None).unwrap();
+            let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            (
+                ReaderSlot {
+                    reader,
+                    spec,
+                    ended_seen: false,
+                },
+                writer,
+            )
+        }
+
+        fn poke(slot: &ReaderSlot, writer: &mut std::fs::File) {
+            use std::io::Write;
+            slot.reader.fired().store(false, Ordering::SeqCst);
+            writer.write_all(b"x").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if slot.reader.fired().load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            panic!("the write never reached the reader");
+        }
+
+        #[test]
+        fn an_arrival_is_drained_and_resolved_against_the_bracket_log() {
+            // The whole seam. The reader supplied a timestamp; this is
+            // where it gains meaning, and WindowLog decides what it
+            // means — not the drain.
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "a.fifo");
+            let mut log = WindowLog::new(Duration::from_secs(30));
+            let key =
+                TriggerKey("fifo:".to_string() + &dir.path().join("a.fifo").display().to_string());
+
+            poke(&s, &mut w);
+            drain_reader_arrivals(std::slice::from_ref(&s), &mut log, Instant::now());
+            let idle = log.arrivals(&key);
+            assert_eq!(idle.len(), 1, "the arrival never reached the log");
+            assert!(
+                idle[0].containing.is_empty(),
+                "nothing was in flight, so this is EXOGENOUS"
+            );
+
+            // Now with a child covering it.
+            log.open_bracket(SourceId(0), Instant::now(), Vec::new());
+            poke(&s, &mut w);
+            drain_reader_arrivals(std::slice::from_ref(&s), &mut log, Instant::now());
+            let all = log.arrivals(&key);
+            assert_eq!(all.len(), 2);
+            assert!(
+                !all[1].containing.is_empty(),
+                "a bracket covered it, so this is ENDOGENOUS"
+            );
+        }
+
+        #[test]
+        fn draining_arrivals_does_not_disturb_the_fired_flag() {
+            // The gate swaps `fired` to decide a respawn. If the drain
+            // consumed it, a fire would be lost and the pane would stop
+            // refreshing with nothing on screen to say why.
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "a.fifo");
+            let mut log = WindowLog::new(Duration::from_secs(30));
+            poke(&s, &mut w);
+            drain_reader_arrivals(std::slice::from_ref(&s), &mut log, Instant::now());
+            assert!(
+                s.reader.fired().load(Ordering::SeqCst),
+                "the drain cleared the gate's flag"
+            );
+        }
+
+        #[test]
+        fn each_arrival_is_passed_with_its_trigger_identity() {
+            // Two fifos on ONE pane must land under different keys, or
+            // the per-path stages of the credit rule cannot be applied
+            // to this route at all.
+            let dir = tempfile::tempdir().unwrap();
+            let (a, mut wa) = slot(dir.path(), "a.fifo");
+            let (b, mut wb) = slot(dir.path(), "b.fifo");
+            let mut log = WindowLog::new(Duration::from_secs(30));
+            poke(&a, &mut wa);
+            poke(&b, &mut wb);
+            poke(&b, &mut wb);
+            drain_reader_arrivals(&[a, b], &mut log, Instant::now());
+            let ka =
+                TriggerKey("fifo:".to_string() + &dir.path().join("a.fifo").display().to_string());
+            let kb =
+                TriggerKey("fifo:".to_string() + &dir.path().join("b.fifo").display().to_string());
+            assert_eq!(log.arrivals(&ka).len(), 1);
+            assert_eq!(log.arrivals(&kb).len(), 2);
+        }
+
+        #[test]
+        fn a_reader_overflow_makes_the_window_abstain() {
+            // Missing evidence is not absent evidence — the whole veto
+            // is a zero test, so a lost arrival must abstain, not accuse.
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "a.fifo");
+            let mut log = WindowLog::new(Duration::from_secs(30));
+            let now = Instant::now();
+            assert!(!log.evidence_lost(now), "nothing lost yet");
+            for _ in 0..(crate::term::tap::ARRIVAL_CAP + 1) {
+                poke(&s, &mut w);
+            }
+            drain_reader_arrivals(std::slice::from_ref(&s), &mut log, now);
+            assert!(log.evidence_lost(now), "the overflow never reached the log");
+        }
+
+        #[test]
+        fn arrivals_are_handed_over_as_timestamps_not_pre_judged() {
+            // Eviction is WindowLog's job. This pins that the drain
+            // passes the reader's instant through unchanged rather than
+            // filtering or re-stamping it: an arrival recorded before
+            // the window opened must still ARRIVE, and be dropped by
+            // eviction, not silently skipped here.
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "a.fifo");
+            let mut log = WindowLog::new(Duration::from_millis(50));
+            let key =
+                TriggerKey("fifo:".to_string() + &dir.path().join("a.fifo").display().to_string());
+            poke(&s, &mut w);
+            std::thread::sleep(Duration::from_millis(120));
+            let now = Instant::now();
+            drain_reader_arrivals(std::slice::from_ref(&s), &mut log, now);
+            assert_eq!(log.arrivals(&key).len(), 1, "the drain pre-judged it");
+            log.evict(now);
+            assert!(
+                log.arrivals(&key).is_empty(),
+                "eviction, not the drain, is what drops it"
+            );
         }
     }
 }

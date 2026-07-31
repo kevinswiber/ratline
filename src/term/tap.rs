@@ -598,11 +598,7 @@ pub struct TriggerReader {
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Staged: recorded here, drained when the loop wires this route.
-    #[allow(dead_code)]
     arrivals: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>,
-    /// Staged: read beside the drain, in the same pass.
-    #[allow(dead_code)]
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -747,11 +743,6 @@ impl TriggerReader {
     /// distinguish. The two must never be folded into one call: a drain
     /// that consumed `fired` would lose a fire and the pane would
     /// silently stop refreshing.
-    ///
-    /// Staged: the loop's trigger arm is its only caller. An allow that
-    /// survives the wiring task means something the plan said would be
-    /// called is not.
-    #[allow(dead_code)]
     pub fn take_arrivals(&self) -> Vec<std::time::Instant> {
         let mut queue = self
             .arrivals
@@ -767,9 +758,6 @@ impl TriggerReader {
     /// makes *that* window abstain; a sticky flag would make every later
     /// window abstain too, and a badge that can never clear is the
     /// failure this whole design is built to avoid.
-    ///
-    /// Staged: drained in the same pass as `take_arrivals`.
-    #[allow(dead_code)]
     pub fn overflowed(&self) -> bool {
         self.overflowed
             .swap(false, std::sync::atomic::Ordering::SeqCst)
