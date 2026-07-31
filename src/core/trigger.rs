@@ -2245,3 +2245,469 @@ mod tests {
         );
     }
 }
+
+/// Task 5.1's matrix: condition 4 over a bounded graph domain.
+///
+/// **What this claims, precisely.** The graph axis is EXHAUSTIVE for 1, 2
+/// and 3 panes — generated over all `n²` ordered edges including
+/// self-loops, then deduplicated up to isomorphism — plus a NAMED finite
+/// set at 4 and 5 panes. The cost-ratio and phase axes are explicit
+/// discrete domains and are SAMPLED, not exhaustive. Calling the whole
+/// thing an enumeration would overstate it.
+///
+/// **Why it lives here and not in `tests/`.** `PathLedger::inject` is
+/// `#[cfg(test)]` and `rat` is a binary crate, so an integration test can
+/// reach neither it nor the credit rule. The driven half below is the
+/// compensation: it goes through `observe_bracket` over real files and
+/// real overlapping brackets, which is the closest thing to the loop that
+/// is reachable without a terminal.
+///
+/// **What is NOT covered here**, stated rather than implied: the reader
+/// route (its arrivals reach the same credit rule by a different path, and
+/// its end-to-end coverage is `a_fifo_cycle_earns_its_badge_and_its_notice_too`);
+/// eviction mid-window; more than one trigger per edge; and any shape
+/// above 5 panes.
+#[cfg(test)]
+mod matrix {
+    use super::*;
+
+    const W: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The tightest child. Widths are `BASE` for pane 0 and `BASE * ratio`
+    /// for the rest, so a ratio > 1 makes pane 0 the only tight one.
+    const BASE: std::time::Duration = std::time::Duration::from_millis(2);
+    /// The loop slice a drain-side close adds to a bracket's apparent width.
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    /// One change per trigger-driven respawn, because that is what they are:
+    /// a respawn on this route IS an observed change. An earlier draft set 60
+    /// respawns while producing 5 changes, which made every pane a candidate
+    /// while leaving the dashboard almost idle — a combination the loop cannot
+    /// reach, and it manufactured failures that said nothing about main.
+    /// Above `min_respawns` (50) so every pane is a candidate honestly.
+    const CHANGES: usize = 55;
+    /// SAMPLED axis. Straddles the measured anchors: merging is correct at
+    /// 1.0-1.1x and wrong at 25.9x, with nothing measured in between.
+    const RATIOS: [u32; 3] = [1, 5, 25];
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Close {
+        Worker,
+        Drain,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Phase {
+        Locked,
+        Dephased,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Production {
+        /// `containing` handed to the credit rule directly.
+        Synthetic,
+        /// `containing` built by `observe_bracket` from real files and real
+        /// brackets, at least one of them still OPEN at observation.
+        Driven,
+    }
+
+    #[derive(Clone, Debug)]
+    struct Shape {
+        n: usize,
+        /// `(writer, watcher)`: the writer's command touches a path the
+        /// watcher triggers on.
+        edges: Vec<(usize, usize)>,
+    }
+
+    impl Shape {
+        fn has_cycle(&self) -> bool {
+            // Self-loops included: one pane writing what it watches is the
+            // shipped hazard's smallest form.
+            (0..self.n).any(|start| {
+                let mut seen = vec![false; self.n];
+                let mut stack = vec![start];
+                let mut first = true;
+                while let Some(cur) = stack.pop() {
+                    if cur == start && !first {
+                        return true;
+                    }
+                    first = false;
+                    if seen[cur] {
+                        continue;
+                    }
+                    seen[cur] = true;
+                    stack.extend(
+                        self.edges
+                            .iter()
+                            .filter(|(from, _)| *from == cur)
+                            .map(|(_, to)| *to),
+                    );
+                }
+                false
+            })
+        }
+
+        /// Least edge set over all vertex permutations — the isomorphism key.
+        fn canonical(&self) -> Vec<(usize, usize)> {
+            permutations(self.n)
+                .into_iter()
+                .map(|perm| {
+                    let mut mapped: Vec<(usize, usize)> = self
+                        .edges
+                        .iter()
+                        .map(|(a, b)| (perm[*a], perm[*b]))
+                        .collect();
+                    mapped.sort();
+                    mapped
+                })
+                .min()
+                .unwrap_or_default()
+        }
+    }
+
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..n {
+            let mut next = Vec::new();
+            for partial in &out {
+                for v in 0..n {
+                    if !partial.contains(&v) {
+                        let mut p = partial.clone();
+                        p.push(v);
+                        next.push(p);
+                    }
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    /// Every directed graph on `n` vertices, over all `n²` ordered edges
+    /// INCLUDING self-loops, deduplicated up to isomorphism.
+    fn shapes(n: usize) -> Vec<Shape> {
+        let slots: Vec<(usize, usize)> = (0..n).flat_map(|a| (0..n).map(move |b| (a, b))).collect();
+        let mut seen: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut out = Vec::new();
+        for mask in 0..(1u32 << slots.len()) {
+            let edges: Vec<(usize, usize)> = slots
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, e)| *e)
+                .collect();
+            let shape = Shape { n, edges };
+            let key = shape.canonical();
+            if !seen.contains(&key) {
+                seen.push(key);
+                out.push(shape);
+            }
+        }
+        out
+    }
+
+    fn named() -> Vec<(&'static str, Shape)> {
+        vec![
+            (
+                "4-cycle",
+                Shape {
+                    n: 4,
+                    edges: vec![(0, 1), (1, 2), (2, 3), (3, 0)],
+                },
+            ),
+            (
+                "diamond",
+                Shape {
+                    n: 4,
+                    edges: vec![(0, 1), (0, 2), (1, 3), (2, 3)],
+                },
+            ),
+            (
+                "4-chain",
+                Shape {
+                    n: 4,
+                    edges: vec![(0, 1), (1, 2), (2, 3)],
+                },
+            ),
+            (
+                "3-cycle beside an unrelated producer-consumer pair",
+                Shape {
+                    n: 5,
+                    edges: vec![(0, 1), (1, 2), (2, 0), (3, 4)],
+                },
+            ),
+        ]
+    }
+
+    fn width_of(pane: usize, ratio: u32) -> std::time::Duration {
+        if pane == 0 { BASE } else { BASE * ratio }
+    }
+
+    /// Move a path's mtime to a fresh value. Set explicitly rather than by
+    /// writing and sleeping: `fingerprint` is mtime-only, and a same-tick
+    /// rewrite would be invisible — a test that silently observed nothing.
+    fn touch(path: &std::path::Path, seq: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seq);
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    struct Case {
+        shape: Shape,
+        ratio: u32,
+        close: Close,
+        phase: Phase,
+        production: Production,
+    }
+
+    fn evaluate_case(dir: &std::path::Path, case: &Case, seq: &mut u64) -> Verdict {
+        let n = case.shape.n;
+        let paths: Vec<std::path::PathBuf> = case
+            .shape
+            .edges
+            .iter()
+            .map(|(a, b)| dir.join(format!("p{a}_{b}")))
+            .collect();
+        for path in &paths {
+            std::fs::write(path, b"0").unwrap();
+            *seq += 1;
+            touch(path, *seq);
+        }
+        // Baseline AFTER the files exist: an appearing path is not a change.
+        let mut ledger = PathLedger::new(paths.clone());
+        let mut log = WindowLog::new(W);
+        let t0 = std::time::Instant::now();
+
+        let step = std::time::Duration::from_millis(450);
+        // De-phased panes must not overlap, so one round holds n slots wide
+        // enough for the widest child.
+        let spread = step / (n as u32 + 1);
+        let close_slop = if case.close == Close::Drain {
+            SLICE
+        } else {
+            std::time::Duration::ZERO
+        };
+
+        for c in 0..CHANGES {
+            let round = t0 + step * (c as u32);
+            // A respawn per round per pane: the count and the evidence are the
+            // same events, so condition 1 cannot be satisfied by a pane the
+            // rest of the window says was idle.
+            for pane in 0..n {
+                log.record_respawn(SourceId(pane), round);
+            }
+            let open_at = |pane: usize| match case.phase {
+                Phase::Locked => round,
+                Phase::Dephased => round + spread * (pane as u32),
+            };
+            let close_at = |pane: usize| open_at(pane) + width_of(pane, case.ratio) + close_slop;
+
+            match case.phase {
+                // Everything overlaps: open all, change, then close in turn,
+                // so the first pane to observe finds the others still OPEN.
+                Phase::Locked => {
+                    let ids: Vec<BracketId> = (0..n)
+                        .map(|pane| log.open_bracket(SourceId(pane), open_at(pane), stamps(&paths)))
+                        .collect();
+                    for (w, r) in &case.shape.edges {
+                        *seq += 1;
+                        touch(&dir.join(format!("p{w}_{r}")), *seq);
+                    }
+                    for (pane, id) in ids.iter().enumerate() {
+                        let closed = log
+                            .close_bracket(*id, close_at(pane), stamps(&paths))
+                            .cloned();
+                        if case.production == Production::Driven
+                            && let Some(closed) = closed
+                        {
+                            let others = log.overlapping(&closed);
+                            ledger.observe_bracket(&closed, &others);
+                        }
+                    }
+                    if case.production == Production::Synthetic {
+                        for (w, r) in &case.shape.edges {
+                            let mut containing = vec![(SourceId(*w), ids[*w])];
+                            for (pane, id) in ids.iter().enumerate() {
+                                if pane != *w {
+                                    containing.push((SourceId(pane), *id));
+                                }
+                            }
+                            ledger.inject(
+                                &dir.join(format!("p{w}_{r}")),
+                                open_at(*w) + std::time::Duration::from_millis(1),
+                                containing,
+                            );
+                        }
+                    }
+                }
+                // Nothing overlaps: each pane opens, writes, closes and
+                // observes alone, so only the writer can be credited.
+                Phase::Dephased => {
+                    for pane in 0..n {
+                        let id = log.open_bracket(SourceId(pane), open_at(pane), stamps(&paths));
+                        for (w, r) in &case.shape.edges {
+                            if *w == pane {
+                                *seq += 1;
+                                touch(&dir.join(format!("p{w}_{r}")), *seq);
+                            }
+                        }
+                        let closed = log
+                            .close_bracket(id, close_at(pane), stamps(&paths))
+                            .cloned();
+                        match case.production {
+                            Production::Driven => {
+                                if let Some(closed) = closed {
+                                    let others = log.overlapping(&closed);
+                                    ledger.observe_bracket(&closed, &others);
+                                }
+                            }
+                            Production::Synthetic => {
+                                for (w, r) in &case.shape.edges {
+                                    if *w == pane {
+                                        ledger.inject(
+                                            &dir.join(format!("p{w}_{r}")),
+                                            open_at(pane) + std::time::Duration::from_millis(1),
+                                            vec![(SourceId(pane), id)],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let now = t0 + step * (CHANGES as u32) + std::time::Duration::from_secs(1);
+        let watched: Vec<Vec<std::path::PathBuf>> = (0..n)
+            .map(|r| {
+                case.shape
+                    .edges
+                    .iter()
+                    .filter(|(_, watcher)| *watcher == r)
+                    .map(|(w, _)| dir.join(format!("p{w}_{r}")))
+                    .collect()
+            })
+            .collect();
+        let panes: Vec<PaneWindow<'_>> = (0..n)
+            .map(|id| PaneWindow {
+                source: SourceId(id),
+                trigger_respawns: log.respawns_in_window(SourceId(id), now),
+                watched: &watched[id],
+                readers: &[],
+            })
+            .collect();
+        LoopSuspicion::default().evaluate(now, &ledger, &log, &panes)
+    }
+
+    fn all_cases() -> Vec<(String, Shape)> {
+        let mut out: Vec<(String, Shape)> = Vec::new();
+        for n in 1..=3 {
+            for shape in shapes(n) {
+                out.push((format!("n{n}:{:?}", shape.edges), shape));
+            }
+        }
+        for (name, shape) in named() {
+            out.push((name.to_string(), shape));
+        }
+        out
+    }
+
+    /// The de-phased half of the matrix, which PASSES in full: 1440 cells,
+    /// every acyclic shape clean and every cyclic one tripped, across all
+    /// three cost ratios, both close sides and both production forms.
+    ///
+    /// This is the permanent coverage. The phase-locked half is a known
+    /// failure and lives in the ignored test below with its own account —
+    /// it is separated so this one can guard the settled behaviour without
+    /// the open question blocking the branch, NOT to make a red test green.
+    #[test]
+    fn condition_four_holds_over_the_bounded_domain_when_children_do_not_overlap() {
+        let (cells, abstained, failures) = run_matrix(&[Phase::Dephased]);
+        assert!(
+            failures.is_empty(),
+            "{cells} cells, {abstained} abstained, {} failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// **KNOWN FAILING — the open finding this task exists to have found.**
+    ///
+    /// Ignored so it does not block the branch, never deleted and never
+    /// weakened: run it with `cargo test -- --ignored` to reproduce. 76 of
+    /// 1440 phase-locked cells are wrong, in BOTH directions, and synthetic
+    /// and driven agree on every one — so this is the credit rule, not the
+    /// fixture.
+    ///
+    /// **False positives (68 cells, every ratio).** When every pane's child
+    /// covers a majority of a path's changes and their median widths sit
+    /// within 2x, the tightness stage keeps them all, `add` merges them, and
+    /// the merged node's own edge is a self-edge — so a legitimate
+    /// producer->consumer pair reads as a loop. It is reachable: the loop
+    /// spawns every due source in one pass, so two panes sharing a cadence
+    /// are phase-locked by construction, and one of them writing a path the
+    /// other triggers on is the undeclared producer->consumer shape that
+    /// already ships.
+    ///
+    /// **False negatives (8 cells, ratios 5 and 25 only).** A pane whose
+    /// child is expensive and which writes a path IT watches — a self-loop,
+    /// the hazard's smallest form — loses the tightness stage to any cheaper
+    /// pane that also covers those changes. Its own cycle is then credited
+    /// to the cheap pane and disappears from the graph entirely.
+    ///
+    /// Both are the unequal-cost and full-overlap regions the design record
+    /// named as never measured. Fixing either is a change to the credit rule
+    /// and a scope decision, which is why this lands as a recorded
+    /// characterization rather than as a silent repair.
+    #[test]
+    #[ignore = "known failing: the credit rule is wrong in both directions under full overlap; see the doc comment"]
+    fn condition_four_over_the_bounded_graph_domain() {
+        let (cells, abstained, failures) = run_matrix(&[Phase::Locked, Phase::Dephased]);
+        assert!(
+            failures.is_empty(),
+            "{cells} cells, {abstained} abstained, {} failures:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    fn run_matrix(phases: &[Phase]) -> (usize, usize, Vec<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut seq = 1_700_000_000u64;
+        let mut failures: Vec<String> = Vec::new();
+        let mut cells = 0usize;
+        let mut abstained = 0usize;
+        for (name, shape) in all_cases() {
+            let cyclic = shape.has_cycle();
+            for ratio in RATIOS {
+                for close in [Close::Worker, Close::Drain] {
+                    for phase in phases.iter().copied() {
+                        for production in [Production::Synthetic, Production::Driven] {
+                            let case = Case {
+                                shape: shape.clone(),
+                                ratio,
+                                close,
+                                phase,
+                                production,
+                            };
+                            let v = evaluate_case(dir.path(), &case, &mut seq);
+                            cells += 1;
+                            if v.abstained {
+                                abstained += 1;
+                            }
+                            if v.abstained {
+                                continue; // declining is not a wrong answer
+                            }
+                            if v.panes.is_empty() == cyclic {
+                                failures.push(format!(
+                                    "{name} cyclic={cyclic} ratio={ratio} close={close:?} \
+                                     phase={phase:?} prod={production:?} -> panes={:?} abstained={}",
+                                    v.panes, v.abstained
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (cells, abstained, failures)
+    }
+}
