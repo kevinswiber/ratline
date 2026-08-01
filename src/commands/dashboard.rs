@@ -63,6 +63,9 @@ fn pane_help(registry: &Registry) -> Vec<String> {
             lines.push(format!("      {trigger}"));
         }
     }
+    if registry.ids().any(|id| registry.spec(id).live) {
+        lines.extend(LIVE_HELP.iter().map(|l| (*l).to_string()));
+    }
     if registry
         .ids()
         .any(|id| !registry.spec(id).triggers.is_empty())
@@ -71,6 +74,31 @@ fn pane_help(registry: &Registry) -> Vec<String> {
     }
     lines
 }
+
+/// What the `live` label means, and what `interval` means under it.
+///
+/// **Static, like the looping section below**: `pane_help` runs once at
+/// startup, so this states the contract rather than live state.
+///
+/// The `interval` sentence is the load-bearing one and is not guessable:
+/// on a live pane the interval does nothing while the child runs, and
+/// becomes the delay before a replacement spawns if it exits. Written as
+/// what the knob DOES today, not as a promise that it is the only knob
+/// there will ever be — a dedicated backoff can join it without making
+/// this section a lie.
+///
+/// Wrapped by hand: `?` pages plain grouped text through the pager, so
+/// there is no wrapping engine to lean on, and nothing here may exceed
+/// the width the key table already sets.
+const LIVE_HELP: &[&str] = &[
+    "",
+    "  live panes:",
+    "    A pane marked `live` runs one long-lived command, spawned once",
+    "    and painted as it prints — it is not on a cadence. Its",
+    "    `interval` is how soon a replacement spawns if the child exits,",
+    "    not how often it runs. `interval \"never\"` means no replacement:",
+    "    the pane keeps its exit badge.",
+];
 
 /// What `· looping` means, and what to do about it.
 ///
@@ -174,6 +202,79 @@ mod tests {
         .expect("a valid two-pane registry")
     }
 
+    /// One live follower beside one batch pane — the mixed dashboard
+    /// the help must serve. The live pane keeps its tail, as load
+    /// would have enforced.
+    fn live_registry() -> Registry {
+        let batch = SourceSpec {
+            name: "a".to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval: Some(Duration::from_secs(5)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+            live: false,
+        };
+        let follow = SourceSpec {
+            name: "follow".to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval: Some(Duration::from_secs(2)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+            live: true,
+        };
+        let pane = |overflow| PaneBox {
+            height: 5,
+            width: PaneWidth::Weight(1),
+            overflow,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: true,
+        };
+        Registry::panes(
+            vec![batch, follow],
+            vec![pane(Overflow::KeepTop), pane(Overflow::KeepBottom)],
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            1,
+            0,
+        )
+        .expect("a valid two-pane registry")
+    }
+
+    #[test]
+    fn the_help_explains_what_interval_means_on_a_live_pane() {
+        // The owner contract, stated where a chrome row has no room:
+        // `interval` on a live pane is the respawn delay. Not a
+        // guessable fact — nothing on the pane says it. De-wrapped
+        // before matching, for the same reason as the looping test.
+        let lines = pane_help(&live_registry());
+        assert!(
+            lines.contains(&"    follow  live".to_string()),
+            "the pane list must carry the live label: {lines:?}"
+        );
+        let text = lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        assert!(text.contains("live panes:"), "got {text}");
+        assert!(text.contains("how soon a replacement spawns"), "got {text}");
+        assert!(text.contains("not how often it runs"), "got {text}");
+        // And the opt-out, which is the same contract's other half:
+        // `interval "never"` on a live pane means no replacement.
+        assert!(text.contains("no replacement"), "got {text}");
+    }
+
+    #[test]
+    fn the_live_help_is_absent_when_no_pane_is_live() {
+        // The trigger-only dashboard must not gain the live section —
+        // and the no-trigger, no-live case is already pinned
+        // byte-identical below.
+        let text = pane_help(&registry(true)).join(" ");
+        assert!(!text.contains("live panes:"), "got {text}");
+    }
+
     #[test]
     fn the_help_explains_the_badge_and_names_the_fix() {
         // De-wrapped before matching. The section is wrapped by hand,
@@ -205,7 +306,10 @@ mod tests {
         // key table is one the pager has to chop. 74 is the widest row
         // that ships (`p  freeze the frame in place …`); this section
         // may reach it and must not pass it.
-        for line in pane_help(&registry(true)) {
+        for line in pane_help(&registry(true))
+            .into_iter()
+            .chain(pane_help(&live_registry()))
+        {
             assert!(
                 line.chars().count() <= 74,
                 "{} cells: {line:?}",
