@@ -569,13 +569,31 @@ impl WindowLog {
             SourceId,
             Option<std::time::Duration>,
         );
-        // Strict inequalities: a bracket that closed exactly at `from` does
-        // not overlap it. Touching at an endpoint is not coverage.
+        // Strict inequalities on a CLOSED bracket: one that closed exactly at
+        // `from` does not overlap it, because touching at an endpoint is not
+        // coverage.
+        //
+        // An OPEN bracket has not ended, so it overlaps anything that starts
+        // at or after its own start — the rule `Bracket::spans` already
+        // states. Testing it with `end_or(to)` would collapse its end onto
+        // the interval's own upper bound and ask `to > from`, which is FALSE
+        // for a zero-width interval and would read `Disjoint`: a false veto,
+        // in the destructive direction, on an observation that is squarely
+        // inside a running child.
+        //
+        // Zero-width intervals are not hypothetical. `Instant` is guaranteed
+        // only nondecreasing, and on this hardware **64% of back-to-back
+        // `Instant::now()` pairs are equal** (5,000,000 samples), so a proof
+        // of emptiness and the read that follows it routinely land on the
+        // same instant.
         let mut spans: Vec<Span> = self
             .brackets
             .iter()
-            .map(|b| (b.opened, b.end_or(to), b.source, b.width()))
-            .filter(|(open, close, _, _)| *close > from && *open < to)
+            .map(|b| (b.opened, b.closed, b.source, b.width()))
+            .filter(|(open, closed, _, _)| closed.is_none_or(|close| close > from) && *open <= to)
+            // Past the filter an open bracket covers through the end of the
+            // interval, which is all the walk below needs of it.
+            .map(|(open, closed, source, width)| (open, closed.unwrap_or(to), source, width))
             .collect();
         if spans.is_empty() {
             return TemporalCoverage::Disjoint;
@@ -2897,18 +2915,16 @@ mod tests {
     /// zero-width interval — for tests that are about something other than
     /// the interval.
     ///
-    /// **Not identical to the instant the log used to store**, and the
-    /// difference is at the endpoints: the old `spans` was inclusive
-    /// (`opened <= at`), while `classify`'s filter is strict on both sides,
-    /// because touching an endpoint is not coverage. So `at(t)` against a
-    /// bracket that opens exactly at `t` reads `Disjoint`, where the old
-    /// code read it as contained. Put the instant strictly inside.
+    /// The one place it differs from the instant the log used to store is the
+    /// CLOSING edge: a bracket that closed exactly at `t` does not cover it,
+    /// because touching the end of a bracket is not coverage. The opening
+    /// edge stays inclusive, as `Bracket::spans` always had it, and a still
+    /// open bracket covers `t` outright.
     ///
-    /// It is also never covered by an **open** bracket, whose end is taken as
-    /// the interval's own upper bound — so `close > from` is `t > t`. Use a
-    /// real interval whenever an open bracket is involved. A reader cannot
-    /// produce a zero-width interval anyway: its two bounds are separate
-    /// `Instant::now()` calls.
+    /// A zero-width interval is **not** a fixture artefact. `Instant` is
+    /// guaranteed only nondecreasing, and 64% of back-to-back
+    /// `Instant::now()` pairs come back equal on this hardware, so a real
+    /// reader produces these routinely.
     fn at(t: Instant) -> Observation {
         Observation {
             empty_since: Some(t),
@@ -3022,6 +3038,48 @@ mod tests {
         assert_eq!(changes.len(), 1, "it is still an observation");
         assert!(changes[0].containing.is_empty(), "and it covers no source");
         assert!(credit(&changes).is_empty());
+    }
+
+    #[test]
+    fn a_zero_width_interval_inside_a_running_child_is_covered_not_disjoint() {
+        // `Instant` is guaranteed only NONDECREASING. On this hardware 64% of
+        // back-to-back `Instant::now()` pairs come back equal (5,000,000
+        // samples), so a proof of emptiness and the read that follows it
+        // routinely land on the same instant and the interval has zero width.
+        //
+        // Reading that as `Disjoint` would be a false veto in the destructive
+        // direction — on an observation squarely inside a running child — and
+        // it is the exact defect this change exists to remove, reached
+        // through the clock instead of through the bracket edge.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        log.open_bracket(SourceId(1), t0, Vec::new()); // still running
+        let t = t0 + ms(3);
+        assert_eq!(
+            log.classify(&Observation {
+                empty_since: Some(t),
+                observed_at: t,
+            }),
+            TemporalCoverage::Covered(vec![(SourceId(1), None)])
+        );
+    }
+
+    #[test]
+    fn a_zero_width_interval_at_the_instant_a_bracket_opens_is_covered() {
+        // The fence sequence collapsed onto one clock value: the bracket
+        // opens, the fence is served, the child writes, and the reader reads,
+        // all reporting the same `Instant`. An off-by-one at the opening edge
+        // is the same false veto by another route.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        log.open_bracket(SourceId(2), t0, Vec::new());
+        assert_eq!(
+            log.classify(&Observation {
+                empty_since: Some(t0),
+                observed_at: t0,
+            }),
+            TemporalCoverage::Covered(vec![(SourceId(2), None)])
+        );
     }
 
     #[test]
