@@ -766,32 +766,12 @@ impl TriggerReader {
     /// distinguish. The two must never be folded into one call: a drain
     /// that consumed `fired` would lose a fire and the pane would
     /// silently stop refreshing.
-    /// The reader now records an interval, but this still hands out the
-    /// upper bound alone so the loop is untouched by this task. Task 2.2
-    /// widens the signature to `Vec<Observation>` and adapts the caller;
-    /// until then the lower bound is recorded and not yet read, which is
-    /// what makes this change behaviour-neutral.
-    pub fn take_arrivals(&self) -> Vec<std::time::Instant> {
-        self.take_observations()
-            .into_iter()
-            .map(|o| o.observed_at)
-            .collect()
-    }
-
-    fn take_observations(&self) -> Vec<Observation> {
+    pub fn take_arrivals(&self) -> Vec<Observation> {
         let mut queue = self
             .arrivals
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.drain(..).collect()
-    }
-
-    /// The whole interval, for the tests that pin what the reader records.
-    /// Task 2.2 removes this: once `take_arrivals` itself yields
-    /// `Observation`s there is nothing left for it to reach past.
-    #[cfg(test)]
-    pub fn take_arrivals_for_test(&self) -> Vec<Observation> {
-        self.take_observations()
     }
 
     /// Hold the arrivals queue, so a test can prove `observed_at` is stamped
@@ -1158,7 +1138,7 @@ mod trigger_reader_tests {
         std::thread::sleep(Duration::from_millis(300));
         let arrivals = reader.take_arrivals();
         assert_eq!(arrivals.len(), 1);
-        let at = arrivals[0];
+        let at = arrivals[0].observed_at;
         assert!(
             at.duration_since(before) < Duration::from_millis(250),
             "recorded {:?} after the write — taken at the drain, not at arrival",
@@ -1294,7 +1274,7 @@ mod trigger_reader_tests {
         let mut out = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
-            out.extend(reader.take_arrivals_for_test());
+            out.extend(reader.take_arrivals());
             if out.len() >= n {
                 return out;
             }
