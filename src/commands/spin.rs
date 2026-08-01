@@ -116,10 +116,14 @@ pub fn run(args: SpinArgs, profile: ColorProfile, _palette: Palette) -> AppResul
     let failed = code != 0;
     let show_stdout = args.show_output || args.show_stdout || (args.show_error && failed);
     let show_stderr = args.show_output || args.show_stderr || (args.show_error && failed);
-    // A notice is only owed for a stream being shown. Both pipes are
-    // drained whatever the flags say, so the default invocation — no
-    // `--show-*` at all — can drop a great deal; reporting that would
-    // announce the truncation of output the user never asked to see.
+    // A notice is only owed for a stream being SHOWN, and the reason is
+    // what kind of message it would otherwise be. Both pipes are drained
+    // whatever the flags say, so the default invocation — no `--show-*`
+    // at all — discards plenty. Announcing that is debug output, not
+    // normal output: it tells a user about the fate of bytes they chose
+    // not to look at, on every long-running command they wrap. Ratified
+    // rather than assumed; the alternative costs one line here and one
+    // test if it is ever wanted.
     if show_stdout {
         report_dropped(stdout_dropped, stdout_lines.len(), "stdout");
         std::io::stdout()

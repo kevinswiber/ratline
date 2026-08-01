@@ -7,6 +7,30 @@
 //! in cost depending on how it is chopped up. Lines are the unit that
 //! predicts the cost, and the unit a pane renders.
 //!
+//! # What a line count costs in bytes
+//!
+//! **A line bound is not a memory bound, and the difference is three
+//! orders of magnitude.** Since a line survives up to [`MAX_LINE_BYTES`]
+//! (64 KiB), the true ceiling is `max_lines x 64 KiB` per stream:
+//!
+//! | caller | lines | typical | ceiling per stream |
+//! |---|---|---|---|
+//! | `rat watch`, dashboard panes | 1,000 | ~100 KiB | **62.5 MiB** |
+//! | `rat spin` | 10,000 | ~1 MiB | **625 MiB** |
+//!
+//! Both streams are capped separately, so a child flooding both doubles
+//! it. Terminal lines run well under 100 bytes, so ordinary output sits
+//! at the typical column; reaching the ceiling takes output that is
+//! uniformly enormous — hundreds of MB of ≥64 KiB lines — which is
+//! pathological rather than merely large, and which consumed UNBOUNDED
+//! memory before this type existed.
+//!
+//! This is a deliberate, documented ceiling rather than an oversight,
+//! but it is the number to reason with: **anyone raising `max_lines` is
+//! multiplying it.** Bounding bytes as well would mean carrying a second
+//! budget through eviction, and the line count would stop predicting the
+//! cost — the property the paragraph above exists to buy.
+//!
 //! Nothing here decodes, for two separate reasons, and it reads like an
 //! omission rather than the correctness rule it is. One: a pipe splits
 //! wherever it likes, so a chunk can end in the middle of a character,

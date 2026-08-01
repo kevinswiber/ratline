@@ -349,6 +349,13 @@ you declared `keep-bottom`. `rat watch` has no pane to declare it on and
 keeps the newest, so a watch whose command floods now shows its tail
 instead of everything it has ever printed.
 
+Being a line count, it is not directly a memory bound: a single line is
+kept up to 64 KiB before it is dropped whole, so the ceiling is 62.5 MiB
+per stream rather than the ~100 KiB ordinary output costs. Terminal
+lines run well under 100 bytes, so you would need output that is
+uniformly enormous to approach it — but that is the number, and it
+scales with the line count.
+
 Past the bound, the pane says so on the chrome row where a failing pane
 shows `· exit N`: `· 1.2k lines dropped`. A plain `rat watch` puts it on
 the status row, and a piped run puts it on stderr, so the data you are
@@ -630,9 +637,16 @@ Exit codes everywhere: `0` success, `1` no selection / negative / error,
 spinner stops, and that is bounded too: **the newest 10,000 lines of
 each stream**. Ten times what a watch pane keeps, because spin prints
 what it kept rather than rendering a window over it — enough for a full
-build log, and still a ceiling for a command that never stops. When it
-does drop something it says so on stderr, never in the output you are
-piping: `rat: 2.0k lines dropped from stdout — kept the newest 10000`.
+build log, and still a ceiling for a command that never stops. Ordinary
+output costs about 1 MiB; the same 64 KiB-per-line rule puts the ceiling
+at 625 MiB per stream for output that is uniformly enormous.
+
+When it drops something it says so on stderr, never in the output you
+are piping: `rat: 2.0k lines dropped from stdout — kept the newest
+10000`. A stream you did not ask to see stays silent — `spin` drains
+both pipes whatever the flags say, so the default invocation discards
+plenty, and reporting output you never wanted would be debug noise on
+every long-running command.
 
 ## A complete dashboard
 
