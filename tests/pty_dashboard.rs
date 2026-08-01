@@ -1596,3 +1596,91 @@ fn once_emits_one_frame_from_a_live_pane_and_leaves_no_orphan() {
         "the live child outlived the --once run that spawned it"
     );
 }
+
+/// The lifecycle hazard unique to this feature: a follower has no exit
+/// of its own, so if shutdown does not reach it, quitting rat leaks a
+/// process that holds the log open forever. The batch q test above
+/// cannot stand in — its children die of natural causes one second
+/// later, so a missed kill has no symptom there.
+///
+/// Child-side evidence on both halves: the counter says the child was
+/// spawned exactly once, and `ps` says nothing matching the log path
+/// survived the quit.
+#[test]
+fn q_shuts_down_a_child_that_would_never_exit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "start\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "1h",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"start", Duration::from_secs(5)),
+        "the live pane never painted"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(5)),
+        "the dashboard should have exited on q"
+    );
+    assert_counter_settled_at(&counter, 1);
+    assert!(
+        !any_process_matching(&log.display().to_string()),
+        "the live child outlived the q that shut its dashboard down"
+    );
+}
+
+/// A follower is the shape most likely to flood — that is the point of
+/// it — so the bound and its marker get an end-to-end test on THIS
+/// route. The worker-side cap is pinned in units; nothing before this
+/// pins that a live source's drop count survives the emission, the
+/// drain, and the compose to reach its own chrome row.
+///
+/// 1500 seeded lines against the 1000-line cap: the count is exact, so
+/// a marker that merely says "some" cannot pass. The tail line proves
+/// the keep direction on this route too — a live pane keeps its tail,
+/// and `flood-1499` is only on screen if the HEAD is what went.
+#[test]
+fn a_live_pane_bounded_at_its_cap_reports_the_drop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    let body: String = (0..1500).map(|i| format!("flood-{i}\n")).collect();
+    seed(&log, &body);
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "1h",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // ONE capture for both needles: they arrive in the same repaint,
+    // and a second wait that starts after the first consumed it would
+    // watch a stream where the now-unchanged chrome row never paints
+    // again — the differ trap this plan has already hit once, in a new
+    // costume.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"500 lines dropped",
+        Duration::from_secs(5),
+    )
+    .expect("the live pane's chrome never reported the drop");
+    assert!(
+        contains(&seen, b"flood-1499"),
+        "the flood's tail never reached the frame"
+    );
+}
