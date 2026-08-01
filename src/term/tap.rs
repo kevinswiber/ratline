@@ -608,6 +608,28 @@ pub struct TriggerReader {
     /// two routes apart, hence the staged allow.
     #[cfg_attr(not(test), allow(dead_code))]
     max_reads_per_select: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The write end of the control pipe. `fence()` pokes one byte at it;
+    /// the reader has the read end in its `select` set. Closed on `Drop`,
+    /// after the thread is joined.
+    control_tx: libc::c_int,
+    /// The reader's last proof of emptiness, mirrored out of the loop so a
+    /// test can see a fence land without waiting for a write. The loop's
+    /// own local is the authority; this is a copy.
+    #[cfg_attr(not(test), allow(dead_code))]
+    empty_since: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// How many fences have been issued. Task 3.2 reads it to prove BOTH
+    /// call sites fire — I-82's two halves fail silently, so a dropped
+    /// fence site is invisible without a count.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fences: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Test scaffolding: when set, the loop stops servicing anything and
+    /// naps instead. It exists so `fence()` can be proved non-blocking
+    /// against a reader that is definitively not listening. Always present
+    /// rather than `cfg(test)` — one atomic load per slice is cheaper than
+    /// a `cfg` seam through the loop's signature, and cfg-variant
+    /// signatures are how this codebase has broken the Windows leg before.
+    #[cfg_attr(not(test), allow(dead_code))]
+    parked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -714,29 +736,64 @@ impl TriggerReader {
         let arrivals = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::with_capacity(ARRIVAL_CAP),
         ));
+        // The control pipe. Both ends non-blocking: the reader must never
+        // block draining nudges, and `fence()` must never block issuing
+        // them — a full pipe means a wake is already pending, which asks for
+        // exactly the same thing, so the dropped write loses nothing.
+        let (control_rx, control_tx) = {
+            let mut ends: [libc::c_int; 2] = [-1, -1];
+            if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
+                bail!(
+                    "control pipe for trigger reader: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            for end in ends {
+                let flags = unsafe { libc::fcntl(end, libc::F_GETFL) };
+                unsafe { libc::fcntl(end, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            }
+            (ends[0], ends[1])
+        };
+
         let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let max_reads_per_select = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let empty_since = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let fences = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_fired = std::sync::Arc::clone(&fired);
         let thread_ended = std::sync::Arc::clone(&ended);
         let thread_shutdown = std::sync::Arc::clone(&shutdown);
         let thread_arrivals = std::sync::Arc::clone(&arrivals);
         let thread_overflowed = std::sync::Arc::clone(&overflowed);
         let thread_max_reads = std::sync::Arc::clone(&max_reads_per_select);
+        let thread_empty_since = std::sync::Arc::clone(&empty_since);
+        let thread_parked = std::sync::Arc::clone(&parked);
         let reader = std::thread::Builder::new()
             .name("rat-trigger".to_string())
             .spawn(move || {
                 let _keep_alive = keep_alive;
                 trigger_read_loop(
-                    fd,
-                    drainable,
-                    &thread_fired,
-                    &thread_ended,
-                    &thread_shutdown,
-                    &thread_arrivals,
-                    &thread_overflowed,
-                    &thread_max_reads,
+                    ReaderFds {
+                        data: fd,
+                        control: control_rx,
+                        drainable,
+                    },
+                    &ReaderState {
+                        fired: &thread_fired,
+                        ended: &thread_ended,
+                        shutdown: &thread_shutdown,
+                        parked: &thread_parked,
+                        arrivals: &thread_arrivals,
+                        overflowed: &thread_overflowed,
+                        max_reads_per_select: &thread_max_reads,
+                        empty_since: &thread_empty_since,
+                    },
                     wake,
                 );
+                // The reader owns the control read end for its whole life;
+                // closing it here means `Drop` has only the write end left
+                // and cannot race the thread for a descriptor number.
+                unsafe { libc::close(control_rx) };
             })?;
         Ok(TriggerReader {
             fired,
@@ -745,6 +802,10 @@ impl TriggerReader {
             arrivals,
             overflowed,
             max_reads_per_select,
+            control_tx,
+            empty_since,
+            fences,
+            parked,
             reader: Some(reader),
         })
     }
@@ -797,6 +858,60 @@ impl TriggerReader {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Ask this reader to prove its descriptor empty as soon as it can.
+    ///
+    /// **Never blocks, and is never required to be served.** The control
+    /// pipe's write end is non-blocking, so a full pipe returns `EAGAIN`
+    /// rather than waiting — and a full pipe means a wake is already
+    /// pending, which asks for exactly the same thing, so the dropped write
+    /// loses nothing.
+    ///
+    /// A fence that arrives after the bytes it hoped to bound simply leaves
+    /// an older proof in place: the interval stays wide and classification
+    /// returns `Ambiguous`. **Precision, never correctness** — soundness
+    /// depends only on `empty_since` being written when the descriptor was
+    /// actually observed empty, which no amount of fence lateness can
+    /// disturb.
+    ///
+    /// Staged: the loop does not call this until task 3.2 puts it at the two
+    /// sites either side of a bracket. **3.2 removes this allow.**
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn fence(&self) {
+        self.fences
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let byte = 1u8;
+        // The return value is deliberately ignored: EAGAIN is the designed
+        // outcome of a full pipe, and a failed nudge is not an error.
+        unsafe {
+            libc::write(self.control_tx, std::ptr::addr_of!(byte).cast(), 1);
+        }
+    }
+
+    /// How many fences have been issued. Task 3.2 reads it to prove both
+    /// call sites fire; a dropped site is otherwise invisible, because the
+    /// two fences' jobs fail silently and in opposite directions.
+    #[cfg(test)]
+    pub fn fences_for_test(&self) -> usize {
+        self.fences.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The reader's last proof of emptiness, so a test can watch a fence
+    /// land without a write to carry it out.
+    #[cfg(test)]
+    pub fn empty_since_for_test(&self) -> Option<std::time::Instant> {
+        *self
+            .empty_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Stop the reader servicing anything, so `fence()` can be proved
+    /// non-blocking against a reader that is definitively not listening.
+    #[cfg(test)]
+    pub fn park_for_test(&self) {
+        self.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Whether arrivals were dropped since the last call — reports and
     /// clears.
     ///
@@ -815,37 +930,20 @@ impl Drop for TriggerReader {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         self.shutdown.store(true, Ordering::SeqCst);
+        // A parked reader naps instead of selecting, so it notices shutdown
+        // at the top of its next nap; either way the wait is one slice.
         if let Some(reader) = self.reader.take() {
             // Bounded by one slice: the reader never blocks on a read
             // it has not selected for first.
             let _ = reader.join();
         }
+        // Only after the join: the thread owns the read end and closes it
+        // itself, so neither side can free a descriptor the other is still
+        // naming.
+        unsafe { libc::close(self.control_tx) };
     }
 }
 
-/// The reader's loop: select with a bounded slice, drain, raise the
-/// flag on the rising edge. End discipline: EOF (`read == 0`) or any
-/// terminal select/read error sets `ended` and exits — a dead source
-/// must never spin silently; transient EINTR/EAGAIN are retried.
-///
-/// **Why this route records an instant and the polled route records a
-/// bracket.** A `file:` trigger can be stat'd before and after a child,
-/// so a change can be placed inside a window after the fact. A fifo
-/// cannot: the bytes are drained and gone, there is no state left to
-/// compare, and nothing can reconstruct when they landed. The arrival
-/// instant is therefore the only attribution signal that exists on this
-/// route, and the reader thread is the only place that has it.
-///
-/// **One arrival is one read, not one write.** A single `read` returns
-/// whatever is queued, so writes that land between two selects are
-/// coalesced into one arrival and the reader cannot tell them apart —
-/// nothing in the pipe records how many `write` calls produced the
-/// bytes. That under-counts a tight burst and never over-counts, which
-/// is the safe direction: the veto asks whether an outside writer was
-/// *ever* seen, and a coalesced arrival still answers that with the
-/// right instant.
-#[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
 /// Is there anything to read right now?
 ///
 /// A zero-timeout `select` proves emptiness WITHOUT a read, which is what
@@ -892,33 +990,102 @@ enum ReadStep {
     Over,
 }
 
+/// The descriptors the reader watches: the source itself, the control pipe
+/// the loop nudges it through, and whether repeated draining is safe (I-83).
 #[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
-fn trigger_read_loop(
-    fd: i32,
+struct ReaderFds {
+    data: i32,
+    control: i32,
     drainable: bool,
-    fired: &std::sync::atomic::AtomicBool,
-    ended: &std::sync::atomic::AtomicBool,
-    shutdown: &std::sync::atomic::AtomicBool,
-    arrivals: &std::sync::Mutex<std::collections::VecDeque<Observation>>,
-    overflowed: &std::sync::atomic::AtomicBool,
-    max_reads_per_select: &std::sync::atomic::AtomicUsize,
+}
+
+/// Everything the reader shares with its owner. Grouped because the loop
+/// crossed the argument limit once the fence arrived, and a struct of named
+/// fields survives the next addition better than a longer positional list.
+#[cfg(unix)]
+struct ReaderState<'a> {
+    fired: &'a std::sync::atomic::AtomicBool,
+    ended: &'a std::sync::atomic::AtomicBool,
+    shutdown: &'a std::sync::atomic::AtomicBool,
+    parked: &'a std::sync::atomic::AtomicBool,
+    arrivals: &'a std::sync::Mutex<std::collections::VecDeque<Observation>>,
+    overflowed: &'a std::sync::atomic::AtomicBool,
+    max_reads_per_select: &'a std::sync::atomic::AtomicUsize,
+    empty_since: &'a std::sync::Mutex<Option<std::time::Instant>>,
+}
+
+/// The reader's loop: select with a bounded slice, drain, raise the
+/// flag on the rising edge. End discipline: EOF (`read == 0`) or any
+/// terminal select/read error sets `ended` and exits — a dead source
+/// must never spin silently; transient EINTR/EAGAIN are retried.
+///
+/// **Why this route records an instant and the polled route records a
+/// bracket.** A `file:` trigger can be stat'd before and after a child,
+/// so a change can be placed inside a window after the fact. A fifo
+/// cannot: the bytes are drained and gone, there is no state left to
+/// compare, and nothing can reconstruct when they landed. The arrival
+/// instant is therefore the only attribution signal that exists on this
+/// route, and the reader thread is the only place that has it.
+///
+/// **One arrival is one read, not one write.** A single `read` returns
+/// whatever is queued, so writes that land between two selects are
+/// coalesced into one arrival and the reader cannot tell them apart —
+/// nothing in the pipe records how many `write` calls produced the
+/// bytes. That under-counts a tight burst and never over-counts, which
+/// is the safe direction: the veto asks whether an outside writer was
+/// *ever* seen, and a coalesced arrival still answers that with the
+/// right instant.
+#[cfg(unix)]
+fn trigger_read_loop(
+    fds: ReaderFds,
+    state: &ReaderState<'_>,
     wake: Option<std::sync::mpsc::Sender<TapChunk>>,
 ) {
     use std::sync::atomic::Ordering;
+
+    let ReaderFds {
+        data: fd,
+        control,
+        drainable,
+    } = fds;
+    let &ReaderState {
+        fired,
+        ended,
+        shutdown,
+        parked,
+        arrivals,
+        overflowed,
+        max_reads_per_select,
+        empty_since: published,
+    } = state;
 
     let mut buf = [0u8; 256];
     // The last instant this reader PROVED the descriptor empty. `None` until
     // it has proved it once; an observation carrying `None` claims nothing.
     let mut empty_since: Option<std::time::Instant> = None;
+    // Publish every change, so a fence can be observed landing without a
+    // write to carry it out. Set once per proof — at most a few times a
+    // second — never on the read path.
+    let publish = |proof: Option<std::time::Instant>| {
+        *published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = proof;
+    };
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
+        }
+        if parked.load(Ordering::SeqCst) {
+            // Test scaffolding: a reader that is definitively not listening,
+            // so `fence()` can be proved non-blocking against one.
+            std::thread::sleep(READ_SLICE);
+            continue;
         }
         let mut read_set: libc::fd_set = unsafe { std::mem::zeroed() };
         unsafe {
             libc::FD_ZERO(&mut read_set);
             libc::FD_SET(fd, &mut read_set);
+            libc::FD_SET(control, &mut read_set);
         }
         let mut timeout = libc::timeval {
             tv_sec: 0,
@@ -933,7 +1100,7 @@ fn trigger_read_loop(
         let candidate = std::time::Instant::now();
         let ready = unsafe {
             libc::select(
-                fd + 1,
+                fd.max(control) + 1,
                 &mut read_set,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -952,7 +1119,35 @@ fn trigger_read_loop(
             // Nothing became readable for a whole slice: a proof of
             // emptiness, free, and the only one an unfenced reader gets.
             empty_since = Some(candidate);
+            publish(empty_since);
             continue;
+        }
+        if unsafe { libc::FD_ISSET(control, &read_set) } {
+            // Discard: the byte is a nudge, not a message. Several fences
+            // collapsing into one wake is correct — each asks for the same
+            // thing.
+            let mut sink = [0u8; 64];
+            while unsafe {
+                libc::read(
+                    control,
+                    sink.as_mut_ptr().cast::<libc::c_void>(),
+                    sink.len(),
+                )
+            } > 0
+            {}
+            // Same rule as every other probe: sample first, install only if
+            // the probe agrees. Stamping after `readable_now` would let
+            // bytes that arrived during the call sit BEFORE their own lower
+            // bound. This is the third and last readiness probe in the
+            // finished design, and all three follow it.
+            let candidate = std::time::Instant::now();
+            if !readable_now(fd) {
+                empty_since = Some(candidate);
+                publish(empty_since);
+                continue;
+            }
+            // Readable after all: fall through to the ordinary drain, which
+            // records observations and then proves emptiness at the end.
         }
         let mut reads = 0usize;
         loop {
@@ -1009,6 +1204,7 @@ fn trigger_read_loop(
             let candidate = std::time::Instant::now();
             if !readable_now(fd) {
                 empty_since = Some(candidate);
+                publish(empty_since);
                 break;
             }
         }
@@ -1388,6 +1584,69 @@ mod trigger_reader_tests {
             "a fd: source must take exactly one read per select"
         );
         drop(tx);
+    }
+
+    // ── The fence (task 3.1) ────────────────────────────────────────────
+
+    #[test]
+    fn a_fence_proves_emptiness_without_waiting_for_a_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, _writer) = fifo_pair(dir.path());
+        // Let the reader settle so any timeout-proof is old.
+        std::thread::sleep(READ_SLICE + Duration::from_millis(10));
+        let before = std::time::Instant::now();
+        reader.fence();
+        // Far shorter than READ_SLICE: only a control wake can do this.
+        std::thread::sleep(Duration::from_millis(5));
+        let proof = reader.empty_since_for_test();
+        assert!(
+            proof.is_some_and(|p| p >= before),
+            "the fence must produce a fresh proof of emptiness inside 5ms, \
+             not at the next 50ms slice"
+        );
+    }
+
+    #[test]
+    fn fence_never_blocks_even_when_the_reader_is_not_listening() {
+        // I-80: correctness never depends on a fence being served. Park the
+        // reader thread and fence far past the pipe's capacity, so the
+        // writes genuinely reach EAGAIN rather than merely fitting; the
+        // caller must return promptly every time and nothing may deadlock.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, _writer) = fifo_pair(dir.path());
+        reader.park_for_test();
+        // A pipe holds 64 KiB; 200k one-byte fences cannot all fit, so this
+        // exercises the full-pipe path instead of just the roomy one.
+        let start = std::time::Instant::now();
+        for _ in 0..200_000 {
+            reader.fence();
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "fence() blocked or backed up: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(reader.fences_for_test(), 200_000);
+    }
+
+    #[test]
+    fn a_fence_that_loses_the_race_costs_precision_and_not_correctness() {
+        // Bytes already queued when the fence arrives are drained by the
+        // fence itself, so their lower bound is the OLDER proof — the
+        // interval is wide, and classification will call it Ambiguous. What
+        // must never happen is a lower bound later than the write.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        std::thread::sleep(READ_SLICE * 2);
+        let at_write = std::time::Instant::now();
+        writer.write_all(b"x").unwrap();
+        reader.fence();
+
+        let o = wait_for_observations(&reader, 1)[0];
+        assert!(
+            o.empty_since.is_some_and(|p| p <= at_write),
+            "a proof of emptiness must never postdate the write it bounds"
+        );
     }
 
     #[test]
