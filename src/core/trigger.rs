@@ -807,6 +807,52 @@ impl WindowLog {
         self.brackets.len()
     }
 
+    /// DIAGNOSTIC ONLY: closed bracket widths in the window, in milliseconds,
+    /// as (min, median, max).
+    ///
+    /// This is the number that decides whether INTERVAL-valued arrival evidence
+    /// can work at all. An observation's interval is at best as tight as the
+    /// reader's proof-of-empty cadence; if the brackets it must be placed
+    /// against are far narrower than that, every interval straddles a bracket
+    /// edge and every answer is "ambiguous".
+    pub fn bracket_widths_ms(&self) -> Option<(f64, f64, f64)> {
+        let mut widths: Vec<f64> = self
+            .brackets
+            .iter()
+            .filter_map(|b| Some(b.width()?.as_secs_f64() * 1000.0))
+            .collect();
+        if widths.is_empty() {
+            return None;
+        }
+        widths.sort_by(f64::total_cmp);
+        Some((
+            widths[0],
+            widths[widths.len() / 2],
+            widths[widths.len() - 1],
+        ))
+    }
+
+    /// DIAGNOSTIC ONLY: the median gap between consecutive arrivals on one
+    /// trigger, in milliseconds — how far back "the reader last proved this
+    /// empty" would sit if it learned so only by ordinary polling.
+    pub fn arrival_gap_ms(&self, trigger: &TriggerKey) -> Option<f64> {
+        let ats: Vec<std::time::Instant> = self
+            .arrivals
+            .iter()
+            .filter(|a| a.trigger == *trigger)
+            .map(|a| a.at)
+            .collect();
+        if ats.len() < 2 {
+            return None;
+        }
+        let mut gaps: Vec<f64> = ats
+            .windows(2)
+            .map(|w| w[1].saturating_duration_since(w[0]).as_secs_f64() * 1000.0)
+            .collect();
+        gaps.sort_by(f64::total_cmp);
+        Some(gaps[gaps.len() / 2])
+    }
+
     /// True when a reader lost arrivals inside the current window.
     pub fn evidence_lost(&self, now: std::time::Instant) -> bool {
         let cutoff = self.cutoff(now);
@@ -1045,6 +1091,16 @@ impl LoopSuspicion {
             u8::from(log.evidence_lost(now)),
             log.bracket_count(),
         );
+        if let Some((min, med, max)) = log.bracket_widths_ms() {
+            let _ = write!(w, " brkms={min:.2}/{med:.2}/{max:.2}");
+        }
+        for pane in panes {
+            for key in pane.readers {
+                if let Some(gap) = log.arrival_gap_ms(key) {
+                    let _ = write!(w, " gap{}={gap:.1}", pane.source.0);
+                }
+            }
+        }
         for pane in panes {
             let exogenous: usize = pane.watched.iter().map(|p| ledger.exogenous(p)).sum();
             let (mut arrivals, mut uncontained, mut deferred) = (0usize, 0usize, 0usize);
