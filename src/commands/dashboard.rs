@@ -82,7 +82,22 @@ fn pane_help(registry: &Registry) -> Vec<String> {
 /// departure from the sketch, which showed `?` listing the specific
 /// panes, and it is recorded here so it does not read as an oversight.
 ///
-/// The last sentence is the load-bearing one and is not guessable:
+/// **The closing paragraph is about what the badge's ABSENCE does not
+/// mean**, and it is here because the detector can now decline to answer.
+/// A window abstains when a candidate's reader evidence is all ambiguous,
+/// and condition 3 has always abstained on lost evidence or a busy
+/// dashboard — none of which reach a surface. So a silent dashboard and a
+/// clean one look identical from outside, which is a quieter form of the
+/// confident-negative defect the interval model removed.
+///
+/// Deliberately STATIC, and deliberately not a live "cannot decide" badge.
+/// Nobody has measured how often abstention actually fires, and
+/// `Verdict::abstained` carries no user-facing cause to put in a notice —
+/// so a dynamic surface would be guessing at both its frequency and its
+/// wording. Stating the limitation once, where the badge is explained,
+/// costs nothing and is true today.
+///
+/// The mtime sentence below is the load-bearing one and is not guessable:
 /// `fingerprint` is mtime-only, so a command that rewrites a file with
 /// identical bytes still fires the trigger. Guarding the *change*
 /// rather than the *write* is the mistake that produces exactly this
@@ -106,6 +121,12 @@ const LOOPING_HELP: &[&str] = &[
     "    path no pane writes. A trigger fires on mtime, not on content,",
     "    so writing identical bytes still fires — the guard has to skip",
     "    the write, not just the change.",
+    "",
+    "    The absence of the badge is weaker than its presence. rat stays",
+    "    silent whenever it cannot tell: when a write cannot be placed",
+    "    against the commands that were running, when a reader's evidence",
+    "    was lost, or when the dashboard was too busy to judge. No badge",
+    "    means no loop was proved, not that there is none.",
 ];
 
 #[cfg(test)]
@@ -169,6 +190,11 @@ mod tests {
         // than on the bytes — so writing identical content still fires.
         assert!(text.contains("nothing has been stopped"), "got {text}");
         assert!(text.contains("mtime, not on content"), "got {text}");
+        // And the third, which is about the badge's ABSENCE: the detector
+        // can decline to answer, and a silent dashboard is not a clean
+        // one. Asserted because a static string nothing reads is exactly
+        // how this codebase has shipped a lie before.
+        assert!(text.contains("no loop was proved"), "got {text}");
     }
 
     #[test]
