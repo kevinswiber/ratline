@@ -150,6 +150,7 @@ mod tests {
                 Vec::new()
             },
             debounce: Duration::from_millis(250),
+            live: false,
         };
         let pane = || PaneBox {
             height: 5,

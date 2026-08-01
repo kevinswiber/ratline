@@ -143,6 +143,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
             interval,
             triggers,
             debounce,
+            // `rat watch` has no declaration to say otherwise. A live
+            // source is a dashboard pane's opt-in; the plain watch path
+            // stays exactly the batch loop it has always been.
+            live: false,
         },
         args.title.clone(),
     );
@@ -3688,6 +3692,7 @@ mod tests {
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
+            live: false,
         };
         let pane = |overflow| PaneBox {
             height: 5,
@@ -3784,6 +3789,7 @@ mod tests {
                 interval: Some(Duration::from_secs(2)),
                 triggers: Vec::new(),
                 debounce: Duration::from_millis(250),
+                live: false,
             },
             None,
         );
@@ -4210,6 +4216,7 @@ mod tests {
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
+            live: false,
         };
         let pane = || PaneBox {
             height: 5,
@@ -4496,6 +4503,7 @@ mod tests {
             interval: None,
             triggers: vec![TriggerSpec::File(std::path::PathBuf::from(path))],
             debounce: Duration::from_millis(250),
+            live: false,
         };
         let pane = || PaneBox {
             height: 5,
@@ -4573,6 +4581,7 @@ mod tests {
                 interval: None,
                 triggers: vec![TriggerSpec::File(std::path::PathBuf::from("./stamp"))],
                 debounce: Duration::from_millis(250),
+                live: false,
             },
             None,
         );
@@ -4729,6 +4738,7 @@ mod tests {
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
+            live: false,
         }
     }
 

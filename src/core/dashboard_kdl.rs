@@ -122,6 +122,11 @@ const PANE_KEYS: &[Key] = &[
         example: "chrome #false",
         set: Set::Flag(|d, v| d.chrome = Some(v)),
     },
+    Key {
+        name: "live",
+        example: "live #true",
+        set: Set::Flag(|d, v| d.live = Some(v)),
+    },
 ];
 
 /// What a setter needs beyond the value: the phrase every teaching

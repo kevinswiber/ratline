@@ -29,6 +29,9 @@ pub struct SourceSpec {
     pub interval: Option<Duration>,
     pub triggers: Vec<TriggerSpec>,
     pub debounce: Duration,
+    /// The child is long-lived: spawned once, its output shown as it
+    /// arrives rather than at an exit that is not coming.
+    pub live: bool,
 }
 
 /// The declared box a source paints into. Height is PINNED: the
@@ -414,6 +417,7 @@ mod tests {
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(120),
+            live: false,
         }
     }
 

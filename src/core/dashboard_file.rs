@@ -98,6 +98,9 @@ pub struct PaneDecl {
     pub padding: Option<String>,
     pub title: Option<String>,
     pub chrome: Option<bool>,
+    /// The child is long-lived: spawn it once and show its output as it
+    /// arrives, rather than waiting for an exit that is not coming.
+    pub live: Option<bool>,
 }
 
 impl DashboardFile {
@@ -156,6 +159,7 @@ fn at(name: &str) -> String {
 
 fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Result<SourceSpec> {
     let shell = decl.shell.or(defaults.shell).unwrap_or(false);
+    let live = decl.live.or(defaults.live).unwrap_or(false);
     // A command string is word-split (or kept verbatim) at PARSE time,
     // under the shell mode in force where it was written. A pane that
     // inherits the defaults' command while flipping `shell` would
@@ -210,6 +214,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
         interval,
         triggers,
         debounce,
+        live,
     })
 }
 
@@ -224,10 +229,26 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Resu
         None | Some("auto") => PaneWidth::Weight(1),
         Some(token) => parse_width(token, name)?,
     };
-    let overflow = match decl.overflow.as_deref().or(defaults.overflow.as_deref()) {
-        None | Some("keep-top") => Overflow::KeepTop,
-        Some("keep-bottom") => Overflow::KeepBottom,
-        Some(other) => bail!(
+    // `None` and an explicit "keep-top" are NOT the same arm here, even
+    // though they resolve alike for a batch pane. A live pane is read at
+    // its tail, so an undeclared overflow defaults to keep-bottom; and
+    // keeping the head on one silently kills the `D` and `c` change
+    // marks, so declaring it is an error rather than a preference.
+    let live = decl.live.or(defaults.live).unwrap_or(false);
+    let declared_overflow = decl.overflow.as_deref().or(defaults.overflow.as_deref());
+    let overflow = match (declared_overflow, live) {
+        (None, true) => Overflow::KeepBottom,
+        (None, false) => Overflow::KeepTop,
+        (Some("keep-top"), true) => bail!(
+            "{}: `overflow \"keep-top\"` cannot be combined with `live`: a live \
+             pane is read at its tail, and keeping the head silently disables the \
+             `D` and `c` change markers. Use `overflow \"keep-bottom\"`, or drop \
+             `live`.",
+            at(name)
+        ),
+        (Some("keep-top"), false) => Overflow::KeepTop,
+        (Some("keep-bottom"), _) => Overflow::KeepBottom,
+        (Some(other), _) => bail!(
             "{}: unknown overflow {other:?}: expected keep-top or keep-bottom",
             at(name)
         ),
@@ -513,6 +534,135 @@ mod tests {
         let registry = decl.into_registry().expect("registry");
         assert_eq!(registry.spec(SourceId(0)).interval, None);
         assert_eq!(registry.spec(SourceId(0)).triggers.len(), 1);
+    }
+
+    #[test]
+    fn a_pane_is_not_live_unless_it_says_so() {
+        let registry = file(vec![pane("log", &["date"])])
+            .into_registry()
+            .expect("registry");
+        assert!(!registry.spec(SourceId(0)).live);
+    }
+
+    #[test]
+    fn live_is_carried_onto_the_spec() {
+        let registry = file(vec![PaneDecl {
+            live: Some(true),
+            ..pane("log", &["date"])
+        }])
+        .into_registry()
+        .expect("registry");
+        assert!(registry.spec(SourceId(0)).live);
+    }
+
+    #[test]
+    fn live_is_inheritable_from_defaults_and_overridable_per_pane() {
+        let mut decl = file(vec![
+            pane("a", &["date"]),
+            PaneDecl {
+                live: Some(false),
+                ..pane("b", &["date"])
+            },
+        ]);
+        decl.defaults.live = Some(true);
+        let registry = decl.into_registry().expect("registry");
+        assert!(registry.spec(SourceId(0)).live, "inherits the default");
+        assert!(
+            !registry.spec(SourceId(1)).live,
+            "a pane must be able to opt back out"
+        );
+    }
+
+    #[test]
+    fn a_live_pane_with_no_overflow_declared_resolves_to_keep_bottom() {
+        // A live pane is read at its TAIL. The shipped `None => KeepTop`
+        // default would otherwise hand every live pane the one overflow
+        // refused below, making a bare `live` a load error.
+        let registry = file(vec![PaneDecl {
+            live: Some(true),
+            ..pane("log", &["date"])
+        }])
+        .into_registry()
+        .expect("registry");
+        assert_eq!(
+            registry.pane(SourceId(0)).expect("pane").overflow,
+            Overflow::KeepBottom
+        );
+    }
+
+    #[test]
+    fn a_batch_pane_with_no_overflow_declared_still_resolves_to_keep_top() {
+        // The shipped default is untouched — a live-only override, not a
+        // change to what every other pane does.
+        let registry = file(vec![pane("p", &["date"])])
+            .into_registry()
+            .expect("registry");
+        assert_eq!(
+            registry.pane(SourceId(0)).expect("pane").overflow,
+            Overflow::KeepTop
+        );
+    }
+
+    #[test]
+    fn keep_top_declared_on_a_live_pane_is_refused() {
+        // Under keep-top the change marks are computed and then
+        // structurally discarded — the window never reaches an index at
+        // or past the pane's row count — so `D` and `c` do nothing for
+        // that pane and nothing says why. Silent death of two features is
+        // worse than a load error.
+        let err = err_of(file(vec![PaneDecl {
+            live: Some(true),
+            overflow: Some("keep-top".to_string()),
+            ..pane("log", &["date"])
+        }]));
+        assert!(err.contains("log"), "names the pane: {err}");
+        assert!(err.contains("keep-top"), "names what is wrong: {err}");
+        assert!(err.contains("keep-bottom"), "names the fix: {err}");
+    }
+
+    #[test]
+    fn keep_top_inherited_from_defaults_is_refused_on_a_live_pane_too() {
+        // The route that would otherwise slip through: nothing on the
+        // pane says keep-top, so a check reading only the pane's own
+        // token passes it.
+        let mut decl = file(vec![PaneDecl {
+            live: Some(true),
+            ..pane("log", &["date"])
+        }]);
+        decl.defaults.overflow = Some("keep-top".to_string());
+        let err = err_of(decl);
+        assert!(err.contains("log"), "{err}");
+    }
+
+    #[test]
+    fn keep_top_stays_legal_on_a_batch_pane() {
+        // The refusal is about the COMBINATION. keep-top is the shipped
+        // default and must not become an error.
+        let registry = file(vec![PaneDecl {
+            overflow: Some("keep-top".to_string()),
+            ..pane("p", &["date"])
+        }])
+        .into_registry()
+        .expect("registry");
+        assert_eq!(
+            registry.pane(SourceId(0)).expect("pane").overflow,
+            Overflow::KeepTop
+        );
+    }
+
+    #[test]
+    fn live_with_keep_bottom_declared_is_accepted() {
+        let registry = file(vec![PaneDecl {
+            live: Some(true),
+            overflow: Some("keep-bottom".to_string()),
+            ..pane("log", &["date"])
+        }])
+        .into_registry()
+        .expect("registry");
+        assert_eq!(
+            registry.pane(SourceId(0)).expect("pane").overflow,
+            Overflow::KeepBottom
+        );
     }
 
     #[test]
