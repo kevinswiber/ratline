@@ -18,6 +18,21 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The harness ceiling, kept here because it is INVISIBLE where test
+/// authors choose their timeouts: `.config/nextest.toml` terminates a
+/// test after `10s x 2`, so any wait longer than this is unreachable by
+/// construction — the harness kills the test before the wait can expire,
+/// and a terminated test prints nothing. A generous number written past
+/// this line buys no tolerance for a slow runner; it only trades the
+/// failure's evidence for the appearance of patience.
+///
+/// Waits that can plausibly approach it derive from these two rather
+/// than pick a number. Change it only alongside `nextest.toml`.
+const HARNESS_CEILING: Duration = Duration::from_secs(20);
+/// What the ceiling owes to everything that is not the wait: the
+/// shutdown probe, the kill, the diagnostic dump, and slack.
+const HARNESS_RESERVE: Duration = Duration::from_secs(4);
+
 /// `wait_for`, returning the accumulated bytes once `needle` appears —
 /// for assertions that need to inspect text near the needle.
 fn wait_for_bytes(
@@ -924,6 +939,7 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
         .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
+    let started = std::time::Instant::now();
     assert!(
         wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5)),
         "the first composition never painted"
@@ -932,11 +948,21 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     // repaint at the rising edge, and the one-shot row is painted after
     // the frame, so seeing it means the frame's bytes are already in
     // hand — which lets one 8.5 s run assert both surfaces.
+    //
+    // The wait is DERIVED from nextest's ceiling rather than chosen. A
+    // wait longer than the ceiling is unreachable by construction — the
+    // harness terminates the test first, and a terminated test prints
+    // nothing, so the generous-looking number buys no tolerance and
+    // costs the evidence. Subtracting what has already elapsed means a
+    // slow first paint eats its own margin instead of this wait's.
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
         "a, b: trigger loop suspected:".as_bytes(),
-        Duration::from_secs(40),
+        HARNESS_CEILING
+            .saturating_sub(HARNESS_RESERVE)
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_secs(1)),
     );
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(5));
@@ -1054,21 +1080,19 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     let (painted, first_paint, _) =
         wait_for_bytes_verbose(&session, &mut terminal, b"cycle-b", Duration::from_secs(5));
     let paint_at = started.elapsed().as_secs_f64();
-    // DIAGNOSTIC BOUND, not a budget. The shipped wait is 40 s under nextest's
-    // 20 s ceiling, so this test can only ever be KILLED — and a terminated
-    // test prints nothing, which is why four failing CI runs produced no
-    // evidence. Derived from what is LEFT of the ceiling rather than fixed, so
-    // a slow first paint eats its own margin instead of the report's: every
-    // second the wait does not need is a second the wait gets.
-    const CEILING: Duration = Duration::from_secs(20);
-    const RESERVE: Duration = Duration::from_secs(4); // probe, kill, dump, slack
+    // DIAGNOSTIC BOUND, not a budget. A wait past the harness ceiling can only
+    // ever be KILLED — and a terminated test prints nothing, which is why four
+    // failing CI runs produced no evidence. Derived from what is LEFT of the
+    // ceiling rather than fixed, so a slow first paint eats its own margin
+    // instead of the report's: every second the wait does not need is a second
+    // the wait gets.
     let (found, seen, chunks) = if painted {
         wait_for_bytes_verbose(
             &session,
             &mut terminal,
             "a, b: trigger loop suspected:".as_bytes(),
-            CEILING
-                .saturating_sub(RESERVE)
+            HARNESS_CEILING
+                .saturating_sub(HARNESS_RESERVE)
                 .saturating_sub(started.elapsed())
                 .max(Duration::from_secs(1)),
         )
