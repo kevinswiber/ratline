@@ -477,6 +477,24 @@ pub(crate) fn run_registry(
                 if observing {
                     let opened = log.open_bracket(id, Instant::now(), stamps(&watched_union));
                     runtime[id.0].bracket = Some(opened);
+                    // Fence AFTER the bracket opens and BEFORE the child can
+                    // write, so a promptly-served fence puts the interval's
+                    // lower bound INSIDE this bracket — which is the only
+                    // way a write by this child can ever be attributable to
+                    // it. Fencing before the open would guarantee the
+                    // interval starts too early and could never be covered.
+                    //
+                    // Per spawn, not once before the loop: brackets open one
+                    // per iteration here, so a single pass before them would
+                    // fence against brackets that do not exist yet.
+                    //
+                    // The pass is a separate statement from the mutation
+                    // above so the `&runtime` borrow does not overlap the
+                    // `runtime[id.0]` write.
+                    #[cfg(unix)]
+                    for r in runtime.iter() {
+                        fence_all(&r.readers);
+                    }
                 }
                 // Resolved once per spawn and shared by both paths: two
                 // resolutions are two chances to disagree, and the
@@ -641,6 +659,19 @@ pub(crate) fn run_registry(
             }
         }
         if !drained.is_empty() {
+            // The close fence is what keeps a genuine outside writer
+            // PROVABLE. Without it the lower bound stays at the last open
+            // fence, every later interval overlaps that bracket, and no
+            // observation could ever be disjoint from everything — so the
+            // veto would silently stop firing. The two fences have opposite
+            // jobs and both are required; dropping either disables one half
+            // of the signal without disabling the other.
+            #[cfg(unix)]
+            if observing {
+                for r in runtime.iter() {
+                    fence_all(&r.readers);
+                }
+            }
             let content = combined_hash(&runtime);
             // The live status row names the ABSOLUTE local time of the
             // last content change: a counting age would change every
@@ -1571,6 +1602,23 @@ fn reader_key(spec: &TriggerSpec) -> crate::core::trigger::TriggerKey {
 /// The identity is not optional. Two fifos on one pane are two separate bodies
 /// of evidence, and merging them under a source id would make the per-path
 /// stages inapplicable to this route.
+/// Ask every reader for a fresh proof that its descriptor is empty.
+///
+/// **Every reader, not just the spawning source's.** A pane's fifo is
+/// written by some OTHER pane's child — that is what a trigger loop IS — so
+/// the reader that needs the tight bound is never the one being spawned.
+/// Fencing only the spawning source's readers would leave exactly the
+/// reader that matters on its 50 ms cadence, and nothing would report it.
+///
+/// Cost is one non-blocking one-byte write per reader per call, and no
+/// waiting: `fence()` cannot block and is never required to be served.
+#[cfg(unix)]
+fn fence_all(slots: &[ReaderSlot]) {
+    for slot in slots {
+        slot.reader.fence();
+    }
+}
+
 #[cfg(unix)]
 fn drain_reader_arrivals(
     slots: &[ReaderSlot],
@@ -4830,6 +4878,26 @@ mod tests {
             )
         }
 
+        /// Drain until `n` observations have been recorded, or fail. The
+        /// reader is a thread, so every assertion about what it recorded
+        /// needs a settle. (`tap.rs` has its own copy for its own module;
+        /// `TriggerReader`'s internals are not reachable from here.)
+        fn wait_for_observations(
+            reader: &TriggerReader,
+            n: usize,
+        ) -> Vec<crate::core::trigger::Observation> {
+            let mut out = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                out.extend(reader.take_arrivals());
+                if out.len() >= n {
+                    return out;
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            panic!("wanted {n} observations, saw {}", out.len());
+        }
+
         fn poke(slot: &ReaderSlot, writer: &mut std::fs::File) {
             use std::io::Write;
             slot.reader.fired().store(false, Ordering::SeqCst);
@@ -4994,6 +5062,66 @@ mod tests {
 
             let key = reader_key(&slots[0].spec);
             assert_eq!(log.arrivals(&key).len(), 1);
+        }
+
+        // ── The fence sites (task 3.2) ──────────────────────────────────
+
+        #[test]
+        fn a_fence_between_the_bracket_and_the_spawn_makes_the_interval_covered() {
+            // I-81's ORDER, tested by what it buys rather than by inspecting
+            // call order. Open a bracket, fence, then write — exactly the
+            // sequence the spawn step performs — and the observation must
+            // classify as the running source's. Fence BEFORE the open and
+            // this fails, because the lower bound lands outside the bracket.
+            use crate::core::trigger::TemporalCoverage;
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "fenced.fifo");
+            std::thread::sleep(Duration::from_millis(120)); // an old proof exists
+
+            let mut log = WindowLog::new(Duration::from_secs(30));
+            let opened = log.open_bracket(SourceId(1), Instant::now(), Vec::new());
+            s.reader.fence();
+            // The fence is served; a real spawn costs far more than this.
+            std::thread::sleep(Duration::from_millis(2));
+            use std::io::Write as _;
+            w.write_all(b"x").unwrap();
+
+            let observation = wait_for_observations(&s.reader, 1)[0];
+            log.close_bracket(opened, Instant::now(), Vec::new());
+            // Match the variant and the contributor, not an exact width: the
+            // width is real elapsed time, and asserting it would be
+            // asserting the speed of the machine.
+            match log.classify(&observation) {
+                TemporalCoverage::Covered(contributors) => {
+                    assert_eq!(contributors.len(), 1);
+                    assert_eq!(contributors[0].0, SourceId(1));
+                    assert!(
+                        contributors[0].1.is_some(),
+                        "the bracket closed, so a width exists"
+                    );
+                }
+                other => panic!(
+                    "with the fence inside the bracket the write is attributable, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn fencing_reaches_every_reader_not_just_the_spawning_source() {
+            // A pane's fifo is written by some OTHER pane's child, so the
+            // reader needing the tight bound is never the one being spawned.
+            // Fencing only the spawning source's readers would leave exactly
+            // the reader that matters on its 50ms cadence, and nothing else
+            // would notice.
+            let dir = tempfile::tempdir().unwrap();
+            let (a, _wa) = slot(dir.path(), "a-fence.fifo");
+            let (b, _wb) = slot(dir.path(), "b-fence.fifo");
+            let slots = vec![a, b];
+
+            fence_all(&slots);
+
+            assert_eq!(slots[0].reader.fences_for_test(), 1);
+            assert_eq!(slots[1].reader.fences_for_test(), 1);
         }
     }
 }

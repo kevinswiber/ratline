@@ -608,10 +608,15 @@ pub struct TriggerReader {
     /// two routes apart, hence the staged allow.
     #[cfg_attr(not(test), allow(dead_code))]
     max_reads_per_select: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// The write end of the control pipe. `fence()` pokes one byte at it;
-    /// the reader has the read end in its `select` set. Closed on `Drop`,
-    /// after the thread is joined.
-    control_tx: libc::c_int,
+    /// The control pipe: `fence()` pokes one byte at the write end, and the
+    /// reader has the read end in its `select` set.
+    ///
+    /// **Both ends are owned here and closed together in `Drop`, after the
+    /// thread is joined** — never by the thread itself. The reader exits
+    /// early on EOF while its owner lives on and keeps fencing, and a
+    /// closed descriptor number is immediately reusable, so an early close
+    /// turns `fence()` into a one-byte write into an unrelated descriptor.
+    control: (libc::c_int, libc::c_int),
     /// The reader's last proof of emptiness, mirrored out of the loop so a
     /// test can see a fence land without waiting for a write. The loop's
     /// own local is the authority; this is a copy.
@@ -790,10 +795,14 @@ impl TriggerReader {
                     },
                     wake,
                 );
-                // The reader owns the control read end for its whole life;
-                // closing it here means `Drop` has only the write end left
-                // and cannot race the thread for a descriptor number.
-                unsafe { libc::close(control_rx) };
+                // The control read end is deliberately NOT closed here.
+                // This thread exits early on EOF or a terminal error while
+                // the `TriggerReader` lives on and keeps being fenced — and
+                // a closed descriptor number is immediately reusable, so
+                // `fence()` would then write a byte into whatever the
+                // process opened next. Both ends close in `Drop`, after the
+                // join. An undrained pipe simply fills and returns EAGAIN,
+                // which is what `fence()` already promises to tolerate.
             })?;
         Ok(TriggerReader {
             fired,
@@ -802,7 +811,7 @@ impl TriggerReader {
             arrivals,
             overflowed,
             max_reads_per_select,
-            control_tx,
+            control: (control_rx, control_tx),
             empty_since,
             fences,
             parked,
@@ -873,9 +882,6 @@ impl TriggerReader {
     /// actually observed empty, which no amount of fence lateness can
     /// disturb.
     ///
-    /// Staged: the loop does not call this until task 3.2 puts it at the two
-    /// sites either side of a bracket. **3.2 removes this allow.**
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn fence(&self) {
         self.fences
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -883,7 +889,7 @@ impl TriggerReader {
         // The return value is deliberately ignored: EAGAIN is the designed
         // outcome of a full pipe, and a failed nudge is not an error.
         unsafe {
-            libc::write(self.control_tx, std::ptr::addr_of!(byte).cast(), 1);
+            libc::write(self.control.1, std::ptr::addr_of!(byte).cast(), 1);
         }
     }
 
@@ -910,6 +916,13 @@ impl TriggerReader {
     #[cfg(test)]
     pub fn park_for_test(&self) {
         self.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Is the control pipe's read end still open? A reader thread that has
+    /// exited must not have closed it — see the test that pins why.
+    #[cfg(test)]
+    pub fn control_read_end_open_for_test(&self) -> bool {
+        unsafe { libc::fcntl(self.control.0, libc::F_GETFD) != -1 }
     }
 
     /// Whether arrivals were dropped since the last call — reports and
@@ -940,7 +953,10 @@ impl Drop for TriggerReader {
         // Only after the join: the thread owns the read end and closes it
         // itself, so neither side can free a descriptor the other is still
         // naming.
-        unsafe { libc::close(self.control_tx) };
+        unsafe {
+            libc::close(self.control.0);
+            libc::close(self.control.1);
+        }
     }
 }
 
@@ -1647,6 +1663,38 @@ mod trigger_reader_tests {
             o.empty_since.is_some_and(|p| p <= at_write),
             "a proof of emptiness must never postdate the write it bounds"
         );
+    }
+
+    #[test]
+    fn fencing_a_reader_whose_thread_has_ended_is_still_safe() {
+        // The reader thread does NOT live as long as its owner: it exits on
+        // EOF, which is the designed end-of-life for every `fd:` source,
+        // while the loop keeps fencing every reader once per spawn and once
+        // per drain. If the thread closed the control read end on its way
+        // out, that descriptor NUMBER would be free for the next open, and
+        // every later fence would write a byte into an unrelated stream.
+        //
+        // This cost a real failure once — a watch heartbeat died because
+        // fences were landing in a reused descriptor — and it was caught by
+        // a test that exists for the end-of-life notice, not for this. The
+        // assertion below makes it deliberate instead of lucky.
+        let (rx, tx) = os_pipe_pair();
+        let reader = TriggerReader::open(&TriggerSpec::Fd(rx.as_raw_fd()), None).unwrap();
+        drop(tx); // EOF: the reader thread ends and returns
+        assert!(
+            wait_until(|| reader.ended().load(Ordering::SeqCst)),
+            "the reader never noticed EOF"
+        );
+
+        assert!(
+            reader.control_read_end_open_for_test(),
+            "the exiting thread closed the control read end; its number is \
+             now reusable and every later fence corrupts whatever claims it"
+        );
+        for _ in 0..100 {
+            reader.fence();
+        }
+        assert_eq!(reader.fences_for_test(), 100);
     }
 
     #[test]
