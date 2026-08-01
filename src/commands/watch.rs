@@ -4869,6 +4869,21 @@ mod tests {
             )
         }
 
+        /// Wait until the reader has actually PROVED its descriptor empty at
+        /// least once. Sleeping a read slice and assuming it happened is a
+        /// wall-clock premise a loaded CI runner does not honour; this waits
+        /// for the fact.
+        fn wait_for_empty_proof(reader: &TriggerReader) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if reader.empty_since_for_test().is_some() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("the reader never proved its descriptor empty");
+        }
+
         /// Drain until `n` observations have been recorded, or fail. The
         /// reader is a thread, so every assertion about what it recorded
         /// needs a settle. (`tap.rs` has its own copy for its own module;
@@ -4914,14 +4929,15 @@ mod tests {
             let key =
                 TriggerKey("fifo:".to_string() + &dir.path().join("a.fifo").display().to_string());
 
-            // Wait out one reader slice first, so a proof of emptiness
-            // exists. A reader's very first arrival has no lower bound —
-            // it has never yet seen its descriptor be not-readable — and
-            // an unbounded interval proves nothing in either direction.
-            // Vetoing on it is precisely the overclaim this plan removes,
-            // so the exogenous case now has a precondition it did not have
-            // when an arrival was a bare instant.
-            std::thread::sleep(Duration::from_millis(120));
+            // Wait for a proof of emptiness first. A reader's very first
+            // arrival has no lower bound — it has never yet seen its
+            // descriptor be not-readable — and an unbounded interval proves
+            // nothing in either direction. Vetoing on it is precisely the
+            // overclaim this plan removes, so the exogenous case now has a
+            // precondition it did not have when an arrival was a bare
+            // instant. Waited for, not slept through: the sleep was a
+            // scheduling assumption and CI does not honour it.
+            wait_for_empty_proof(&s.reader);
             poke(&s, &mut w);
             drain_reader_arrivals(std::slice::from_ref(&s), &mut log, Instant::now());
             let idle = log.arrivals(&key);
@@ -5029,8 +5045,7 @@ mod tests {
             // boundary, which is what this task owns.
             let dir = tempfile::tempdir().unwrap();
             let (s, mut w) = slot(dir.path(), "f.fifo");
-            // Longer than one reader slice, so a proof of emptiness exists.
-            std::thread::sleep(Duration::from_millis(120));
+            wait_for_empty_proof(&s.reader);
             poke(&s, &mut w);
 
             let observations = s.reader.take_arrivals();
@@ -5052,7 +5067,7 @@ mod tests {
             // between will leave the cycle tests failing every run.
             let dir = tempfile::tempdir().unwrap();
             let (s, mut w) = slot(dir.path(), "g.fifo");
-            std::thread::sleep(Duration::from_millis(120));
+            wait_for_empty_proof(&s.reader);
             poke(&s, &mut w);
 
             let mut log = WindowLog::new(Duration::from_secs(30));
@@ -5075,7 +5090,7 @@ mod tests {
             use crate::core::trigger::TemporalCoverage;
             let dir = tempfile::tempdir().unwrap();
             let (s, mut w) = slot(dir.path(), "fenced.fifo");
-            std::thread::sleep(Duration::from_millis(120)); // an old proof exists
+            wait_for_empty_proof(&s.reader); // an old proof exists
 
             let mut log = WindowLog::new(Duration::from_secs(30));
             let opened = log.open_bracket(SourceId(1), Instant::now(), Vec::new());
