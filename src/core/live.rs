@@ -126,10 +126,6 @@ impl Emissions {
     }
 
     /// Take the pending body, leaving the outbox empty.
-    // STAGED: the worker fills the outbox now, but nothing in the loop
-    // empties it until the compose gate opens on progress. The allow
-    // comes off with that change and is not a permanent exemption.
-    #[allow(dead_code)]
     pub fn take(&self) -> Option<Emission> {
         self.lock().pending.take()
     }

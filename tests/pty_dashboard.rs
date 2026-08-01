@@ -1223,3 +1223,376 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
         "the notice must name the watched fifos and where to read more"
     );
 }
+
+// ---------------------------------------------------------------------
+// A live pane: a child spawned once, never expected to exit, whose
+// output must reach the frame as it arrives.
+// ---------------------------------------------------------------------
+
+/// A live pane's command: record this spawn, then FOLLOW the log without
+/// exiting.
+///
+/// `exec` so the process that outlives the shell IS the follower. A
+/// shell that forks instead of execing would absorb a kill while its
+/// child kept the pipes open, which is the rule the kill-slot fixtures
+/// already follow.
+fn following_counter_cmd(counter: &std::path::Path, log: &std::path::Path) -> String {
+    format!(
+        "echo run >> {c}; exec {rat} __follow {l}",
+        c = counter.display(),
+        rat = rat_bin(),
+        l = log.display()
+    )
+}
+
+/// A declaration whose panes each say whether they are long-lived.
+/// Keeps the format-specific text in this file's builders, beside
+/// `board` and `panes_row`. `live` rides the PROPERTY position so the
+/// dual spelling gets exercised through a real file, not just a parse.
+fn live_board(panes: &[(&str, &str, bool, &str)]) -> String {
+    let mut body = String::from(
+        "row-gap 0\n\ndefaults {\n    height 5\n    border \"rounded\"\n    shell #true\n}\n",
+    );
+    for (name, interval, live, command) in panes {
+        let live_attr = if *live { " live=#true" } else { "" };
+        body.push_str(&format!(
+            "\npane \"{name}\"{live_attr} {{\n    interval \"{interval}\"\n    command \"{command}\"\n}}\n"
+        ));
+    }
+    body
+}
+
+fn seed(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).expect("seed the log");
+}
+
+fn append(path: &std::path::Path, text: &str) {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("reopen the log")
+        .write_all(text.as_bytes())
+        .expect("append to the log");
+}
+
+/// Whether any process's command line contains `needle`.
+///
+/// Child-side evidence that a killed child really died, which no screen
+/// assertion can give: a frame says nothing about what is still running
+/// behind it. POSIX `ps`, since this file is unix-only anyway.
+fn any_process_matching(needle: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "args="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|line| line.contains(needle))
+}
+
+/// THE INVARIANT, and the worst hazard in this feature. The loop calls
+/// `schedule.completed()` for every source it drained. A live child that
+/// EMITS has not completed: marking it so clears `in_flight` and
+/// schedules a second child while the first is still running, whose
+/// handle the slot then overwrites — orphaning the original.
+///
+/// Child-side evidence, never a screen assertion: the fixture appends to
+/// a counter on startup, so a second spawn is a second line. The
+/// interval is short on purpose — a wrongly-completed tick respawns
+/// inside the settle window rather than after it.
+#[test]
+fn a_progress_event_does_not_complete_the_tick() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "start\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "200ms",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"start", Duration::from_secs(5)),
+        "the live pane never painted"
+    );
+    // Several emissions, each one a chance to be miscounted as a
+    // completion. Without them the test would pass on a source that
+    // simply never moved.
+    for i in 0..4 {
+        append(&log, &format!("line-{i}\n"));
+        assert!(
+            wait_for(
+                &session,
+                &mut terminal,
+                format!("line-{i}").as_bytes(),
+                Duration::from_secs(5)
+            ),
+            "append {i} never reached the frame"
+        );
+    }
+    assert_counter_settled_at(&counter, 1);
+}
+
+/// The measured defect: a dashboard whose only pane is live painted 25
+/// bytes, every one of them terminal capability probing. The compose
+/// block was gated on a non-empty drain, and a child that never exits
+/// never posts.
+#[test]
+fn a_dashboard_of_only_live_panes_paints_without_any_completion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "first line\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "1h",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // A 1h interval: nothing but the emission itself can produce this
+    // frame, so a pass cannot come from a second tick.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"first line",
+            Duration::from_secs(5)
+        ),
+        "a live-only dashboard never painted"
+    );
+}
+
+/// Following, not just a first paint. The order matters: appending
+/// BEFORE the first paint would let one read satisfy this.
+#[test]
+fn appended_lines_reach_an_already_painted_frame() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "first line\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "1h",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"first line",
+            Duration::from_secs(5)
+        ),
+        "the first line never painted"
+    );
+    append(&log, "second line\n");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"second line",
+            Duration::from_secs(5)
+        ),
+        "an append never reached the painted frame"
+    );
+}
+
+/// The mixed case measured on main, where the batch pane painted and the
+/// live pane's box stayed empty while looking perfectly healthy.
+#[test]
+fn a_live_pane_beside_a_batch_pane_shows_both() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    let batch = dir.path().join("batch");
+    seed(&log, "followed-text\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[
+            (
+                "follower",
+                "1h",
+                true,
+                &following_counter_cmd(&counter, &log),
+            ),
+            ("batch", "1h", false, &labeled_counter_cmd(&batch, "batch")),
+        ]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // ONE accumulated wait: each needle paints exactly once at a 1h
+    // cadence, so a second wait starting fresh could miss the first.
+    let seen = wait_for_bytes(&session, &mut terminal, b"batch-1", Duration::from_secs(5))
+        .expect("the batch pane never painted");
+    if !contains(&seen, b"followed-text") {
+        let more = wait_for_bytes(
+            &session,
+            &mut terminal,
+            b"followed-text",
+            Duration::from_secs(5),
+        );
+        assert!(more.is_some(), "the live pane never painted beside it");
+    }
+}
+
+/// The repaint gate must still hold. A live pane that stops receiving
+/// must stop painting: a frame that thrashes is worse than one that
+/// lags, and a follower sits quiet most of the time.
+#[test]
+fn a_live_pane_that_stops_moving_stops_painting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "settled\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "1h",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"settled", Duration::from_secs(5)),
+        "the live pane never painted"
+    );
+    // Drain the tail of the first composition, then require silence.
+    // The follower keeps polling its file throughout — the claim is that
+    // a poll finding nothing writes nothing.
+    let _ = session.read_available(Duration::from_millis(500));
+    let quiet = session.read_available(Duration::from_millis(800));
+    assert!(
+        quiet.is_empty(),
+        "a quiet live pane repainted {} bytes: {:?}",
+        quiet.len(),
+        String::from_utf8_lossy(&quiet)
+    );
+}
+
+/// A live command that exits gets respawned, and the replacement's fresh
+/// content must not render under the dead child's `exit N` — that reads
+/// as a pane failing while it works. Nothing else can clear the badge:
+/// the replacement never completes, so it never posts a status.
+///
+/// The absence is asserted against a FULL repaint, forced by a resize.
+/// Asserting it against the incremental stream would pass for the wrong
+/// reason: a badge that survived leaves its row byte-identical, so the
+/// differ rewrites nothing and the stale text never appears either way.
+#[test]
+fn a_live_pane_that_exits_and_respawns_drops_the_old_exit_badge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "second-run-content\n");
+    // Run 1 exits 3 and prints nothing; run 2 follows and stays alive.
+    let command = format!(
+        "echo run >> {c}; if [ $(wc -l < {c}) -eq 1 ]; then exit 3; fi; exec {rat} __follow {l}",
+        c = counter.display(),
+        rat = rat_bin(),
+        l = log.display()
+    );
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[("follower", "300ms", true, &command)]),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"exit 3", Duration::from_secs(5)),
+        "the first run's exit badge never appeared"
+    );
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"second-run-content",
+            Duration::from_secs(5)
+        ),
+        "the respawned follower never emitted"
+    );
+    session.set_winsize(24, 120);
+    let wide = "─".repeat(45);
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        wide.as_bytes(),
+        Duration::from_secs(5),
+    )
+    .expect("the resize never repainted at the new width");
+    assert!(
+        !contains(&bytes, b"exit 3"),
+        "the replacement child inherited the dead child's exit badge"
+    );
+}
+
+/// `--once` with a live pane needs no decision — the shipped loop
+/// already determines it and this pins it. The first emission sets the
+/// source's posted flag, which satisfies the once condition, so one
+/// complete frame is emitted and the loop breaks; the held shutdown
+/// guard then kills a child that would otherwise outlive the process.
+#[test]
+fn once_emits_one_frame_from_a_live_pane_and_leaves_no_orphan() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    seed(&log, "once-content\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_board(&[(
+            "follower",
+            "1h",
+            true,
+            &following_counter_cmd(&counter, &log),
+        )]),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", "--once", &decl.display().to_string()],
+        &[],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"once-content",
+            Duration::from_secs(5)
+        ),
+        "--once never emitted the live pane's frame"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.exited() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "--once never exited with a live pane"
+        );
+        let _ = session.read_available(Duration::from_millis(50));
+    }
+    // The follower is spawned once and killed on the way out; a survivor
+    // would hold a pipe and outlive the run that started it.
+    assert_counter_settled_at(&counter, 1);
+    assert!(
+        !any_process_matching(&log.display().to_string()),
+        "the live child outlived the --once run that spawned it"
+    );
+}

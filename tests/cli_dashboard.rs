@@ -628,3 +628,52 @@ pane "quiet" {{
         "only the flooding pane wears it: {stdout:?}"
     );
 }
+
+/// The piped route for a live pane under `--once`: a source whose child
+/// never exits still produces exactly one frame and a clean exit,
+/// because its first emission is what satisfies the once condition.
+///
+/// Its own test rather than a corollary of the pty one: a piped run and
+/// a terminal run take different branches through the loop, and the
+/// shared half is the half already covered.
+#[test]
+#[cfg(unix)]
+fn once_with_a_live_pane_emits_one_frame_and_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("log");
+    std::fs::write(&log, "piped-live-content\n").expect("seed the log");
+    let file = fixture(
+        dir.path(),
+        "live.kdl",
+        &format!(
+            r#"
+defaults {{
+    height 3
+    chrome #false
+}}
+
+pane "follower" live=#true {{
+    command "{bin}" "__follow" "{log}"
+}}
+"#,
+            bin = rat_bin().replace('\\', "\\\\"),
+            log = log.display()
+        ),
+    );
+    let out = rat()
+        .args(["dashboard", "--once", &file])
+        .env("RAT_WIDTH", "40")
+        .env("RAT_HEIGHT", "10")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("piped-live-content"),
+        "the live pane's body never reached the frame: {stdout:?}"
+    );
+    assert_eq!(
+        stdout.matches("piped-live-content").count(),
+        1,
+        "--once must emit exactly one frame: {stdout:?}"
+    );
+}
