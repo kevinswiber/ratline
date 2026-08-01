@@ -330,6 +330,11 @@ pub(crate) fn run_registry(
         ..Default::default()
     };
     let mut log = WindowLog::new(suspicion.window);
+    if trace.is_some() {
+        // Task 2.3's measurement: keep the reader's intervals so the trace
+        // can report their widths. Nothing reads them but the trace.
+        log.trace_observations();
+    }
     // The panes the notice has already announced — its latch, so one
     // loop announces itself once and a repaired one can announce again.
     let mut suspected: Vec<SourceId> = Vec::new();
@@ -1575,6 +1580,10 @@ fn drain_reader_arrivals(
     for slot in slots {
         let key = reader_key(&slot.spec);
         for observation in slot.reader.take_arrivals() {
+            // DIAGNOSTIC ONLY (task 2.3), and a no-op unless the trace is on:
+            // the log stores a point until 4.1, so this is the only place the
+            // interval can be measured at all.
+            log.note_observation_for_trace(observation);
             log.observe_arrival(key.clone(), observation.observed_at);
         }
         // Read every iteration, and it reports-and-clears: one lost arrival

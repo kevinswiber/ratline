@@ -1021,7 +1021,16 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     // a 0/3 draw happens 30% of the time. The perturbation was never
     // measured, only inferred from a sample too small to say anything, and
     // main's 3/4 is the same coin landing high.
-    let trace = dir.path().join("trigger-trace.log");
+    // Normally the trace lives in the tempdir and is printed only when the
+    // test fails, which is when anyone wants it. Task 2.3 needs the numbers
+    // from EVERY run, passing ones included, so an operator may name a
+    // directory to keep them in. Unset — every ordinary run — is unchanged.
+    let trace = match std::env::var_os("RAT_WEDGE_TRACE_TO") {
+        Some(keep) => {
+            std::path::PathBuf::from(keep).join(format!("trace-{}.log", std::process::id()))
+        }
+        None => dir.path().join("trigger-trace.log"),
+    };
     let trace_arg = trace.display().to_string();
     let traced = std::env::var_os("RAT_WEDGE_CONTROL").is_none();
     let envs: Vec<(&str, &str)> = if traced {
