@@ -18,17 +18,25 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// The harness ceiling, kept here because it is INVISIBLE where test
-/// authors choose their timeouts: `.config/nextest.toml` terminates a
-/// test after `10s x 2`, so any wait longer than this is unreachable by
-/// construction — the harness kills the test before the wait can expire,
-/// and a terminated test prints nothing. A generous number written past
-/// this line buys no tolerance for a slow runner; it only trades the
-/// failure's evidence for the appearance of patience.
+/// The harness ceiling **for the cycle tests**, kept here because it is
+/// INVISIBLE where test authors choose their timeouts: nextest
+/// terminates a test after `period x 2`, so any wait longer than that is
+/// unreachable by construction — the harness kills the test before the
+/// wait can expire, and a terminated test prints nothing. A generous
+/// number written past this line buys no tolerance for a slow runner; it
+/// only trades the failure's evidence for the appearance of patience.
 ///
-/// Waits that can plausibly approach it derive from these two rather
-/// than pick a number. Change it only alongside `nextest.toml`.
-const HARNESS_CEILING: Duration = Duration::from_secs(20);
+/// 60s rather than the suite's general 20s because these two tests EARN
+/// their verdict — 50 trigger-driven respawns inside the detector's 30s
+/// window — so their cost tracks how fast the machine spawns processes.
+/// A `macos-latest` runner has already failed the file route at the 20s
+/// ceiling while its fifo sibling passed at 10.4s.
+///
+/// **Change it only alongside the matching override in
+/// `.config/nextest.toml`**, whose filter is what actually grants the
+/// allowance. This constant only spends what that grants: raise it alone
+/// and every wait derived from it becomes unreachable again, silently.
+const HARNESS_CEILING: Duration = Duration::from_secs(60);
 /// What the ceiling owes to everything that is not the wait: the
 /// shutdown probe, the kill, the diagnostic dump, and slack.
 const HARNESS_RESERVE: Duration = Duration::from_secs(4);
