@@ -1539,10 +1539,17 @@ fn reader_key(spec: &TriggerSpec) -> crate::core::trigger::TriggerKey {
 /// unioned. Do not reinvent it.
 ///
 /// So the reader reports **when**, and the window decides what it means:
-/// `observe_arrival` resolves each instant against the brackets the loop
+/// `observe_arrival` resolves each observation against the brackets the loop
 /// already owns. Nothing is pre-judged here — an arrival older than the window
 /// is still handed over, and eviction drops it, because a drain that filtered
 /// would be a second place deciding what counts.
+///
+/// What the reader reports is a **window**, not an instant: bytes appeared
+/// somewhere between its last proof of emptiness and its read. That window's
+/// WIDTH is the whole question — an unfenced one is tens of milliseconds
+/// wide against child brackets around a millisecond, which is what the fence
+/// exists to shrink. Until then the loop reads only the upper bound, exactly
+/// as it read an instant before, and the lower bound rides along unused.
 ///
 /// The identity is not optional. Two fifos on one pane are two separate bodies
 /// of evidence, and merging them under a source id would make the per-path
@@ -1555,8 +1562,8 @@ fn drain_reader_arrivals(
 ) {
     for slot in slots {
         let key = reader_key(&slot.spec);
-        for at in slot.reader.take_arrivals() {
-            log.observe_arrival(key.clone(), at);
+        for observation in slot.reader.take_arrivals() {
+            log.observe_arrival(key.clone(), observation.observed_at);
         }
         // Read every iteration, and it reports-and-clears: one lost arrival
         // makes THIS window abstain, not every window after it.
@@ -4869,6 +4876,49 @@ mod tests {
                 log.arrivals(&key).is_empty(),
                 "eviction, not the drain, is what drops it"
             );
+        }
+
+        // ── Observations out (task 2.2) ─────────────────────────────────
+
+        #[test]
+        fn the_drain_carries_the_whole_observation_out_of_the_reader() {
+            // The interval must survive `take_arrivals`. The LOG does not
+            // store it yet — that is 4.1 — so this asserts at the reader
+            // boundary, which is what this task owns.
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "f.fifo");
+            // Longer than one reader slice, so a proof of emptiness exists.
+            std::thread::sleep(Duration::from_millis(120));
+            poke(&s, &mut w);
+
+            let observations = s.reader.take_arrivals();
+            assert_eq!(observations.len(), 1);
+            assert!(
+                observations[0].empty_since.is_some(),
+                "the lower bound must survive — without it every observation \
+                 is Ambiguous once 4.1 wires it up, and the route contributes \
+                 nothing"
+            );
+        }
+
+        #[test]
+        fn the_window_still_records_exactly_what_it_recorded_before() {
+            // BEHAVIOUR-NEUTRALITY, asserted rather than assumed. This task
+            // changes a type, not a decision: the log still stores an
+            // instant, so the detector's answers must be identical. If this
+            // fails, the flip has leaked out of 4.1 and some phase in
+            // between will leave the cycle tests failing every run.
+            let dir = tempfile::tempdir().unwrap();
+            let (s, mut w) = slot(dir.path(), "g.fifo");
+            std::thread::sleep(Duration::from_millis(120));
+            poke(&s, &mut w);
+
+            let mut log = WindowLog::new(Duration::from_secs(30));
+            let slots = vec![s];
+            drain_reader_arrivals(&slots, &mut log, Instant::now());
+
+            let key = reader_key(&slots[0].spec);
+            assert_eq!(log.arrivals(&key).len(), 1);
         }
     }
 }
