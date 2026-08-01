@@ -20,6 +20,7 @@
 //! the line, exactly as the renderer treats it. Do not "improve" that.
 
 use std::collections::VecDeque;
+use std::io::Read;
 
 /// The most bytes one line may hold, terminator aside, before it is
 /// dropped whole.
@@ -181,6 +182,69 @@ impl LineCap {
                 }
             }
         }
+    }
+}
+
+/// How much of one child's output is retained, and from which end.
+///
+/// Carried by value, and deliberately not an `Option`: every caller has
+/// a policy, so "unbounded" is not representable.
+#[derive(Clone, Copy)]
+pub struct Retention {
+    pub max_lines: usize,
+    pub keep: Keep,
+}
+
+/// Drain one pipe to EOF, retaining at most what the policy allows.
+///
+/// **The loop always runs to EOF.** There is no early exit when the
+/// bound fills — the accumulator discards, the reader keeps reading.
+///
+/// What an early exit actually costs was measured rather than reasoned
+/// about, and it is not the deadlock one would expect: this function
+/// takes the pipe by value and drops it on return, so the read end
+/// closes before anyone waits and the child dies of SIGPIPE in
+/// milliseconds. The damage is quieter than a hang and harder to
+/// notice — the drop count comes back ZERO while everything past the
+/// bound is lost, so the one number that makes a truncation visible
+/// would report nothing was truncated, and the child's exit stops
+/// being clean. See the proof in `core::child`'s tests.
+///
+/// Each pipe gets its own accumulator, which is the shipped shape, so a
+/// child flooding both is bounded at twice the line count. Bounded is
+/// the requirement; a single shared ceiling is not.
+pub fn read_all<R: Read>(pipe: Option<R>, retention: Retention) -> (Vec<Vec<u8>>, usize) {
+    let mut cap = LineCap::new(retention.max_lines, retention.keep);
+    if let Some(mut pipe) = pipe {
+        // A read granularity, not a bound. The bound is the cap's.
+        let mut buf = [0u8; 8 * 1024];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => cap.feed(&buf[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                // A read error yields whatever arrived: a partial frame
+                // beats tearing the dashboard down.
+                Err(_) => break,
+            }
+        }
+    }
+    cap.finish()
+}
+
+/// A dropped-line count as a person reads it: `90`, `1.2k`, `2.5M`.
+///
+/// One spelling for one number, shared by every surface that reports a
+/// truncation — a watch pane's chrome badge and `spin`'s stderr notice.
+/// Two spellings of the same count would read as two different
+/// mechanisms.
+pub fn compact_count(n: usize) -> String {
+    const K: usize = 1_000;
+    const M: usize = 1_000_000;
+    match n {
+        n if n < K => n.to_string(),
+        n if n < M => format!("{}.{}k", n / K, (n % K) / 100),
+        n => format!("{}.{}M", n / M, (n % M) / 100_000),
     }
 }
 
