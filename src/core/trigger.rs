@@ -771,6 +771,42 @@ impl WindowLog {
             .collect()
     }
 
+    /// DIAGNOSTIC ONLY: how far an arrival that NO bracket contained sat from
+    /// the nearest one, in milliseconds. **Positive means it landed after that
+    /// bracket closed; negative means it landed before that bracket opened.**
+    /// `None` means the log held no bracket at all.
+    ///
+    /// One such arrival reads as an outside writer and vetoes its pane for a
+    /// whole window, and the three answers want three different fixes: missing
+    /// a close by a millisecond is a clock that cannot be trusted to place the
+    /// write, landing well before any bracket is a startup ordering problem,
+    /// and no brackets at all is neither.
+    pub fn nearest_bracket_gap(&self, at: std::time::Instant) -> Option<(SourceId, f64)> {
+        self.brackets
+            .iter()
+            .filter_map(|b| {
+                if at < b.opened {
+                    let ms = b.opened.duration_since(at).as_secs_f64() * 1000.0;
+                    return Some((b.source, -ms));
+                }
+                // Past its open, so only a CLOSED bracket can have missed it:
+                // an open one spans everything from its start and would have
+                // contained the arrival, and then nobody would be asking.
+                let closed = b.closed?;
+                Some((
+                    b.source,
+                    at.saturating_duration_since(closed).as_secs_f64() * 1000.0,
+                ))
+            })
+            .min_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+    }
+
+    /// DIAGNOSTIC ONLY: how many brackets the window holds, so "no bracket was
+    /// near it" and "there were no brackets" stay distinguishable.
+    pub fn bracket_count(&self) -> usize {
+        self.brackets.len()
+    }
+
     /// True when a reader lost arrivals inside the current window.
     pub fn evidence_lost(&self, now: std::time::Instant) -> bool {
         let cutoff = self.cutoff(now);
@@ -1004,13 +1040,16 @@ impl LoopSuspicion {
     ) -> String {
         use std::fmt::Write as _;
         let mut w = format!(
-            "busy={:.3} lost={}",
+            "busy={:.3} lost={} brk={}",
             log.busy_fraction(now),
             u8::from(log.evidence_lost(now)),
+            log.bracket_count(),
         );
         for pane in panes {
             let exogenous: usize = pane.watched.iter().map(|p| ledger.exogenous(p)).sum();
             let (mut arrivals, mut uncontained, mut deferred) = (0usize, 0usize, 0usize);
+            // By how much, and on which side, each vetoing arrival missed.
+            let mut gaps: Vec<String> = Vec::new();
             for key in pane.readers {
                 for arrival in log.arrivals(key) {
                     arrivals += 1;
@@ -1019,8 +1058,15 @@ impl LoopSuspicion {
                     // veto (nothing was in flight, so the byte came from
                     // outside), while an unresolvable width is only DEFERRED
                     // until the covering child exits.
-                    uncontained += usize::from(arrival.containing.is_empty());
                     deferred += usize::from(log.widths(arrival).is_none());
+                    if !arrival.containing.is_empty() {
+                        continue;
+                    }
+                    uncontained += 1;
+                    gaps.push(match log.nearest_bracket_gap(arrival.at) {
+                        Some((source, ms)) => format!("s{}{ms:+.1}", source.0),
+                        None => "nobrackets".to_string(),
+                    });
                 }
             }
             let _ = write!(
@@ -1032,6 +1078,13 @@ impl LoopSuspicion {
                 exogenous,
                 u8::from(self.closed_everywhere(ledger, log, pane)),
             );
+            if !gaps.is_empty() {
+                // `+` is milliseconds AFTER a bracket closed, `-` is before one
+                // opened. The sign is the whole finding: one says the arrival
+                // clock cannot place the write, the other says the ordering at
+                // startup is wrong.
+                let _ = write!(w, " uncgap=[{}]", gaps.join(","));
+            }
         }
         w
     }
@@ -2110,6 +2163,36 @@ mod tests {
         assert!(log.arrivals(&TriggerKey("fifo:/tmp/a".into())).is_empty());
         assert!(!log.evidence_lost(t0 + secs(30)));
         assert!((log.busy_fraction(t0 + secs(30)) - 0.0).abs() < 1e-9);
+    }
+
+    /// DIAGNOSTIC ONLY, and it exists because the SIGN is the finding.
+    ///
+    /// An uncontained arrival vetoes its pane for a whole window. Whether it
+    /// missed a bracket's close by a millisecond or landed before any bracket
+    /// opened names two different defects, and a trace that reports the sign
+    /// backwards would send the next round of CI runs after the wrong one.
+    #[test]
+    fn the_gap_to_the_nearest_bracket_is_signed_by_which_side_it_missed() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(3), t0, Vec::new());
+        log.close_bracket(id, t0 + Duration::from_millis(10), Vec::new());
+
+        // Two milliseconds LATE: the bracket had already closed.
+        let (source, ms) = log
+            .nearest_bracket_gap(t0 + Duration::from_millis(12))
+            .expect("a bracket to measure against");
+        assert_eq!(source, SourceId(3));
+        assert!((ms - 2.0).abs() < 0.5, "late must read positive, got {ms}");
+
+        // Four milliseconds EARLY: the bracket had not opened yet.
+        let (_, ms) = log
+            .nearest_bracket_gap(t0 - Duration::from_millis(4))
+            .expect("a bracket to measure against");
+        assert!((ms + 4.0).abs() < 0.5, "early must read negative, got {ms}");
+
+        // And an empty log is its own answer, not a zero.
+        assert!(WindowLog::new(secs(10)).nearest_bracket_gap(t0).is_none());
     }
 
     #[test]
