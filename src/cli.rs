@@ -101,6 +101,11 @@ pub enum Command {
 pub struct LinesArgs {
     /// How many lines to print.
     pub count: usize,
+    /// Flood stderr instead of stdout. A capture bounds each pipe
+    /// separately, so the two are separate ROUTES and a test that only
+    /// ever floods stdout leaves half the shipped code unexercised.
+    #[arg(long)]
+    pub stderr: bool,
 }
 
 #[cfg(debug_assertions)]
