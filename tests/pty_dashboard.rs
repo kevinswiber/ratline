@@ -1684,3 +1684,86 @@ fn a_live_pane_bounded_at_its_cap_reports_the_drop() {
         "the flood's tail never reached the frame"
     );
 }
+
+/// A single live pane with a `file:` trigger — the declaration whose
+/// contract these two tests settle.
+fn live_trigger_board(interval: &str, command: &str, trigger: &std::path::Path) -> String {
+    format!(
+        "row-gap 0\n\ndefaults {{\n    height 5\n    border \"rounded\"\n    shell #true\n}}\n\n\
+         pane \"follower\" live=#true {{\n    interval \"{interval}\"\n    trigger \"file:{t}\"\n    \
+         trigger-debounce \"100ms\"\n    command \"{command}\"\n}}\n",
+        t = trigger.display()
+    )
+}
+
+/// The trigger contract on a live pane: a fire RESTARTS the child —
+/// the revocable kill discharges the respawn request that
+/// single-in-flight would otherwise hold forever. Child-side evidence
+/// for both halves: the counter says a second spawn happened, and the
+/// appended line proves the REPLACEMENT is the one following the log.
+#[test]
+fn a_file_trigger_restarts_a_live_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, log) = (dir.path().join("counter"), dir.path().join("log"));
+    let poke = dir.path().join("poke");
+    seed(&log, "start\n");
+    seed(&poke, "seed\n");
+    let decl = write_dashboard(
+        dir.path(),
+        &live_trigger_board("1h", &following_counter_cmd(&counter, &log), &poke),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"start", Duration::from_secs(5)),
+        "the live pane never painted"
+    );
+    wait_for_counter(&counter, 1);
+    append(&poke, "fire\n");
+    // The respawn: a second child, and exactly one — the debounce
+    // collapses the single fire into a single restart.
+    wait_for_counter(&counter, 2);
+    append(&log, "after-restart\n");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"after-restart",
+            Duration::from_secs(5)
+        ),
+        "the replacement child is not following"
+    );
+    assert_counter_settled_at(&counter, 2);
+}
+
+/// The compounding case, by name: a trigger-only live pane whose child
+/// exits. With no interval its schedule holds no deadline, so without
+/// the trigger this pane is dead forever — and before this contract
+/// landed, the trigger was inert on top. The fire must revive it.
+#[test]
+fn a_trigger_respawns_a_live_child_that_already_exited() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, poke) = (dir.path().join("counter"), dir.path().join("poke"));
+    seed(&poke, "seed\n");
+    // A live-declared command that prints its run number and exits at
+    // once: run 1 paints `gone-1` and dies, leaving no child and no
+    // deadline.
+    let decl = write_dashboard(
+        dir.path(),
+        &live_trigger_board("never", &labeled_counter_cmd(&counter, "gone"), &poke),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"gone-1", Duration::from_secs(5)),
+        "the first run never painted"
+    );
+    append(&poke, "fire\n");
+    assert!(
+        wait_for(&session, &mut terminal, b"gone-2", Duration::from_secs(5)),
+        "the trigger never revived the dead live pane"
+    );
+    assert_counter_settled_at(&counter, 2);
+}
