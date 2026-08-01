@@ -432,6 +432,58 @@ pub struct Arrival {
     pub containing: Vec<BracketId>,
 }
 
+/// What a reader can honestly say about when some bytes were written.
+///
+/// **Never an instant.** A reader learns only that bytes appeared between
+/// the last moment it PROVED the descriptor empty and the moment its read
+/// returned. The stamp it used to take is later than the write, than the
+/// bytes becoming readable, than `select` returning, than `read`, and than
+/// any lock it waited on — so no code may reconstruct a single write instant
+/// from this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct Observation {
+    /// Last instant this reader proved the descriptor empty, sampled BEFORE
+    /// the probe that proved it. `None` when it has none yet.
+    ///
+    /// Sampling before the probe is the sound direction: bytes can become
+    /// readable between the kernel's check inside `select` and a `now()`
+    /// taken on return, so a bound stamped after the probe could postdate
+    /// the write it claims to precede. Erring early widens the interval,
+    /// which is always safe; erring late is unsound.
+    pub empty_since: Option<std::time::Instant>,
+    /// Stamped immediately after `read` returns, before any lock.
+    pub observed_at: std::time::Instant,
+}
+
+/// Where an observation's possible-write interval sits relative to the
+/// recorded direct-child execution brackets.
+///
+/// **Temporal evidence, not writer provenance.** Fifo bytes do not identify
+/// their writer, so the same classification can describe a direct child, an
+/// unrelated outside writer, or a descendant that outlived its parent. The
+/// endogenous/exogenous inference is made by the conditions that read this —
+/// the only layer entitled to make it.
+///
+/// Two misclassifications follow from that and are deliberately not fixed
+/// here, because no timing evidence could fix them. A stranger writing
+/// mid-bracket is `Covered` and gets credited to our child; a descendant
+/// writing past its parent's close is `Disjoint` and vetoes the pane. The
+/// second is the destructive one. Both are pinned by tests.
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum TemporalCoverage {
+    /// The interval overlaps no recorded bracket. The only value that vetoes.
+    Disjoint,
+    /// Contiguously covered by these brackets, each with its final width —
+    /// `None` while still open. Carries widths because coverage can be a
+    /// UNION no single bracket satisfies, and a resolver asking "which one
+    /// bracket covers this?" would then find none and drop them all.
+    Covered(Vec<(SourceId, Option<std::time::Duration>)>),
+    /// Partially overlaps bracketed and idle time, or has no lower bound.
+    Ambiguous,
+}
+
 /// Every windowed quantity the suspicion test reads, in one place, all of it
 /// evicting. Nothing here is cumulative: a count that cannot fall could never
 /// let a repaired dashboard stop being suspected.
@@ -474,6 +526,62 @@ impl WindowLog {
             close_stamps: Vec::new(),
         });
         id
+    }
+
+    /// Place an observation's possible-write window against the brackets.
+    ///
+    /// The asymmetry is the safety property. For the caller to VETO, nothing
+    /// may have been running at any instant the write could have happened —
+    /// total disjointness. For it to CREDIT, something must have been running
+    /// at every such instant — contiguous total coverage. Anything between
+    /// proves nothing, and the shipped code called that middle case a veto.
+    ///
+    /// Both remain inferences the CALLER makes. This reports only where the
+    /// interval sits; see `TemporalCoverage` for what that does and does not
+    /// establish.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn classify(&self, observation: &Observation) -> TemporalCoverage {
+        let Some(from) = observation.empty_since else {
+            return TemporalCoverage::Ambiguous;
+        };
+        let to = observation.observed_at;
+        type Span = (
+            std::time::Instant,
+            std::time::Instant,
+            SourceId,
+            Option<std::time::Duration>,
+        );
+        // Strict inequalities: a bracket that closed exactly at `from` does
+        // not overlap it. Touching at an endpoint is not coverage.
+        let mut spans: Vec<Span> = self
+            .brackets
+            .iter()
+            .map(|b| (b.opened, b.end_or(to), b.source, b.width()))
+            .filter(|(open, close, _, _)| *close > from && *open < to)
+            .collect();
+        if spans.is_empty() {
+            return TemporalCoverage::Disjoint;
+        }
+        spans.sort_by_key(|(open, _, _, _)| *open);
+
+        // Contributors are NOT deduplicated by source: two brackets of one
+        // source can both contribute, and `median_width` takes a median over
+        // exactly that kind of list. Deduplicating would discard a sample.
+        let mut covered_to = from;
+        let mut contributors: Vec<(SourceId, Option<std::time::Duration>)> = Vec::new();
+        for (open, close, source, width) in spans {
+            if open > covered_to {
+                return TemporalCoverage::Ambiguous; // an idle gap inside the window
+            }
+            if close > covered_to {
+                covered_to = close;
+            }
+            contributors.push((source, width));
+        }
+        if covered_to < to {
+            return TemporalCoverage::Ambiguous; // idle at the end of the window
+        }
+        TemporalCoverage::Covered(contributors)
     }
 
     /// Close a bracket and hand back the completed record, which the loop
@@ -2285,6 +2393,176 @@ mod tests {
         assert!(
             changes.is_empty(),
             "an unresolved arrival contributes no credit input"
+        );
+    }
+
+    // ── Temporal coverage (task 1.1) ────────────────────────────────────
+    //
+    // The semantic core, proved with no threads and nothing depending on it
+    // yet. `classify` places an observation's possible-write interval
+    // against the brackets that were in flight, and says only that. Who
+    // wrote the bytes is an inference the CONDITIONS make, in task 4.1.
+
+    fn obs(from: Instant, to: Instant) -> Observation {
+        Observation {
+            empty_since: Some(from),
+            observed_at: to,
+        }
+    }
+
+    #[test]
+    fn an_interval_inside_one_bracket_is_that_source_running() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(2), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(10), Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(2), t0 + ms(8))),
+            TemporalCoverage::Covered(vec![(SourceId(2), Some(ms(10)))])
+        );
+    }
+
+    #[test]
+    fn an_interval_touching_no_bracket_at_all_is_disjoint() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(6), t0 + ms(9))),
+            TemporalCoverage::Disjoint
+        );
+    }
+
+    #[test]
+    fn an_interval_that_straddles_a_bracket_edge_proves_nothing() {
+        // THE SHIPPED DEFECT, as a unit test. The write could have happened
+        // while the child ran, or in the idle moment after it exited. Today
+        // that is read as proof of an outside writer and vetoes the pane for
+        // a whole 30s window.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(3), t0 + ms(7))),
+            TemporalCoverage::Ambiguous
+        );
+    }
+
+    #[test]
+    fn an_interval_with_no_lower_bound_proves_nothing() {
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(10), Vec::new());
+        let unbounded = Observation {
+            empty_since: None,
+            observed_at: t0 + ms(5),
+        };
+        assert_eq!(log.classify(&unbounded), TemporalCoverage::Ambiguous);
+    }
+
+    #[test]
+    fn union_coverage_reports_every_contributor_with_its_own_width() {
+        // "reports", not "credits": crediting is the conditions' policy, and
+        // this type does not do it. The reason `TemporalCoverage` carries
+        // widths rather than bare ids is that two brackets can jointly cover
+        // an interval that NEITHER covers alone, so a width resolver asking
+        // "which single bracket covers this?" would find none and silently
+        // drop both from the tightness stage.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let a = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(a, t0 + ms(5), Vec::new());
+        let b = log.open_bracket(SourceId(1), t0 + ms(4), Vec::new());
+        log.close_bracket(b, t0 + ms(9), Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(1), t0 + ms(8))),
+            TemporalCoverage::Covered(
+                vec![(SourceId(0), Some(ms(5))), (SourceId(1), Some(ms(5))),]
+            )
+        );
+    }
+
+    #[test]
+    fn a_gap_between_two_brackets_makes_the_span_ambiguous() {
+        // Coverage must be CONTIGUOUS: an outside writer could have written
+        // in the idle moment between them.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let a = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(a, t0 + ms(3), Vec::new());
+        let b = log.open_bracket(SourceId(1), t0 + ms(6), Vec::new());
+        log.close_bracket(b, t0 + ms(9), Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(1), t0 + ms(8))),
+            TemporalCoverage::Ambiguous
+        );
+    }
+
+    #[test]
+    fn a_still_open_bracket_covers_from_its_start_and_reports_no_width() {
+        // `None` is "no claim", never "infinitely tight" — the rule
+        // `median_width` already states, and what stops an unfinished child
+        // winning the tightness stage outright.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        log.open_bracket(SourceId(4), t0, Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(1), t0 + ms(50))),
+            TemporalCoverage::Covered(vec![(SourceId(4), None)])
+        );
+    }
+
+    // The boundary of the claim. Both of these assert a MISCLASSIFICATION as
+    // intended behaviour. They are here so the limitation is pinned by a
+    // test rather than by prose that nothing contradicts when it drifts.
+
+    #[test]
+    fn covered_is_temporal_evidence_not_writer_identity() {
+        // An outside writer active only while our child ran produces exactly
+        // the same interval our child would. `Covered` says "something we
+        // spawned was in flight at every instant this write could have
+        // happened" — never "our child wrote it". The classifier has no
+        // input that could tell the two apart, because fifo bytes carry no
+        // provenance. Condition 2 and condition 4 read it anyway, knowingly:
+        // over-credit is the cheaper of the two errors, since it must still
+        // clear eligibility, tightness and the graph before it can lie.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(10), Vec::new());
+        // Bytes from a stranger, written mid-bracket. Indistinguishable.
+        assert_eq!(
+            log.classify(&obs(t0 + ms(2), t0 + ms(8))),
+            TemporalCoverage::Covered(vec![(SourceId(1), Some(ms(10)))])
+        );
+    }
+
+    #[test]
+    fn a_descendants_write_is_attributed_to_whoever_happened_to_be_running() {
+        // A bracket spans the child the loop spawned and waited for — not
+        // the shell it left behind. So a descendant of SourceId(1) that
+        // writes after its parent's bracket closed is classified by whatever
+        // else was in flight at the time, and here that is an unrelated
+        // SourceId(2): the coverage names the wrong source with full
+        // confidence.
+        //
+        // When nothing else is running the same write degenerates to
+        // `Disjoint` and condition 2 vetoes the pane for a whole window —
+        // the destructive direction, already covered by
+        // `an_interval_touching_no_bracket_at_all_is_disjoint`. Causal
+        // descent is not available to this model in EITHER direction.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let parent = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(parent, t0 + ms(5), Vec::new());
+        let bystander = log.open_bracket(SourceId(2), t0 + ms(5), Vec::new());
+        log.close_bracket(bystander, t0 + ms(12), Vec::new());
+        assert_eq!(
+            log.classify(&obs(t0 + ms(6), t0 + ms(9))),
+            TemporalCoverage::Covered(vec![(SourceId(2), Some(ms(7)))])
         );
     }
 }
