@@ -19,13 +19,13 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
-use crate::core::child::{ChildSlot, Retention, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
+use crate::core::child::{ChildSlot, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
 use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{Composition, Overflow, PaneGeometry, Registry, SourceId, SourceSpec};
-use crate::core::retain::Keep;
+use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
 use crate::core::trigger::{
@@ -2441,18 +2441,6 @@ const MAX_RETAINED_LINES: usize = 1000;
 /// that is already carrying two other badges.
 fn dropped_badge(dropped: usize) -> Option<String> {
     (dropped > 0).then(|| format!("{} lines dropped", compact_count(dropped)))
-}
-
-/// `90`, `1.2k`, `2.5M` — one significant decimal, and no rounding up
-/// into a unit the count has not reached.
-fn compact_count(n: usize) -> String {
-    const K: usize = 1_000;
-    const M: usize = 1_000_000;
-    match n {
-        n if n < K => n.to_string(),
-        n if n < M => format!("{}.{}k", n / K, (n % K) / 100),
-        n => format!("{}.{}M", n / M, (n % M) / 100_000),
-    }
 }
 
 /// The policy for one source: how much it retains, and which end.

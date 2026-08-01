@@ -13,22 +13,11 @@
 //! kills a parked child or bars a spawn that has not happened yet.
 //! There is no window in between.
 
-use std::io::Read;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::core::registry::SourceId;
-use crate::core::retain::{Keep, LineCap};
-
-/// How much of one child's output is retained, and from which end.
-///
-/// Carried by value, and deliberately not an `Option`: every source has
-/// a policy, so "unbounded" is not representable.
-#[derive(Clone, Copy)]
-pub struct Retention {
-    pub max_lines: usize,
-    pub keep: Keep,
-}
+use crate::core::retain::{Retention, read_all};
 
 /// The slot the tick in flight parks its child in, plus the shutdown
 /// bar. Cloning shares the slot.
@@ -231,49 +220,14 @@ fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
     }
 }
 
-/// Drain one pipe to EOF, retaining at most what the policy allows.
-///
-/// **The loop always runs to EOF.** There is no early exit when the
-/// bound fills — the accumulator discards, the reader keeps reading.
-///
-/// What an early exit actually costs was measured rather than reasoned
-/// about, and it is not the deadlock one would expect: this function
-/// takes the pipe by value and drops it on return, so the read end
-/// closes before anyone waits and the child dies of SIGPIPE in
-/// milliseconds. The damage is quieter than a hang and harder to
-/// notice — the drop count comes back ZERO while everything past the
-/// bound is lost, so the one number that makes a truncation visible
-/// would report nothing was truncated, and the child's exit stops
-/// being clean. See the proof in this module's tests.
-///
-/// Each pipe gets its own accumulator, which is the shipped shape, so a
-/// source flooding both is bounded at twice the line count. Bounded is
-/// the requirement; a single shared ceiling is not.
-fn read_all<R: Read>(pipe: Option<R>, retention: Retention) -> (Vec<Vec<u8>>, usize) {
-    let mut cap = LineCap::new(retention.max_lines, retention.keep);
-    if let Some(mut pipe) = pipe {
-        // A read granularity, not a bound. The bound is the cap's.
-        let mut buf = [0u8; 8 * 1024];
-        loop {
-            match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => cap.feed(&buf[..n]),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                // A read error yields whatever arrived: a partial frame
-                // beats tearing the dashboard down.
-                Err(_) => break,
-            }
-        }
-    }
-    cap.finish()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::core::retain::{Keep, read_all};
 
     #[cfg(unix)]
     fn script(body: &str) -> std::process::Command {
