@@ -576,6 +576,14 @@ pub(crate) fn run_registry(
         // channel: a wake is sent only when a body fills an empty
         // outbox, so a child flooding a slot nobody has read yet
         // publishes silently and still contributes at most one event.
+        // TWO LISTS, and keeping them apart is the single most important
+        // line here. `moved` is whatever changed the frame and gates the
+        // compose; `drained` is COMPLETIONS ONLY and is what the
+        // scheduler reads. A long-lived child that emits has not
+        // finished — telling the scheduler otherwise clears `in_flight`
+        // and spawns a second child beside the first, whose handle the
+        // slot then overwrites, orphaning the original.
+        let mut moved: Vec<SourceId> = Vec::new();
         let mut drained: Vec<SourceId> = Vec::new();
         let mut changed: Option<jiff::Timestamp> = None;
         let mut newest = jiff::Timestamp::UNIX_EPOCH;
@@ -587,13 +595,54 @@ pub(crate) fn run_registry(
         while let Ok(event) = rx.try_recv() {
             let outcome = match event {
                 TickEvent::Completed(outcome) => outcome,
-                // Nothing publishes progress yet, so this arm is
-                // unreachable today. It is where the compose gate opens
-                // once a long-lived worker starts offering bodies, and
-                // the split matters: a progress event must never reach
-                // the scheduler below, because a source that emitted has
-                // not finished.
-                TickEvent::Progress { .. } => continue,
+                TickEvent::Progress { source } => {
+                    // At most one body per source per iteration by
+                    // construction: the outbox is one slot and the wake
+                    // is transition-gated. An empty slot means the loop
+                    // already took this body, so the wake is spent.
+                    let Some(emission) = runtime[source.0]
+                        .emissions
+                        .as_ref()
+                        .and_then(Emissions::take)
+                    else {
+                        continue;
+                    };
+                    // A long-lived source is a PANE source by
+                    // construction — `live` is a pane key and a plain
+                    // watch has no pane declaration — so there is no
+                    // plain arm to mirror here.
+                    let spec = registry.spec(source);
+                    let program = spec.command.first().map_or("", String::as_str);
+                    let lines = pane_body(
+                        &emission.stdout.concat(),
+                        &emission.stderr.concat(),
+                        // An emission is output. A spawn error is a
+                        // completion's business and cannot arrive here.
+                        None,
+                        &spec.name,
+                        program,
+                    );
+                    let changed_now = record_pane_body(
+                        &mut runtime[source.0],
+                        lines,
+                        // A fresh live body SUPERSEDES the previous
+                        // child's verdict. Nothing else would clear it:
+                        // the replacement never completes, so it never
+                        // posts a status, and its content would render
+                        // under a dead child's `exit N` forever.
+                        None,
+                        emission.dropped,
+                        emission.at,
+                    );
+                    changed = fold_changed_at(changed, changed_now, emission.at);
+                    newest = newest.max(emission.at);
+                    runtime[source.0].posted = true;
+                    // `moved` and NOT `drained`: this source has content,
+                    // and it has not finished. No bracket closes either —
+                    // no child ran to completion.
+                    moved.push(source);
+                    continue;
+                }
             };
             let id = outcome.source;
             let changed_now = match registry.composition() {
@@ -673,13 +722,13 @@ pub(crate) fn run_registry(
                         &spec.name,
                         program,
                     );
-                    let r = &mut runtime[id.0];
-                    let old_hash = r.hash;
-                    let was_posted = r.posted;
-                    r.failure = exit_badge(outcome.status);
-                    r.truncated = dropped_badge(outcome.dropped);
-                    record_output(r, lines, outcome.at);
-                    r.hash != old_hash || !was_posted
+                    record_pane_body(
+                        &mut runtime[id.0],
+                        lines,
+                        exit_badge(outcome.status),
+                        outcome.dropped,
+                        outcome.at,
+                    )
                 }
             };
             let r = &mut runtime[id.0];
@@ -694,6 +743,7 @@ pub(crate) fn run_registry(
             changed = fold_changed_at(changed, changed_now, outcome.at);
             newest = newest.max(outcome.at);
             r.posted = true;
+            moved.push(id);
             drained.push(id);
             // The bracket closes with the completion. Whatever moved between
             // its two snapshots moved while THIS child was running — and
@@ -709,7 +759,12 @@ pub(crate) fn run_registry(
                 ledger.observe_bracket(&closed, &others);
             }
         }
-        if !drained.is_empty() {
+        // MOVEMENT opens the gate, not completion: a long-lived source
+        // changes the frame without ever finishing, and gating on
+        // completion is exactly why a pane fed by one has been painting
+        // nothing at all. Every completion also moved, so this is strictly
+        // wider than what it replaces and the batch path is unaffected.
+        if !moved.is_empty() {
             // The close fence is what keeps a genuine outside writer
             // PROVABLE. Without it the lower bound stays at the last open
             // fence, every later interval overlaps that bracket, and no
@@ -717,8 +772,12 @@ pub(crate) fn run_registry(
             // veto would silently stop firing. The two fences have opposite
             // jobs and both are required; dropping either disables one half
             // of the signal without disabling the other.
+            //
+            // COMPLETIONS ONLY. An emission closes no bracket, because no
+            // child ran to completion, so fencing on one would narrow the
+            // attribution window with nothing to attribute.
             #[cfg(unix)]
-            if observing {
+            if observing && !drained.is_empty() {
                 for r in runtime.iter() {
                     fence_all(&r.readers);
                 }
@@ -880,6 +939,11 @@ pub(crate) fn run_registry(
             // The deadline is set when a tick COMPOSES, not when it is
             // drained: the fixed delay counts from the frame the reader
             // actually saw.
+            //
+            // `drained`, never `moved` — the one line I-96 exists to
+            // protect. A source that emitted is still running, and
+            // telling the scheduler it completed spawns a second child
+            // beside it.
             for id in &drained {
                 runtime[id.0].schedule.completed(Instant::now());
             }
@@ -2895,6 +2959,34 @@ fn body_signature(
 /// lazily at paint time: they must already exist when the gutter is
 /// switched on, and per-pane diffs are strictly less work than the
 /// composed diff they replace.
+/// Fold one fresh body into a pane's runtime and report whether what the
+/// pane DISPLAYS moved — which is the question the compose gate asks,
+/// and not the same as whether the source produced anything.
+///
+/// The one path for the only two things that produce a body: a child's
+/// completion and a long-lived child's emission. They differ in exactly
+/// one argument — the exit badge, which an emission never carries — and
+/// two copies of the rest would be two chances for a live pane and a
+/// batch pane to disagree about what a body is.
+///
+/// The badges are set HERE, before recording, because `record_output`
+/// folds them into the pane's hash: a badge that cannot repaint is a
+/// badge nobody sees.
+fn record_pane_body(
+    r: &mut SourceRuntime,
+    lines: Vec<String>,
+    failure: Option<String>,
+    dropped: usize,
+    at: jiff::Timestamp,
+) -> bool {
+    let old_hash = r.hash;
+    let was_posted = r.posted;
+    r.failure = failure;
+    r.truncated = dropped_badge(dropped);
+    record_output(r, lines, at);
+    r.hash != old_hash || !was_posted
+}
+
 fn record_output(r: &mut SourceRuntime, lines: Vec<String>, at: jiff::Timestamp) {
     // Every badge is part of what the pane displays, so they all join
     // this pane's hash: a badge that cannot repaint is invisible.

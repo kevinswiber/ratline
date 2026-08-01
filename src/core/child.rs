@@ -82,14 +82,7 @@ pub enum TickEvent {
     /// Deliberately carries no body: the outbox is latest-wins, so N of
     /// these collapse into one render while the wakes themselves stay
     /// cheap. Which source moved is all the loop needs to go look.
-    Progress {
-        // STAGED: the drain matches this arm and drops it, so the tag is
-        // written and not yet read — the loop learns to go look when its
-        // compose gate opens on progress. The allow comes off with that
-        // change and is not a permanent exemption.
-        #[allow(dead_code)]
-        source: SourceId,
-    },
+    Progress { source: SourceId },
     /// A child ran to completion — the shipped path, unchanged.
     Completed(TickOutcome),
 }
