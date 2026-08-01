@@ -67,6 +67,29 @@ impl Drop for ShutdownGuard {
     }
 }
 
+/// What a source hands the loop.
+///
+/// Two variants rather than one struct with optional fields, because a
+/// progress event has no exit status, no close instant and no close
+/// stamps — those describe a COMPLETION. Making them `Option` would let
+/// a caller build "progress that exited 3", and would push the question
+/// of which fields are meaningful onto every reader.
+pub enum TickEvent {
+    /// A long-lived source has new content waiting in its outbox.
+    ///
+    /// Deliberately carries no body: the outbox is latest-wins, so N of
+    /// these collapse into one render while the wakes themselves stay
+    /// cheap. Which source moved is all the loop needs to go look.
+    // STAGED: nothing publishes progress until the worker does, and a
+    // bin crate under `-D warnings` refuses an unconstructed variant.
+    // This comes off with the worker's publish, and is not a permanent
+    // exemption.
+    #[allow(dead_code)]
+    Progress { source: SourceId },
+    /// A child ran to completion — the shipped path, unchanged.
+    Completed(TickOutcome),
+}
+
 /// One finished tick, as it travels from the worker to the loop.
 pub struct TickOutcome {
     /// Which source finished — the index of every per-source resource.
@@ -126,13 +149,13 @@ pub fn run_tick(
 }
 
 /// Run one configured child on a worker thread, which posts exactly
-/// one outcome and exits. The handle is dropped on purpose: nothing
+/// one completion and exits. The handle is dropped on purpose: nothing
 /// ever joins a tick. Err only when the OS refuses a thread.
 pub fn spawn_tick(
     command: std::process::Command,
     source: SourceId,
     slot: ChildSlot,
-    tx: std::sync::mpsc::Sender<TickOutcome>,
+    tx: std::sync::mpsc::Sender<TickEvent>,
     union: Vec<std::path::PathBuf>,
     retention: Retention,
 ) -> std::io::Result<()> {
@@ -141,7 +164,9 @@ pub fn spawn_tick(
         .spawn(move || {
             // On a shutdown race the receiver is already gone; the
             // failed send is the no-op it should be.
-            let _ = tx.send(run_parked(command, source, &slot, &union, retention));
+            let _ = tx.send(TickEvent::Completed(run_parked(
+                command, source, &slot, &union, retention,
+            )));
         })?;
     Ok(())
 }
@@ -736,9 +761,12 @@ mod tests {
             ample(),
         )
         .expect("spawn worker");
-        let outcome = rx
+        let TickEvent::Completed(outcome) = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("one outcome");
+            .expect("one outcome")
+        else {
+            panic!("a batch tick posts a completion");
+        };
         assert!(contains(&outcome.stdout.concat(), b"once"));
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_err());
     }
@@ -820,9 +848,12 @@ mod tests {
             ample(),
         )
         .expect("spawn worker");
-        let posted = rx
+        let TickEvent::Completed(posted) = rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("one outcome");
+            .expect("one outcome")
+        else {
+            panic!("a batch tick posts a completion");
+        };
         assert_eq!(posted.source, SourceId(5));
     }
 
@@ -853,5 +884,71 @@ mod tests {
         );
         assert!(outcome.spawn_error.is_some());
         assert!(outcome.status.is_none());
+    }
+
+    #[test]
+    fn a_batch_tick_posts_exactly_one_completed_event() {
+        // The shipped contract restated against the new type: one tick,
+        // one completion, and NO progress event at all. The second half
+        // is the one that keeps earning its keep once a live worker
+        // starts publishing progress beside it.
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            flooder(1),
+            SourceId(0),
+            ChildSlot::default(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        // The only Sender moved into the worker, so this ends at
+        // Disconnected the moment the worker exits — every event this
+        // tick will ever post is in hand by then.
+        let mut events = Vec::new();
+        while let Ok(event) = rx.recv_timeout(Duration::from_secs(5)) {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], TickEvent::Completed(_)));
+    }
+
+    #[test]
+    fn a_completed_event_still_carries_everything_the_loop_reads() {
+        // TickOutcome is UNCHANGED: the enum WRAPPED it rather than
+        // reshaping it. Asserted over the worker's route, since that is
+        // the one whose type moved.
+        #[cfg(unix)]
+        let cmd = script("echo hi; exit 3");
+        #[cfg(windows)]
+        let cmd = script("echo hi & exit 3");
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            cmd,
+            SourceId(4),
+            ChildSlot::default(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        let TickEvent::Completed(outcome) =
+            rx.recv_timeout(Duration::from_secs(5)).expect("one event")
+        else {
+            panic!("a batch tick posts a completion");
+        };
+        assert_eq!(outcome.source, SourceId(4));
+        assert!(contains(&outcome.stdout.concat(), b"hi"));
+        assert_eq!(outcome.status.and_then(|status| status.code()), Some(3));
+    }
+
+    #[test]
+    fn run_tick_still_returns_a_bare_outcome() {
+        // The inline path is UNTOUCHED: `--once` and every existing
+        // caller read the outcome directly, and wrapping it for the
+        // channel is the caller's business, not this signature's. The
+        // type annotation IS the assertion.
+        let outcome: TickOutcome = run_tick(flooder(1), SourceId(0), Vec::new(), ample());
+        assert!(outcome.spawn_error.is_none());
     }
 }

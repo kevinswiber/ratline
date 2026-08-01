@@ -19,7 +19,7 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
-use crate::core::child::{ChildSlot, ShutdownGuard, TickOutcome, run_tick, spawn_tick};
+use crate::core::child::{ChildSlot, ShutdownGuard, TickEvent, run_tick, spawn_tick};
 use crate::core::duration::parse_interval;
 use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::measure::shift_chop;
@@ -259,7 +259,7 @@ pub(crate) fn run_registry(
         ..StyleSpec::default()
     };
 
-    let (tx, rx) = std::sync::mpsc::channel::<TickOutcome>();
+    let (tx, rx) = std::sync::mpsc::channel::<TickEvent>();
     // `--once` arms no triggers: the run ends at the first composition,
     // so a watcher could only fire into a loop that has already left.
     let armed = !session.once;
@@ -518,22 +518,28 @@ pub(crate) fn run_registry(
                 if inline {
                     let command =
                         source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
-                    let _ = runtime[id.0].tx.send(run_tick(
+                    let _ = runtime[id.0].tx.send(TickEvent::Completed(run_tick(
                         command,
                         id,
                         watched_union.clone(),
                         retention,
-                    ));
+                    )));
                 }
             }
         }
-        // 3. Drain EVERY queued completion, then compose ONCE. The
-        // drain terminates in at most N iterations: one source can
-        // have at most one tick in flight, so it can post at most one
-        // outcome per iteration. Only per-source state is touched in
-        // here; painting inside this loop would put an intermediate
+        // 3. Drain EVERY queued event, then compose ONCE. The drain
+        // terminates in at most N iterations: one source can have at
+        // most one tick in flight, so it can post at most one outcome
+        // per iteration. Only per-source state is touched in here;
+        // painting inside this loop would put an intermediate
         // composition on screen — the one thing the iteration order
         // exists to prevent.
+        //
+        // A long-lived source's progress wakes do not weaken that
+        // argument, and it is the OUTBOX that saves it, not the
+        // channel: a wake is sent only when a body fills an empty
+        // outbox, so a child flooding a slot nobody has read yet
+        // publishes silently and still contributes at most one event.
         let mut drained: Vec<SourceId> = Vec::new();
         let mut changed: Option<jiff::Timestamp> = None;
         let mut newest = jiff::Timestamp::UNIX_EPOCH;
@@ -542,7 +548,17 @@ pub(crate) fn run_registry(
         // its stdout is somebody's data — so this rides stderr, beside
         // where a spawn error already goes.
         let mut piped_dropped: Option<String> = None;
-        while let Ok(outcome) = rx.try_recv() {
+        while let Ok(event) = rx.try_recv() {
+            let outcome = match event {
+                TickEvent::Completed(outcome) => outcome,
+                // Nothing publishes progress yet, so this arm is
+                // unreachable today. It is where the compose gate opens
+                // once a long-lived worker starts offering bodies, and
+                // the split matters: a progress event must never reach
+                // the scheduler below, because a source that emitted has
+                // not finished.
+                TickEvent::Progress { .. } => continue,
+            };
             let id = outcome.source;
             let changed_now = match registry.composition() {
                 Composition::Plain { .. } => {
@@ -3122,7 +3138,7 @@ fn output_lines(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
 struct SourceRuntime {
     schedule: TickSchedule,
     slot: ChildSlot,
-    tx: std::sync::mpsc::Sender<TickOutcome>,
+    tx: std::sync::mpsc::Sender<TickEvent>,
     /// This source's rendered lines: without panes, the whole frame the
     /// shipped composer produced; with them, the child's own lines
     /// awaiting their box.
@@ -3927,7 +3943,7 @@ mod tests {
     /// The channel end is real but never used: these tests exercise
     /// the pure pieces, not the loop.
     fn runtime_with(hash: u64) -> SourceRuntime {
-        let (tx, _rx) = std::sync::mpsc::channel::<TickOutcome>();
+        let (tx, _rx) = std::sync::mpsc::channel::<TickEvent>();
         SourceRuntime {
             schedule: TickSchedule::new(Some(Duration::from_secs(2))),
             slot: ChildSlot::default(),
