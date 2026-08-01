@@ -297,6 +297,18 @@ fn visible(bytes: &[u8]) -> String {
     out
 }
 
+/// The first `n` visible characters, for "what did it actually print".
+fn head(bytes: &[u8], n: usize) -> String {
+    visible(bytes).chars().take(n).collect()
+}
+
+/// The last `n` visible characters — the current screen, near enough.
+fn tail(bytes: &[u8], n: usize) -> String {
+    let text = visible(bytes);
+    let skip = text.chars().count().saturating_sub(n);
+    text.chars().skip(skip).collect()
+}
+
 /// Bytes per whole second, so "output stopped at t=1.2" and "output kept
 /// flowing to the deadline" are told apart at a glance.
 fn per_second(chunks: &[(f64, usize)]) -> String {
@@ -1002,16 +1014,16 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
 
     // DIAGNOSTIC: where the suspicion test writes what it decided, and why.
     //
-    // OPT-IN, because an instrument that changes the thing it measures has to
-    // be switched off to be trusted. Tracing walks every arrival and formats a
-    // line inside the loop the wedge lives in — it costs no measurable time (a
-    // passing ubuntu run is 5.2 s either way) but it moves the interleaving,
-    // and interleaving is exactly what is under investigation. Unset, rat runs
-    // byte-for-byte as it does on main and this test is a control that can
-    // still say what the screen showed.
+    // ON by default, switchable off with `RAT_WEDGE_CONTROL`. It was opt-in
+    // for one round, on the theory that tracing perturbed the interleaving:
+    // three traced ubuntu runs came back 0/3 against a 3/4 prior. Six control
+    // runs then came back 2/6 — so the RATE is about a third, and at a third
+    // a 0/3 draw happens 30% of the time. The perturbation was never
+    // measured, only inferred from a sample too small to say anything, and
+    // main's 3/4 is the same coin landing high.
     let trace = dir.path().join("trigger-trace.log");
     let trace_arg = trace.display().to_string();
-    let traced = std::env::var_os("RAT_WEDGE_TRACE").is_some();
+    let traced = std::env::var_os("RAT_WEDGE_CONTROL").is_none();
     let envs: Vec<(&str, &str)> = if traced {
         vec![("RAT_TRIGGER_TRACE", trace_arg.as_str())]
     } else {
@@ -1025,7 +1037,13 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
     let started = std::time::Instant::now();
-    let painted = wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5));
+    // The first wait KEEPS its bytes now. A control run reported a first paint
+    // at 0.010 s where macOS takes 0.085 s, and the needle `cycle-b` also
+    // appears in the declaration this test wrote — so a startup error quoting
+    // the command would satisfy this wait without a frame ever existing. That
+    // has to be answerable from the log, not from argument.
+    let (painted, first_paint, _) =
+        wait_for_bytes_verbose(&session, &mut terminal, b"cycle-b", Duration::from_secs(5));
     let paint_at = started.elapsed().as_secs_f64();
     // DIAGNOSTIC BOUND, not a budget. The shipped wait is 40 s under nextest's
     // 20 s ceiling, so this test can only ever be KILLED — and a terminated
@@ -1034,7 +1052,7 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     // a slow first paint eats its own margin instead of the report's: every
     // second the wait does not need is a second the wait gets.
     const CEILING: Duration = Duration::from_secs(20);
-    const RESERVE: Duration = Duration::from_secs(3); // kill, dump, and slack
+    const RESERVE: Duration = Duration::from_secs(4); // probe, kill, dump, slack
     let (found, seen, chunks) = if painted {
         wait_for_bytes_verbose(
             &session,
@@ -1048,25 +1066,49 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     } else {
         (false, Vec::new(), Vec::new())
     };
-    session.write_bytes(b"q");
-    // A short kill deadline on purpose: the shipped 5 s is affordable only
-    // when the wait before it succeeded.
-    session.kill_if_alive(Duration::from_millis(300));
+    // POST-HOC PROBES. Everything from here runs only once the wait has
+    // already failed, so none of it can perturb the race it describes.
+    //
+    // Silence from a pty says nothing on its own: a loop that is turning and
+    // declining to accuse looks exactly like a process that died at startup,
+    // and those want opposite fixes. So ask whether it is still there, and if
+    // it is, RESIZE — the one nudge the shipped code answers unconditionally,
+    // by reflowing from retained output. An answer proves the loop still
+    // turns and shows the current chrome; silence narrows it to a hang.
+    let mut exited = false;
+    let mut nudge: Vec<u8> = Vec::new();
     if !found {
-        let text = visible(&seen);
-        let tail: String = text
-            .chars()
-            .rev()
-            .take(1200)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
+        exited = session.exited();
+        if !exited {
+            session.set_winsize(24, 100);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                let chunk = session.read_available(Duration::from_millis(50));
+                terminal.respond(&session, &chunk);
+                nudge.extend_from_slice(&chunk);
+            }
+        }
+    }
+    session.write_bytes(b"q");
+    // `exited` already reaped, and `kill_if_alive` cannot tell a reaped child
+    // from a live one — it would spin until the harness killed the test and
+    // took the report with it.
+    if !exited {
+        // A short kill deadline on purpose: the shipped 5 s is affordable
+        // only when the wait before it succeeded.
+        session.kill_if_alive(Duration::from_millis(300));
+    }
+    if !found {
         println!("=== WEDGE REPORT ===");
-        println!("first paint: {painted} at {paint_at:.3}s");
+        println!(
+            "first paint: {painted} at {paint_at:.3}s ({} bytes)",
+            first_paint.len()
+        );
         println!("bytes seen after first paint: {}", seen.len());
         println!("last chunk at: {:?}", chunks.last().map(|(at, _)| *at));
         println!("bytes per second: {}", per_second(&chunks));
+        println!("rat had already exited at the deadline: {exited}");
+        println!("bytes answering a resize: {}", nudge.len());
         println!(
             "notice text present at all: {}",
             contains(&seen, b"trigger loop suspected")
@@ -1075,7 +1117,12 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
             "badge present at all: {}",
             contains(&seen, "· looping".as_bytes())
         );
-        println!("--- visible tail ---\n{tail}");
+        println!(
+            "--- what the first paint was ---\n{}",
+            head(&first_paint, 900)
+        );
+        println!("--- tail of everything after it ---\n{}", tail(&seen, 900));
+        println!("--- what the resize painted ---\n{}", tail(&nudge, 900));
         println!("--- trigger trace ---");
         if traced {
             match std::fs::read_to_string(&trace) {
@@ -1083,7 +1130,7 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
                 Err(e) => println!("(the trace was asked for and is not there: {e})"),
             }
         } else {
-            println!("(control run: RAT_WEDGE_TRACE unset, rat ran uninstrumented)");
+            println!("(control run: RAT_WEDGE_CONTROL set, rat ran uninstrumented)");
         }
         println!("=== END WEDGE REPORT ===");
     }

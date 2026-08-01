@@ -187,6 +187,20 @@ impl PtySession {
         out
     }
 
+    /// Has the child exited yet, without killing it or waiting for it?
+    ///
+    /// DIAGNOSTIC: a session that produced nothing looks identical whether
+    /// its process wedged or died, and those two want opposite fixes.
+    ///
+    /// **REAPS when it answers true, and a caller that then calls
+    /// `kill_if_alive` will SPIN FOREVER** — that helper waits for a reap
+    /// that has already happened and cannot tell it from a live child.
+    /// `Drop` is safe either way; only `kill_if_alive` is not.
+    pub fn exited(&self) -> bool {
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(self.child_pid, &mut status, libc::WNOHANG) == self.child_pid }
+    }
+
     /// Kills and reaps the child if it hasn't exited by `deadline`.
     /// Returns whether it was still alive — never rely on a wedged child
     /// to notice its own hang.
