@@ -417,19 +417,27 @@ impl PathLedger {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TriggerKey(pub String);
 
-/// One reader arrival. Its covering brackets are identified when the bytes
-/// arrive; their WIDTHS are resolved later.
+/// One reader arrival: the interval the write could have happened in, and
+/// nothing else. Nothing is resolved at record time.
 ///
 /// Storing widths here would be wrong: an arrival is commonly recorded while
 /// its covering child is still running, when the final width does not exist
 /// and elapsed-so-far would make a long-running child look artificially
 /// tight — the mis-credit the median-width rule exists to prevent.
+///
+/// **Coverage is not resolved here either**, and that is the change this
+/// type carries. It used to record which brackets spanned a single instant,
+/// which committed the log to an answer at the moment the bytes landed —
+/// before the writing child had even exited, and against an instant that was
+/// never the write's. `classify` decides it on read instead, when every
+/// bracket that could matter has had its chance to close.
 pub struct Arrival {
     pub trigger: TriggerKey,
-    pub at: std::time::Instant,
-    /// The brackets covering `at`, by id. EMPTY means nothing was in flight,
-    /// which is knowable immediately and is all the veto needs.
-    pub containing: Vec<BracketId>,
+    /// The window the write happened in. Stored verbatim and never collapsed
+    /// to a point: which brackets cover it is `classify`'s job, decided on
+    /// READ rather than on record, because the answer depends on brackets
+    /// that may not have closed when the bytes arrived.
+    pub observation: Observation,
 }
 
 /// What a reader can honestly say about when some bytes were written.
@@ -441,7 +449,6 @@ pub struct Arrival {
 /// any lock it waited on — so no code may reconstruct a single write instant
 /// from this.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Observation {
     /// Last instant this reader proved the descriptor empty, sampled BEFORE
     /// the probe that proved it. `None` when it has none yet.
@@ -471,7 +478,6 @@ pub struct Observation {
 /// writing past its parent's close is `Disjoint` and vetoes the pane. The
 /// second is the destructive one. Both are pinned by tests.
 #[derive(Clone, PartialEq, Eq, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum TemporalCoverage {
     /// The interval overlaps no recorded bracket. The only value that vetoes.
     Disjoint,
@@ -482,6 +488,17 @@ pub enum TemporalCoverage {
     Covered(Vec<(SourceId, Option<std::time::Duration>)>),
     /// Partially overlaps bracketed and idle time, or has no lower bound.
     Ambiguous,
+}
+
+impl TemporalCoverage {
+    /// Did the interval overlap no bracket at all?
+    ///
+    /// Exists because `!= Disjoint` at a call site reads like `== Covered`
+    /// and is not — the third value falls on the other side of that test,
+    /// and it is the value the shipped defect got wrong.
+    pub fn is_disjoint(&self) -> bool {
+        matches!(self, TemporalCoverage::Disjoint)
+    }
 }
 
 /// Every windowed quantity the suspicion test reads, in one place, all of it
@@ -618,7 +635,6 @@ impl WindowLog {
     /// Both remain inferences the CALLER makes. This reports only where the
     /// interval sits; see `TemporalCoverage` for what that does and does not
     /// establish.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn classify(&self, observation: &Observation) -> TemporalCoverage {
         let Some(from) = observation.empty_since else {
             return TemporalCoverage::Ambiguous;
@@ -698,17 +714,10 @@ impl WindowLog {
     /// compiles this and never calls it. Same precedent as the rest of the
     /// unix-only live surface.
     #[cfg_attr(windows, allow(dead_code))]
-    pub fn observe_arrival(&mut self, trigger: TriggerKey, at: std::time::Instant) {
-        let containing = self
-            .brackets
-            .iter()
-            .filter(|b| b.spans(at))
-            .map(|b| b.id)
-            .collect();
+    pub fn observe_arrival(&mut self, trigger: TriggerKey, observation: Observation) {
         self.arrivals.push(Arrival {
             trigger,
-            at,
-            containing,
+            observation,
         });
     }
 
@@ -835,21 +844,6 @@ impl WindowLog {
             .collect()
     }
 
-    /// Resolve an arrival's covering brackets to final widths. `None` while
-    /// any of them is still open: such an arrival is deferred from the credit
-    /// stage — it resolves once the bracket closes — while still counting for
-    /// the veto, which needs only whether `containing` was empty.
-    pub fn widths(&self, arrival: &Arrival) -> Option<Vec<(SourceId, std::time::Duration)>> {
-        arrival
-            .containing
-            .iter()
-            .map(|id| {
-                let bracket = self.brackets.iter().find(|b| b.id == *id)?;
-                Some((bracket.source, bracket.width()?))
-            })
-            .collect()
-    }
-
     /// DIAGNOSTIC ONLY: how far an arrival that NO bracket contained sat from
     /// the nearest one, in milliseconds. **Positive means it landed after that
     /// bracket closed; negative means it landed before that bracket opened.**
@@ -919,7 +913,7 @@ impl WindowLog {
             .arrivals
             .iter()
             .filter(|a| a.trigger == *trigger)
-            .map(|a| a.at)
+            .map(|a| a.observation.observed_at)
             .collect();
         if ats.len() < 2 {
             return None;
@@ -951,14 +945,29 @@ impl WindowLog {
         };
         self.respawns.retain(|(_, at)| *at >= cutoff);
         self.overflows.retain(|at| *at >= cutoff);
-        self.arrivals.retain(|a| a.at >= cutoff);
-        let referenced: std::collections::HashSet<BracketId> = self
+        self.arrivals
+            .retain(|a| a.observation.observed_at >= cutoff);
+        // Retention by INTERVAL REACH, not by a recorded bracket list —
+        // there is no such list any more, because coverage is resolved on
+        // read. A bracket that overlaps a surviving observation is still
+        // needed to classify it, and dropping it would silently turn a
+        // classifiable observation into an ambiguous one: evidence lost to
+        // bookkeeping rather than to time.
+        //
+        // The oldest surviving lower bound is the furthest back any live
+        // interval reaches. An observation with no lower bound reaches only
+        // to its own read, which is already inside the window.
+        let reach = self
             .arrivals
             .iter()
-            .flat_map(|a| a.containing.iter().copied())
-            .collect();
+            .map(|a| {
+                a.observation
+                    .empty_since
+                    .unwrap_or(a.observation.observed_at)
+            })
+            .min();
         self.brackets
-            .retain(|b| b.end_or(now) >= cutoff || referenced.contains(&b.id));
+            .retain(|b| b.end_or(now) >= cutoff || reach.is_some_and(|from| b.end_or(now) >= from));
     }
 
     fn cutoff(&self, now: std::time::Instant) -> Option<std::time::Instant> {
@@ -1191,20 +1200,27 @@ impl LoopSuspicion {
             for key in pane.readers {
                 for arrival in log.arrivals(key) {
                     arrivals += 1;
-                    // The two ways a reader route withholds evidence, and they
-                    // mean opposite things: EMPTY containing is the condition-2
-                    // veto (nothing was in flight, so the byte came from
-                    // outside), while an unresolvable width is only DEFERRED
-                    // until the covering child exits.
-                    deferred += usize::from(log.widths(arrival).is_none());
-                    if !arrival.containing.is_empty() {
-                        continue;
+                    // The three ways a reader route can answer, and they mean
+                    // different things: DISJOINT is the condition-2 veto
+                    // (nothing was in flight at any instant the write could
+                    // have happened), AMBIGUOUS withholds entirely, and a
+                    // covered observation whose contributor is still running
+                    // is only DEFERRED until that child exits.
+                    match log.classify(&arrival.observation) {
+                        TemporalCoverage::Covered(contributors) => {
+                            deferred += usize::from(contributors.iter().any(|(_, w)| w.is_none()));
+                        }
+                        TemporalCoverage::Ambiguous => {}
+                        TemporalCoverage::Disjoint => {
+                            uncontained += 1;
+                            gaps.push(
+                                match log.nearest_bracket_gap(arrival.observation.observed_at) {
+                                    Some((source, ms)) => format!("s{}{ms:+.1}", source.0),
+                                    None => "nobrackets".to_string(),
+                                },
+                            );
+                        }
                     }
-                    uncontained += 1;
-                    gaps.push(match log.nearest_bracket_gap(arrival.at) {
-                        Some((source, ms)) => format!("s{}{ms:+.1}", source.0),
-                        None => "nobrackets".to_string(),
-                    });
                 }
             }
             let _ = write!(
@@ -1236,10 +1252,21 @@ impl LoopSuspicion {
         pane: &PaneWindow<'_>,
     ) -> bool {
         let files_closed = pane.watched.iter().all(|p| ledger.exogenous(p) == 0);
+        // THIS is where time becomes authorship: `classify` reports only that
+        // an interval overlapped no bracket, and the exogenous veto is the
+        // inference drawn from it. Draw it in the weak direction — "no
+        // observation is PROVEN disjoint", never "every observation is proven
+        // covered". Ambiguity is not evidence of an outside writer; treating
+        // it as such is the defect this replaces, and it silenced the
+        // detector for a whole window on a 0.2 ms miss.
+        //
+        // The inference is still not sound: a descendant writing past its
+        // parent's close reads `Disjoint` and vetoes a real cycle. That is
+        // knowingly out of scope — no timing evidence can distinguish it.
         let readers_closed = pane.readers.iter().all(|key| {
             log.arrivals(key)
                 .iter()
-                .all(|arrival| !arrival.containing.is_empty())
+                .all(|arrival| !log.classify(&arrival.observation).is_disjoint())
         });
         // A pane watching nothing cannot be closed: there is no evidence
         // either way, and silence is not a positive.
@@ -1254,14 +1281,17 @@ impl LoopSuspicion {
     fn arrival_changes(log: &WindowLog, key: &TriggerKey) -> Vec<Change> {
         log.arrivals(key)
             .iter()
-            .filter_map(|arrival| {
-                Some(Change {
-                    containing: log
-                        .widths(arrival)?
-                        .into_iter()
-                        .map(|(source, width)| (source, Some(width)))
-                        .collect(),
-                })
+            .filter_map(|arrival| match log.classify(&arrival.observation) {
+                // The other half of the inference: coverage in time, read as
+                // the endogenous credit. The contributors ARE
+                // `Change::containing`'s shape, so there is no second width
+                // resolution that could disagree with the first — which is
+                // what lets a UNION of brackets credit a source no single
+                // bracket could have supplied a width for.
+                TemporalCoverage::Covered(contributors) => Some(Change {
+                    containing: contributors,
+                }),
+                TemporalCoverage::Disjoint | TemporalCoverage::Ambiguous => None,
             })
             .collect()
     }
@@ -2220,40 +2250,52 @@ mod tests {
         // Emptiness needs no width, so the veto never waits on one.
         let mut log = WindowLog::new(W);
         let t0 = Instant::now();
-        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(
+            TriggerKey("fifo:/tmp/a".into()),
+            Observation {
+                empty_since: Some(t0),
+                observed_at: t0 + Duration::from_millis(1),
+            },
+        );
         let key = TriggerKey("fifo:/tmp/a".into());
         let arrivals = log.arrivals(&key);
         assert_eq!(arrivals.len(), 1);
-        assert!(arrivals[0].containing.is_empty());
+        assert!(log.classify(&arrivals[0].observation).is_disjoint());
     }
 
     #[test]
-    fn an_arrival_captures_bracket_identity_at_record_time_and_widths_later() {
-        // Identity must be captured immediately, or eviction could remove the
-        // brackets that gave the arrival meaning. Width must NOT be: an
-        // arrival recorded during an open child would freeze elapsed-so-far
-        // and credit a long child as artificially tight.
+    fn an_arrival_resolves_its_coverage_on_read_and_its_widths_with_it() {
+        // Coverage used to be captured at record time, which committed the
+        // log to an answer before the writing child had even exited. It is
+        // resolved on READ now — and the width arrives with it, rather than
+        // by a second resolution that could disagree.
         let mut log = WindowLog::new(W);
         let t0 = Instant::now();
         let id = log.open_bracket(SourceId(1), t0, Vec::new());
         log.observe_arrival(
             TriggerKey("fifo:/tmp/a".into()),
-            t0 + Duration::from_millis(3),
+            Observation {
+                empty_since: Some(t0 + Duration::from_millis(1)),
+                observed_at: t0 + Duration::from_millis(3),
+            },
         );
 
         let key = TriggerKey("fifo:/tmp/a".into());
         {
             let arrivals = log.arrivals(&key);
-            assert_eq!(arrivals[0].containing, vec![id], "identity is captured now");
-            assert!(log.widths(arrivals[0]).is_none(), "width is not final yet");
+            assert_eq!(
+                log.classify(&arrivals[0].observation),
+                TemporalCoverage::Covered(vec![(SourceId(1), None)]),
+                "covered by the open bracket, with no width claimed yet"
+            );
         }
 
         log.close_bracket(id, t0 + Duration::from_millis(40), Vec::new());
         let arrivals = log.arrivals(&key);
         assert_eq!(
-            log.widths(arrivals[0]),
-            Some(vec![(SourceId(1), Duration::from_millis(40))]),
-            "the FINAL width, not elapsed-so-far"
+            log.classify(&arrivals[0].observation),
+            TemporalCoverage::Covered(vec![(SourceId(1), Some(Duration::from_millis(40)))]),
+            "the FINAL width, not the 3ms that had elapsed when it was read"
         );
     }
 
@@ -2263,9 +2305,9 @@ mod tests {
         // itself to on the reader route.
         let mut log = WindowLog::new(W);
         let t0 = Instant::now();
-        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
-        log.observe_arrival(TriggerKey("fifo:/tmp/b".into()), t0);
-        log.observe_arrival(TriggerKey("fifo:/tmp/b".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), at(t0));
+        log.observe_arrival(TriggerKey("fifo:/tmp/b".into()), at(t0));
+        log.observe_arrival(TriggerKey("fifo:/tmp/b".into()), at(t0));
 
         assert_eq!(log.arrivals(&TriggerKey("fifo:/tmp/a".into())).len(), 1);
         assert_eq!(log.arrivals(&TriggerKey("fifo:/tmp/b".into())).len(), 2);
@@ -2292,7 +2334,7 @@ mod tests {
         let id = log.open_bracket(SourceId(0), t0, Vec::new());
         log.close_bracket(id, t0 + Duration::from_millis(5), Vec::new());
         log.record_respawn(SourceId(0), t0);
-        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
+        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), at(t0));
         log.record_overflow(t0);
 
         log.evict(t0 + secs(30));
@@ -2360,9 +2402,12 @@ mod tests {
         let t0 = Instant::now();
         let id = log.open_bracket(SourceId(0), t0, Vec::new());
         log.close_bracket(id, t0 + Duration::from_millis(5), Vec::new());
-        // The arrival is recent; its bracket is old.
-        log.observe_arrival(TriggerKey("fifo:/tmp/a".into()), t0);
-        log.arrivals(&TriggerKey("fifo:/tmp/a".into()));
+        // The arrival is recent; its bracket is old. Strictly INSIDE the
+        // bracket, not on its opening edge — coverage excludes endpoints.
+        log.observe_arrival(
+            TriggerKey("fifo:/tmp/a".into()),
+            at(t0 + Duration::from_millis(1)),
+        );
 
         log.evict(t0 + Duration::from_millis(500));
 
@@ -2370,9 +2415,9 @@ mod tests {
         let arrivals = log.arrivals(&key);
         assert_eq!(arrivals.len(), 1);
         assert_eq!(
-            log.widths(arrivals[0]),
-            Some(vec![(SourceId(0), Duration::from_millis(5))]),
-            "the referenced bracket must have been retained"
+            log.classify(&arrivals[0].observation),
+            TemporalCoverage::Covered(vec![(SourceId(0), Some(Duration::from_millis(5)))]),
+            "the reached bracket must have been retained"
         );
     }
 
@@ -2692,7 +2737,7 @@ mod tests {
         let t0 = Instant::now();
         let key = TriggerKey("fifo:/tmp/a".into());
         log.open_bracket(SourceId(0), t0, Vec::new()); // never closed
-        log.observe_arrival(key.clone(), t0 + ms(3));
+        log.observe_arrival(key.clone(), at(t0 + ms(3)));
 
         let changes = LoopSuspicion::arrival_changes(&log, &key);
         assert!(
@@ -2818,6 +2863,150 @@ mod tests {
             log.classify(&obs(t0 + ms(1), t0 + ms(50))),
             TemporalCoverage::Covered(vec![(SourceId(4), None)])
         );
+    }
+
+    // ── The flip (task 4.1) ─────────────────────────────────────────────
+
+    /// An observation that pins the write to a single instant — a
+    /// zero-width interval — for tests that are about something other than
+    /// the interval.
+    ///
+    /// **Not identical to the instant the log used to store**, and the
+    /// difference is at the endpoints: the old `spans` was inclusive
+    /// (`opened <= at`), while `classify`'s filter is strict on both sides,
+    /// because touching an endpoint is not coverage. So `at(t)` against a
+    /// bracket that opens exactly at `t` reads `Disjoint`, where the old
+    /// code read it as contained. Put the instant strictly inside.
+    fn at(t: Instant) -> Observation {
+        Observation {
+            empty_since: Some(t),
+            observed_at: t,
+        }
+    }
+
+    fn us(n: u64) -> Duration {
+        Duration::from_micros(n)
+    }
+
+    fn empty_ledger() -> PathLedger {
+        PathLedger::new(Vec::new())
+    }
+
+    #[test]
+    fn an_observation_that_merely_straddles_a_close_does_not_veto() {
+        // THE SHIPPED DEFECT. An arrival 0.2ms after the writing child's
+        // bracket closed wedges the fifo cycle test on Linux about one run
+        // in two. It proves nothing, and must not veto.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(3)),
+                observed_at: t0 + ms(5) + us(200),
+            },
+        );
+
+        let pane = PaneWindow {
+            source: SourceId(0),
+            trigger_respawns: 100,
+            watched: &[],
+            readers: std::slice::from_ref(&key),
+        };
+        assert!(
+            LoopSuspicion::default().closed_everywhere(&empty_ledger(), &log, &pane),
+            "an ambiguous observation must not read as an outside writer"
+        );
+    }
+
+    #[test]
+    fn an_observation_wholly_outside_every_bracket_still_vetoes() {
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(6)),
+                observed_at: t0 + ms(9),
+            },
+        );
+
+        let pane = PaneWindow {
+            source: SourceId(0),
+            trigger_respawns: 100,
+            watched: &[],
+            readers: std::slice::from_ref(&key),
+        };
+        assert!(
+            !LoopSuspicion::default().closed_everywhere(&empty_ledger(), &log, &pane),
+            "a definitely-exogenous observation must still veto"
+        );
+    }
+
+    #[test]
+    fn only_a_covered_interval_produces_an_edge() {
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(10), Vec::new());
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(2)),
+                observed_at: t0 + ms(8),
+            },
+        );
+        assert_eq!(
+            credit(&LoopSuspicion::arrival_changes(&log, &key)),
+            vec![SourceId(1)]
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_interval_contributes_no_edge_at_all() {
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(3)),
+                observed_at: t0 + ms(7),
+            },
+        );
+        assert!(LoopSuspicion::arrival_changes(&log, &key).is_empty());
+    }
+
+    #[test]
+    fn eviction_retains_a_bracket_a_live_interval_still_reaches() {
+        // `containing` is gone, so retention can no longer key off it. A
+        // bracket overlapping a surviving interval is still needed to
+        // classify it, and dropping it would silently turn a classifiable
+        // observation into an ambiguous one.
+        let mut log = WindowLog::new(secs(10));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        log.observe_arrival(
+            TriggerKey("fifo:/tmp/a".into()),
+            Observation {
+                empty_since: Some(t0 + ms(1)),
+                observed_at: t0 + ms(4),
+            },
+        );
+
+        log.evict(t0 + ms(500));
+
+        assert_eq!(log.bracket_count(), 1);
     }
 
     // The boundary of the claim. Both of these assert a MISCLASSIFICATION as

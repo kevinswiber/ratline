@@ -1628,11 +1628,11 @@ fn drain_reader_arrivals(
     for slot in slots {
         let key = reader_key(&slot.spec);
         for observation in slot.reader.take_arrivals() {
-            // DIAGNOSTIC ONLY (task 2.3), and a no-op unless the trace is on:
-            // the log stores a point until 4.1, so this is the only place the
-            // interval can be measured at all.
+            // DIAGNOSTIC ONLY, and a no-op unless the trace is on. It stays
+            // beside the store rather than reading back out of the log so
+            // the measurement sees exactly what the loop handed over.
             log.note_observation_for_trace(observation);
-            log.observe_arrival(key.clone(), observation.observed_at);
+            log.observe_arrival(key.clone(), observation);
         }
         // Read every iteration, and it reports-and-clears: one lost arrival
         // makes THIS window abstain, not every window after it.
@@ -4914,7 +4914,7 @@ mod tests {
 
         #[test]
         fn an_arrival_is_drained_and_resolved_against_the_bracket_log() {
-            // The whole seam. The reader supplied a timestamp; this is
+            // The whole seam. The reader supplied an interval; this is
             // where it gains meaning, and WindowLog decides what it
             // means — not the drain.
             let dir = tempfile::tempdir().unwrap();
@@ -4923,12 +4923,20 @@ mod tests {
             let key =
                 TriggerKey("fifo:".to_string() + &dir.path().join("a.fifo").display().to_string());
 
+            // Wait out one reader slice first, so a proof of emptiness
+            // exists. A reader's very first arrival has no lower bound —
+            // it has never yet seen its descriptor be not-readable — and
+            // an unbounded interval proves nothing in either direction.
+            // Vetoing on it is precisely the overclaim this plan removes,
+            // so the exogenous case now has a precondition it did not have
+            // when an arrival was a bare instant.
+            std::thread::sleep(Duration::from_millis(120));
             poke(&s, &mut w);
             drain_reader_arrivals(std::slice::from_ref(&s), &mut log, Instant::now());
             let idle = log.arrivals(&key);
             assert_eq!(idle.len(), 1, "the arrival never reached the log");
             assert!(
-                idle[0].containing.is_empty(),
+                log.classify(&idle[0].observation).is_disjoint(),
                 "nothing was in flight, so this is EXOGENOUS"
             );
 
@@ -4939,8 +4947,8 @@ mod tests {
             let all = log.arrivals(&key);
             assert_eq!(all.len(), 2);
             assert!(
-                !all[1].containing.is_empty(),
-                "a bracket covered it, so this is ENDOGENOUS"
+                !log.classify(&all[1].observation).is_disjoint(),
+                "a bracket was in flight, so this is not an outside writer"
             );
         }
 
