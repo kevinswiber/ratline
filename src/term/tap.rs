@@ -1493,6 +1493,26 @@ mod trigger_reader_tests {
     // interval: bytes appeared between the last moment it PROVED the
     // descriptor empty and the moment its read returned.
 
+    /// Wait until the reader has actually PROVED its descriptor empty at
+    /// least once.
+    ///
+    /// Sleeping a couple of read slices and assuming the reader was scheduled
+    /// is a wall-clock premise, and a loaded CI runner does not honour it —
+    /// `an_observation_is_bounded_below_by_a_proof_of_emptiness` failed on
+    /// macOS CI 3 runs in 5 for exactly that reason while passing everywhere
+    /// else. This waits for the fact itself, which is a guarantee by
+    /// construction rather than by timing.
+    fn wait_for_empty_proof(reader: &TriggerReader) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if reader.empty_since_for_test().is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the reader never proved its descriptor empty");
+    }
+
     /// Drain until `n` observations have been recorded, or fail. The reader
     /// is a thread, so every assertion about what it recorded needs a
     /// settle.
@@ -1528,9 +1548,9 @@ mod trigger_reader_tests {
     fn an_observation_is_bounded_below_by_a_proof_of_emptiness() {
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
-        // Let the reader select at least once with nothing to read: that is
-        // a proof of emptiness, and it must land BEFORE the write.
-        std::thread::sleep(READ_SLICE * 2);
+        // The reader must have proved emptiness BEFORE the write. Wait for
+        // that proof rather than sleeping and assuming it happened.
+        wait_for_empty_proof(&reader);
         let before = std::time::Instant::now();
         writer.write_all(b"x").unwrap();
 
@@ -1576,7 +1596,7 @@ mod trigger_reader_tests {
         // is known.
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
-        std::thread::sleep(READ_SLICE * 2);
+        wait_for_empty_proof(&reader);
         for _ in 0..3 {
             writer.write_all(&[b'x'; 300]).unwrap(); // > 256, so several reads
         }
@@ -1667,7 +1687,7 @@ mod trigger_reader_tests {
         // must never happen is a lower bound later than the write.
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
-        std::thread::sleep(READ_SLICE * 2);
+        wait_for_empty_proof(&reader);
         let at_write = std::time::Instant::now();
         writer.write_all(b"x").unwrap();
         reader.fence();
@@ -1717,7 +1737,9 @@ mod trigger_reader_tests {
         // false everywhere and still pass its own test suite.
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
-        std::thread::sleep(Duration::from_millis(120));
+        // Waited, not slept: this needs the reader up and idle in its select,
+        // and a sleep only assumes that.
+        wait_for_empty_proof(&reader);
         writer.write_all(&[b'x'; 700]).unwrap();
         wait_for_observations(&reader, 3);
 
