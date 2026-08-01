@@ -3,6 +3,8 @@
 //! retains an unrecognized run indefinitely: a complete escape sequence it
 //! does not understand is dropped, and an accumulating one is bounded.
 
+#[cfg(unix)]
+use crate::core::trigger::Observation;
 use crate::term::theme_notify::{OscColorKind, parse_color_scheme_report, parse_osc_color_reply};
 use crate::theme::Appearance;
 use crate::ui::key::Key;
@@ -598,8 +600,14 @@ pub struct TriggerReader {
     fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    arrivals: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>>,
+    arrivals: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<Observation>>>,
     overflowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// High-water mark of reads taken inside one `select`. Maintained
+    /// always — one store per wake is not worth a `cfg` seam through the
+    /// loop's signature — and read only by the tests that pin `drainable`'s
+    /// two routes apart, hence the staged allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    max_reads_per_select: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -643,6 +651,16 @@ impl TriggerReader {
 
         // The fds the loop selects and reads; files are moved into the
         // thread so their descriptors outlive the setup.
+        //
+        // `drainable` is I-83's narrow half. Proving emptiness with a
+        // zero-timeout `select` costs no read and is safe on every
+        // descriptor; draining REPEATEDLY is not. A `fifo:` source we
+        // opened `O_NONBLOCK` ourselves can only ever return `EAGAIN`, but a
+        // `fd:` source keeps the caller's blocking mode and may be shared,
+        // so another consumer can take the readable bytes between the probe
+        // and the `read` and this thread blocks — the one place I-80 must
+        // never be violated.
+        let drainable = matches!(spec, crate::core::trigger::TriggerSpec::Fifo(_));
         let (fd, keep_alive) = match spec {
             TriggerSpec::Fifo(path) => {
                 let read_end = std::fs::OpenOptions::new()
@@ -697,22 +715,26 @@ impl TriggerReader {
             std::collections::VecDeque::with_capacity(ARRIVAL_CAP),
         ));
         let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let max_reads_per_select = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread_fired = std::sync::Arc::clone(&fired);
         let thread_ended = std::sync::Arc::clone(&ended);
         let thread_shutdown = std::sync::Arc::clone(&shutdown);
         let thread_arrivals = std::sync::Arc::clone(&arrivals);
         let thread_overflowed = std::sync::Arc::clone(&overflowed);
+        let thread_max_reads = std::sync::Arc::clone(&max_reads_per_select);
         let reader = std::thread::Builder::new()
             .name("rat-trigger".to_string())
             .spawn(move || {
                 let _keep_alive = keep_alive;
                 trigger_read_loop(
                     fd,
+                    drainable,
                     &thread_fired,
                     &thread_ended,
                     &thread_shutdown,
                     &thread_arrivals,
                     &thread_overflowed,
+                    &thread_max_reads,
                     wake,
                 );
             })?;
@@ -722,6 +744,7 @@ impl TriggerReader {
             shutdown,
             arrivals,
             overflowed,
+            max_reads_per_select,
             reader: Some(reader),
         })
     }
@@ -743,12 +766,55 @@ impl TriggerReader {
     /// distinguish. The two must never be folded into one call: a drain
     /// that consumed `fired` would lose a fire and the pane would
     /// silently stop refreshing.
+    /// The reader now records an interval, but this still hands out the
+    /// upper bound alone so the loop is untouched by this task. Task 2.2
+    /// widens the signature to `Vec<Observation>` and adapts the caller;
+    /// until then the lower bound is recorded and not yet read, which is
+    /// what makes this change behaviour-neutral.
     pub fn take_arrivals(&self) -> Vec<std::time::Instant> {
+        self.take_observations()
+            .into_iter()
+            .map(|o| o.observed_at)
+            .collect()
+    }
+
+    fn take_observations(&self) -> Vec<Observation> {
         let mut queue = self
             .arrivals
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.drain(..).collect()
+    }
+
+    /// The whole interval, for the tests that pin what the reader records.
+    /// Task 2.2 removes this: once `take_arrivals` itself yields
+    /// `Observation`s there is nothing left for it to reach past.
+    #[cfg(test)]
+    pub fn take_arrivals_for_test(&self) -> Vec<Observation> {
+        self.take_observations()
+    }
+
+    /// Hold the arrivals queue, so a test can prove `observed_at` is stamped
+    /// OUTSIDE the lock: a timestamp taken inside it would be dragged
+    /// forward by this contention, and the test measures exactly that.
+    #[cfg(test)]
+    pub fn lock_arrivals_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<Observation>> {
+        self.arrivals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The most reads the loop has ever taken inside one `select`. The
+    /// property is about iteration structure, which no externally observable
+    /// timing can pin down — a fast machine can complete three whole
+    /// select/read cycles before a test looks, so counting observations
+    /// cannot tell the two routes apart.
+    #[cfg(test)]
+    pub fn max_reads_per_select_for_test(&self) -> usize {
+        self.max_reads_per_select
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Whether arrivals were dropped since the last call — reports and
@@ -800,18 +866,71 @@ impl Drop for TriggerReader {
 /// right instant.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
+/// Is there anything to read right now?
+///
+/// A zero-timeout `select` proves emptiness WITHOUT a read, which is what
+/// makes it safe for a descriptor whose blocking mode we do not control — a
+/// speculative `read` on a shared blocking `fd:` could wedge this thread.
+/// Regular files, the one kind `select` would always call ready, are
+/// rejected at open.
+#[cfg(unix)]
+fn readable_now(fd: i32) -> bool {
+    let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
+    }
+    let mut zero = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::select(
+            fd + 1,
+            &mut set,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut zero,
+        ) > 0
+    }
+}
+
+/// What one `read` in the drain loop told us to do next.
+///
+/// `cfg(unix)` like everything else down here: a non-cfg item this far into
+/// the file lands *after* an earlier `#[cfg(test)] mod`, and on the Windows
+/// leg — where the unix items vanish and it would not — clippy's
+/// `items_after_test_module` fires. It compiles clean on macOS either way,
+/// so only the cross-compile leg catches it.
+#[cfg(unix)]
+enum ReadStep {
+    /// Bytes arrived; record an observation.
+    Got,
+    /// Nothing more to take right now — leave the drain, keep the thread.
+    Idle,
+    /// The source is finished or broken; the thread is done.
+    Over,
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn trigger_read_loop(
     fd: i32,
+    drainable: bool,
     fired: &std::sync::atomic::AtomicBool,
     ended: &std::sync::atomic::AtomicBool,
     shutdown: &std::sync::atomic::AtomicBool,
-    arrivals: &std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    arrivals: &std::sync::Mutex<std::collections::VecDeque<Observation>>,
     overflowed: &std::sync::atomic::AtomicBool,
+    max_reads_per_select: &std::sync::atomic::AtomicUsize,
     wake: Option<std::sync::mpsc::Sender<TapChunk>>,
 ) {
     use std::sync::atomic::Ordering;
 
     let mut buf = [0u8; 256];
+    // The last instant this reader PROVED the descriptor empty. `None` until
+    // it has proved it once; an observation carrying `None` claims nothing.
+    let mut empty_since: Option<std::time::Instant> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -825,6 +944,13 @@ fn trigger_read_loop(
             tv_sec: 0,
             tv_usec: READ_SLICE.subsec_micros() as libc::suseconds_t,
         };
+        // Sampled BEFORE the probe, never after. Bytes can become readable
+        // between the kernel's check inside `select` and a `now()` taken on
+        // return, so a bound stamped afterwards could postdate the very
+        // write it claims to precede — and the interval would then exclude
+        // the moment it exists to contain. Erring early only widens the
+        // interval, which is always safe.
+        let candidate = std::time::Instant::now();
         let ready = unsafe {
             libc::select(
                 fd + 1,
@@ -843,39 +969,72 @@ fn trigger_read_loop(
             return;
         }
         if ready == 0 {
+            // Nothing became readable for a whole slice: a proof of
+            // emptiness, free, and the only one an unfenced reader gets.
+            empty_since = Some(candidate);
             continue;
         }
-        let read = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
-        if read == 0 {
-            ended.store(true, Ordering::SeqCst);
-            return; // EOF: every write end is gone (fd: sources only).
-        }
-        if read < 0 {
-            let err = std::io::Error::last_os_error();
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-            ) {
-                continue;
+        let mut reads = 0usize;
+        loop {
+            let read =
+                unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+            let step = if read > 0 {
+                ReadStep::Got
+            } else if read == 0 {
+                ReadStep::Over // EOF: every write end is gone (fd: sources only).
+            } else {
+                let err = std::io::Error::last_os_error();
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) {
+                    ReadStep::Idle
+                } else {
+                    ReadStep::Over
+                }
+            };
+            match step {
+                ReadStep::Over => {
+                    ended.store(true, Ordering::SeqCst);
+                    return;
+                }
+                ReadStep::Idle => break,
+                ReadStep::Got => {}
             }
-            ended.store(true, Ordering::SeqCst);
-            return;
-        }
-        // Recorded beside the flag store, never derived from it: the
-        // flag is a rising edge the gate consumes, so an arrival keyed
-        // off it would be lost whenever the loop had not drained yet —
-        // which is exactly the burst case the window most needs.
-        {
-            let mut queue = arrivals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if queue.len() == ARRIVAL_CAP {
-                queue.pop_front();
-                overflowed.store(true, Ordering::SeqCst);
+            reads += 1;
+            // Stamped HERE: after the read, before any lock. Contention on
+            // the queue must not be able to drag this forward — that was the
+            // largest of the three ways the old instant drifted.
+            let observed_at = std::time::Instant::now();
+            // Recorded beside the flag store, never derived from it: the
+            // flag is a rising edge the gate consumes, so an arrival keyed
+            // off it would be lost whenever the loop had not drained yet —
+            // which is exactly the burst case the window most needs.
+            {
+                let mut queue = arrivals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if queue.len() == ARRIVAL_CAP {
+                    queue.pop_front();
+                    overflowed.store(true, Ordering::SeqCst);
+                }
+                queue.push_back(Observation {
+                    empty_since,
+                    observed_at,
+                });
             }
-            queue.push_back(std::time::Instant::now());
+            if !drainable {
+                break; // one read per select for a descriptor we do not own
+            }
+            let candidate = std::time::Instant::now();
+            if !readable_now(fd) {
+                empty_since = Some(candidate);
+                break;
+            }
         }
-        if !fired.swap(true, Ordering::SeqCst)
+        max_reads_per_select.fetch_max(reads, Ordering::SeqCst);
+        if reads > 0
+            && !fired.swap(true, Ordering::SeqCst)
             && let Some(wake) = wake.as_ref()
         {
             let _ = wake.send(TapChunk::Trigger);
@@ -1119,6 +1278,151 @@ mod trigger_reader_tests {
         assert!(
             wait_until(|| reader.ended().load(Ordering::SeqCst)),
             "EOF never set ended"
+        );
+    }
+
+    // ── The empty frontier (task 2.1) ───────────────────────────────────
+    //
+    // The reader stops reporting an instant and starts reporting an
+    // interval: bytes appeared between the last moment it PROVED the
+    // descriptor empty and the moment its read returned.
+
+    /// Drain until `n` observations have been recorded, or fail. The reader
+    /// is a thread, so every assertion about what it recorded needs a
+    /// settle.
+    fn wait_for_observations(reader: &TriggerReader, n: usize) -> Vec<Observation> {
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            out.extend(reader.take_arrivals_for_test());
+            if out.len() >= n {
+                return out;
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        panic!("wanted {n} observations, saw {}", out.len());
+    }
+
+    /// A blocking, caller-owned pipe — a faithful stand-in for a real `fd:`
+    /// source, whose flags this process does not control and must not
+    /// change.
+    fn os_pipe_pair() -> (std::fs::File, std::fs::File) {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[test]
+    fn an_observation_is_bounded_below_by_a_proof_of_emptiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        // Let the reader select at least once with nothing to read: that is
+        // a proof of emptiness, and it must land BEFORE the write.
+        std::thread::sleep(READ_SLICE * 2);
+        let before = std::time::Instant::now();
+        writer.write_all(b"x").unwrap();
+
+        let observations = wait_for_observations(&reader, 1);
+        let o = observations[0];
+        assert!(
+            o.empty_since.is_some(),
+            "the reader must report a lower bound"
+        );
+        assert!(
+            o.empty_since.unwrap() <= before,
+            "the proof of emptiness must precede the write it bounds"
+        );
+        assert!(o.observed_at >= before, "and the read must follow it");
+    }
+
+    #[test]
+    fn the_stamp_is_taken_before_the_queue_lock() {
+        // Hold the arrivals lock across a write, so any timestamp taken
+        // INSIDE the lock would be dragged forward by the contention. The
+        // reported instant must not move.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        let held = reader.lock_arrivals_for_test();
+        let at_write = std::time::Instant::now();
+        writer.write_all(b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        drop(held);
+
+        let o = wait_for_observations(&reader, 1)[0];
+        assert!(
+            o.observed_at < at_write + Duration::from_millis(100),
+            "observed_at was taken after the lock, not after the read: {:?}",
+            o.observed_at.duration_since(at_write)
+        );
+    }
+
+    #[test]
+    fn a_burst_drains_within_one_slice_and_shares_one_lower_bound() {
+        // Several writes queued before the reader wakes are read in one
+        // pass. Each chunk gets its own observed_at; they share the one
+        // proof of emptiness that preceded them, because that is all that
+        // is known.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        std::thread::sleep(READ_SLICE * 2);
+        for _ in 0..3 {
+            writer.write_all(&[b'x'; 300]).unwrap(); // > 256, so several reads
+        }
+        let observations = wait_for_observations(&reader, 2);
+        let first = observations[0].empty_since;
+        assert!(first.is_some());
+        assert!(
+            observations.iter().all(|o| o.empty_since == first),
+            "one proof of emptiness bounds every chunk drained after it"
+        );
+    }
+
+    #[test]
+    fn an_fd_source_is_never_read_twice_in_one_select() {
+        // I-83's narrow half. A `fd:` descriptor keeps the caller's
+        // blocking mode and may be shared, so a speculative second read can
+        // block the reader thread — the one place I-80 must not be
+        // violated.
+        //
+        // Asserted DIRECTLY, on a counter the loop maintains, rather than
+        // inferred from how many observations happened to be queued when
+        // the test looked: with 700 bytes waiting the reader can
+        // legitimately complete three whole select/read iterations before
+        // any drain, so an observation count cannot tell one-read-per-select
+        // from three-reads-in-one-select. It would pass for the wrong reason
+        // on a fast machine.
+        let (rx, mut tx) = os_pipe_pair();
+        let reader = TriggerReader::open(&TriggerSpec::Fd(rx.as_raw_fd()), None).unwrap();
+        tx.write_all(&[b'x'; 700]).unwrap(); // > 256: needs three reads to drain
+        wait_for_observations(&reader, 3);
+
+        assert_eq!(
+            reader.max_reads_per_select_for_test(),
+            1,
+            "a fd: source must take exactly one read per select"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn a_fifo_source_does_drain_within_one_select() {
+        // The other side of the same flag, so `drainable` cannot be quietly
+        // false everywhere and still pass its own test suite.
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = fifo_pair(dir.path());
+        std::thread::sleep(Duration::from_millis(120));
+        writer.write_all(&[b'x'; 700]).unwrap();
+        wait_for_observations(&reader, 3);
+
+        assert!(
+            reader.max_reads_per_select_for_test() > 1,
+            "an owned non-blocking fifo drains while readable"
         );
     }
 }
