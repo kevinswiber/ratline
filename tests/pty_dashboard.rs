@@ -1001,11 +1001,26 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     let decl = write_dashboard(dir.path(), &fifo_cycle_board(&fa, &fb));
 
     // DIAGNOSTIC: where the suspicion test writes what it decided, and why.
+    //
+    // OPT-IN, because an instrument that changes the thing it measures has to
+    // be switched off to be trusted. Tracing walks every arrival and formats a
+    // line inside the loop the wedge lives in — it costs no measurable time (a
+    // passing ubuntu run is 5.2 s either way) but it moves the interleaving,
+    // and interleaving is exactly what is under investigation. Unset, rat runs
+    // byte-for-byte as it does on main and this test is a control that can
+    // still say what the screen showed.
     let trace = dir.path().join("trigger-trace.log");
+    let trace_arg = trace.display().to_string();
+    let traced = std::env::var_os("RAT_WEDGE_TRACE").is_some();
+    let envs: Vec<(&str, &str)> = if traced {
+        vec![("RAT_TRIGGER_TRACE", trace_arg.as_str())]
+    } else {
+        Vec::new()
+    };
     let session = PtySession::spawn(
         &rat_bin(),
         &["dashboard", &decl.display().to_string()],
-        &[("RAT_TRIGGER_TRACE", &trace.display().to_string())],
+        &envs,
     )
     .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
@@ -1062,9 +1077,13 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
         );
         println!("--- visible tail ---\n{tail}");
         println!("--- trigger trace ---");
-        match std::fs::read_to_string(&trace) {
-            Ok(t) => println!("{t}"),
-            Err(e) => println!("(no trace: {e})"),
+        if traced {
+            match std::fs::read_to_string(&trace) {
+                Ok(t) => println!("{t}"),
+                Err(e) => println!("(the trace was asked for and is not there: {e})"),
+            }
+        } else {
+            println!("(control run: RAT_WEDGE_TRACE unset, rat ran uninstrumented)");
         }
         println!("=== END WEDGE REPORT ===");
     }
