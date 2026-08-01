@@ -841,6 +841,11 @@ pub struct LoopSuspicion {
     pub window: std::time::Duration,
     pub min_respawns: usize,
     pub abstain_at_or_above: f64,
+    /// DIAGNOSTIC ONLY: fill `Verdict::why` with the conditions as they were
+    /// read. Off by default and never user-facing — the extra work (a second
+    /// `busy_fraction`, a walk of every arrival, a formatted string) runs per
+    /// evaluation, so it must be paid for only where somebody asked.
+    pub explain: bool,
 }
 
 impl Default for LoopSuspicion {
@@ -849,6 +854,7 @@ impl Default for LoopSuspicion {
             window: std::time::Duration::from_secs(30),
             min_respawns: 50,
             abstain_at_or_above: 0.5,
+            explain: false,
         }
     }
 }
@@ -877,6 +883,11 @@ pub struct Verdict {
     /// is load-bearing, because it is what stops a busy dashboard from
     /// re-announcing one unbroken loop every time it goes quiet again.
     pub abstained: bool,
+    /// DIAGNOSTIC ONLY, `Some` only under `LoopSuspicion::explain`: which
+    /// condition decided this, in the order they are tested. A verdict of
+    /// "nothing" and an abstention both look like silence from outside, and
+    /// this is the only thing that tells them apart after the fact.
+    pub why: Option<String>,
 }
 impl LoopSuspicion {
     /// Which panes are implicated over the window ending at `now`.
@@ -891,6 +902,9 @@ impl LoopSuspicion {
         log: &WindowLog,
         panes: &[PaneWindow<'_>],
     ) -> Verdict {
+        let mut why = self
+            .explain
+            .then(|| self.explain_inputs(now, ledger, log, panes));
         // Condition 3 first: it is the cheapest, and it short-circuits. Lost
         // reader evidence lands here too — missing evidence is not absent
         // evidence, and the veto below is a zero test that cannot survive a
@@ -900,6 +914,10 @@ impl LoopSuspicion {
                 panes: Vec::new(),
                 ordered: None,
                 abstained: true,
+                why: why.map(|mut w| {
+                    w.push_str(" | c3 ABSTAIN");
+                    w
+                }),
             };
         }
 
@@ -951,11 +969,71 @@ impl LoopSuspicion {
         }
         let implicated = on_a_cycle(&candidates, &edges, &merged);
         let precise = merged.iter().all(|group| group.len() <= 1);
+        if let Some(w) = why.as_mut() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                w,
+                " | cand={:?} edges={:?} ambig={:?} merged={:?}",
+                candidates.iter().map(|c| c.source.0).collect::<Vec<_>>(),
+                edges.iter().map(|(a, b)| (a.0, b.0)).collect::<Vec<_>>(),
+                ambiguities
+                    .iter()
+                    .map(|(g, w)| (ids(g), w.0))
+                    .collect::<Vec<_>>(),
+                merged.iter().map(|g| ids(g)).collect::<Vec<_>>(),
+            );
+        }
         Verdict {
             ordered: (precise && !implicated.is_empty()).then(|| implicated.clone()),
             panes: implicated,
             abstained: false,
+            why,
         }
+    }
+
+    /// DIAGNOSTIC ONLY: every input the four conditions read, before any of
+    /// them is applied. Reported per pane because the conditions are per pane,
+    /// and a pane that never became a candidate is indistinguishable from one
+    /// that did unless its own counts are shown.
+    fn explain_inputs(
+        &self,
+        now: std::time::Instant,
+        ledger: &PathLedger,
+        log: &WindowLog,
+        panes: &[PaneWindow<'_>],
+    ) -> String {
+        use std::fmt::Write as _;
+        let mut w = format!(
+            "busy={:.3} lost={}",
+            log.busy_fraction(now),
+            u8::from(log.evidence_lost(now)),
+        );
+        for pane in panes {
+            let exogenous: usize = pane.watched.iter().map(|p| ledger.exogenous(p)).sum();
+            let (mut arrivals, mut uncontained, mut deferred) = (0usize, 0usize, 0usize);
+            for key in pane.readers {
+                for arrival in log.arrivals(key) {
+                    arrivals += 1;
+                    // The two ways a reader route withholds evidence, and they
+                    // mean opposite things: EMPTY containing is the condition-2
+                    // veto (nothing was in flight, so the byte came from
+                    // outside), while an unresolvable width is only DEFERRED
+                    // until the covering child exits.
+                    uncontained += usize::from(arrival.containing.is_empty());
+                    deferred += usize::from(log.widths(arrival).is_none());
+                }
+            }
+            let _ = write!(
+                w,
+                " | s{} resp={}/{} exo={} arr={arrivals}/unc={uncontained}/def={deferred} closed={}",
+                pane.source.0,
+                pane.trigger_respawns,
+                self.min_respawns,
+                exogenous,
+                u8::from(self.closed_everywhere(ledger, log, pane)),
+            );
+        }
+        w
     }
 
     /// Condition 2: every trigger this pane watches recorded ZERO exogenous
@@ -1046,6 +1124,12 @@ impl LoopSuspicion {
 /// producer is arbitrarily more expensive than its consumer. The band is 2x
 /// because the measured gap it sits in is far wider than that, not because it
 /// was tuned.
+/// DIAGNOSTIC ONLY: a group of sources as plain indices, so an explanation
+/// reads as numbers instead of a row of `SourceId(_)`.
+fn ids(group: &[SourceId]) -> Vec<usize> {
+    group.iter().map(|s| s.0).collect()
+}
+
 fn credit(changes: &[Change]) -> Vec<SourceId> {
     if changes.is_empty() {
         return Vec::new();
@@ -2931,7 +3015,7 @@ mod matrix {
         LoopSuspicion {
             window: W,
             min_respawns: MIN_RESPAWNS,
-            abstain_at_or_above: LoopSuspicion::default().abstain_at_or_above,
+            ..LoopSuspicion::default()
         }
         .evaluate(now, &ledger, &log, &panes)
     }

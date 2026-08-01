@@ -319,7 +319,16 @@ pub(crate) fn run_registry(
     // MtimeWatchSet over the same paths: sharing them would let an observer
     // poll consume a trigger's fire, and the pane would stop refreshing.
     let mut ledger = PathLedger::new(watched_union.clone());
-    let suspicion = crate::core::trigger::LoopSuspicion::default();
+    // DIAGNOSTIC ONLY: `RAT_TRIGGER_TRACE=<path>` records how the suspicion
+    // test answered, every time it answers. A dashboard that never reports a
+    // loop looks exactly like one that has none, and this is the only surface
+    // that tells the two apart from outside the process. Unset — the shipped
+    // case — costs one `var_os` at startup and nothing per iteration.
+    let mut trace = TriggerTrace::open();
+    let suspicion = crate::core::trigger::LoopSuspicion {
+        explain: trace.is_some(),
+        ..Default::default()
+    };
     let mut log = WindowLog::new(suspicion.window);
     // The panes the notice has already announced — its latch, so one
     // loop announces itself once and a repaired one can announce again.
@@ -869,6 +878,9 @@ pub(crate) fn run_registry(
                     })
                     .collect();
                 let verdict = suspicion.evaluate(now, &ledger, &log, &panes);
+                if let Some(t) = trace.as_mut() {
+                    t.record(now, &verdict);
+                }
                 // A badge appearing or clearing is a displayed change,
                 // and it is decided HERE — with no outcome to ride. So
                 // the transition recomposes from the retained outputs,
@@ -1570,6 +1582,59 @@ fn drain_reader_arrivals(
         if slot.reader.overflowed() {
             log.record_overflow(now);
         }
+    }
+}
+
+/// DIAGNOSTIC ONLY: an append-only record of the suspicion test's answers.
+///
+/// Two things make it usable from CI, where the failing run is the one nobody
+/// can attach a debugger to. It is THROTTLED, so a 50 ms loop does not turn a
+/// fifteen-second run into thirty thousand lines; and it is UNTHROTTLED
+/// whenever the answer itself moves, so the one transition that matters can
+/// never be the sample that got skipped.
+struct TriggerTrace {
+    file: std::fs::File,
+    started: Instant,
+    last_written: Option<Instant>,
+    last_answer: Option<(Vec<crate::core::registry::SourceId>, bool)>,
+}
+
+impl TriggerTrace {
+    /// `Some` only when `RAT_TRIGGER_TRACE` names a path that opens. A
+    /// diagnostic that aborts the run it is diagnosing is worse than none, so
+    /// an unopenable path is simply no trace.
+    fn open() -> Option<TriggerTrace> {
+        let path = std::env::var_os("RAT_TRIGGER_TRACE")?;
+        Some(TriggerTrace {
+            file: std::fs::File::create(path).ok()?,
+            started: Instant::now(),
+            last_written: None,
+            last_answer: None,
+        })
+    }
+
+    fn record(&mut self, now: Instant, verdict: &crate::core::trigger::Verdict) {
+        let answer = (verdict.panes.clone(), verdict.abstained);
+        let moved = self.last_answer.as_ref() != Some(&answer);
+        let due = self
+            .last_written
+            .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(200));
+        if !moved && !due {
+            return;
+        }
+        self.last_written = Some(now);
+        self.last_answer = Some(answer);
+        let Some(why) = verdict.why.as_deref() else {
+            return;
+        };
+        use std::io::Write as _;
+        let _ = writeln!(
+            self.file,
+            "t={:.3} {why} -> panes={:?} abstain={}",
+            now.duration_since(self.started).as_secs_f64(),
+            verdict.panes.iter().map(|s| s.0).collect::<Vec<_>>(),
+            u8::from(verdict.abstained),
+        );
     }
 }
 
@@ -4426,6 +4491,7 @@ mod tests {
                 panes: panes.to_vec(),
                 ordered: None,
                 abstained,
+                why: None,
             },
         )
     }
