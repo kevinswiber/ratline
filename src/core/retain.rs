@@ -149,10 +149,6 @@ impl LineCap {
         (self.retained.into(), self.dropped)
     }
 
-    // STAGED: the live source that reads these lands in task 1.2, and a
-    // bin crate under `-D warnings` refuses a method nothing calls. The
-    // allow comes off with that task; it is not a permanent exemption.
-    // (Plan 0013's precedent for exactly this shape.)
     /// The retained lines and the drop count, WITHOUT consuming.
     ///
     /// `finish()` stays consuming and is still the batch path's only
@@ -166,7 +162,6 @@ impl LineCap {
     /// and no terminator is ever coming. A live child's partial line is
     /// mid-write, and a snapshot including it would paint half a line
     /// that changes under the reader on the next chunk.
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> (Vec<Vec<u8>>, usize) {
         (self.retained.iter().cloned().collect(), self.dropped)
     }
@@ -177,7 +172,6 @@ impl LineCap {
     /// anything a reader could see has changed; asking `snapshot()`
     /// instead would clone the whole retained set per chunk to answer a
     /// question about its length.
-    #[allow(dead_code)]
     pub fn retained_len(&self) -> usize {
         self.retained.len()
     }
@@ -187,7 +181,6 @@ impl LineCap {
     /// Paired with `retained_len` because a body can change by DROPPING
     /// alone: a full cap that evicts one line and gains one has the same
     /// length and different content.
-    #[allow(dead_code)]
     pub fn dropped_count(&self) -> usize {
         self.dropped
     }

@@ -1,9 +1,3 @@
-// STAGED: nothing spawns a live worker until task 3.2, so every item
-// here is unreachable from a live root and a bin crate under
-// `-D warnings` refuses the lot. This comes off with that task —
-// together with the matching allows on `LineCap`'s three new methods —
-// and is not a permanent exemption.
-#![allow(dead_code)]
 //! The handoff between a live source's worker and the loop.
 //!
 //! One outbox slot, latest wins, no queue — which is the whole design.
@@ -27,6 +21,12 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::core::retain::{LineCap, Retention};
+
+/// One cap from one policy — the single place a `Retention` becomes a
+/// `LineCap` here, so a re-armed cap cannot drift from a fresh one.
+fn cap(policy: Retention) -> LineCap {
+    LineCap::new(policy.max_lines, policy.keep)
+}
 
 /// Which pipe a reader is feeding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +52,11 @@ pub struct Emission {
 }
 
 struct State {
+    /// The policy each cap is rebuilt from. Kept because an `Emissions`
+    /// OUTLIVES the child that fills it — the loop owns one per source
+    /// and the scheduler may respawn — so `finish` has to hand back a
+    /// fresh cap, not a spent one.
+    policy: (Retention, Retention),
     stdout: LineCap,
     stderr: LineCap,
     pending: Option<Emission>,
@@ -78,8 +83,9 @@ pub struct Emissions(Arc<Mutex<State>>);
 impl Emissions {
     pub fn new(stdout: Retention, stderr: Retention) -> Emissions {
         Emissions(Arc::new(Mutex::new(State {
-            stdout: LineCap::new(stdout.max_lines, stdout.keep),
-            stderr: LineCap::new(stderr.max_lines, stderr.keep),
+            policy: (stdout, stderr),
+            stdout: cap(stdout),
+            stderr: cap(stderr),
             pending: None,
         })))
     }
@@ -120,8 +126,43 @@ impl Emissions {
     }
 
     /// Take the pending body, leaving the outbox empty.
+    // STAGED: the worker fills the outbox now, but nothing in the loop
+    // empties it until the compose gate opens on progress. The allow
+    // comes off with that change and is not a permanent exemption.
+    #[allow(dead_code)]
     pub fn take(&self) -> Option<Emission> {
         self.lock().pending.take()
+    }
+
+    /// Consume both caps at the child's EOF and yield its final body:
+    /// all retained stdout, all retained stderr, and what the two bounds
+    /// discarded between them. The completion path's call.
+    ///
+    /// This also flushes an unterminated trailing line, which `feed`
+    /// deliberately withholds — mid-write while the child lives, but a
+    /// real line once it is gone.
+    ///
+    /// **It RE-ARMS rather than spends, and that is not tidiness.** The
+    /// caps are replaced with fresh ones built from the same policy,
+    /// because this type outlives the child that fills it: the loop owns
+    /// one per source and the scheduler may respawn after an exit.
+    /// Leaving the old caps in place would append the next child's
+    /// output to a dead child's lines; leaving spent ones would retain
+    /// nothing at all, silently.
+    ///
+    /// A body already sitting in the outbox is left alone. It is a
+    /// strictly earlier view of the same stream, and the events are
+    /// ordered — every wake this child sent was sent before the
+    /// completion — so the loop records it first and the completion
+    /// replaces it in the same drain.
+    pub fn finish(&self) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, usize) {
+        let mut state = self.lock();
+        let (out_policy, err_policy) = state.policy;
+        let stdout = std::mem::replace(&mut state.stdout, cap(out_policy));
+        let stderr = std::mem::replace(&mut state.stderr, cap(err_policy));
+        let (out, out_dropped) = stdout.finish();
+        let (err, err_dropped) = stderr.finish();
+        (out, err, out_dropped + err_dropped)
     }
 
     /// The state holds no invariant a panicking worker can break, so
@@ -255,6 +296,60 @@ mod tests {
             e.feed(Stream::Stdout, b"second\n", at()),
             "eviction is movement"
         );
+    }
+
+    #[test]
+    fn finishing_flushes_the_line_the_child_never_terminated() {
+        // The one difference between a snapshot and a finish. `feed`
+        // withholds a partial line because it is mid-write and would
+        // repaint under the reader; once the child is gone no terminator
+        // is coming, and dropping it would eat output that fits.
+        let e = Emissions::new(ample(), ample());
+        e.feed(Stream::Stdout, b"whole\npartial", at());
+        let body = e.take().expect("a body");
+        assert_eq!(body.stdout, vec![b"whole\n".to_vec()], "not while it lives");
+        let (stdout, _, _) = e.finish();
+        assert_eq!(
+            stdout,
+            vec![b"whole\n".to_vec(), b"partial".to_vec()],
+            "but yes once it is gone, and verbatim — no terminator invented"
+        );
+    }
+
+    #[test]
+    fn finishing_reports_what_both_bounds_dropped() {
+        let e = Emissions::new(bound(1), bound(1));
+        e.feed(Stream::Stdout, b"o1\no2\no3\n", at());
+        e.feed(Stream::Stderr, b"e1\ne2\n", at());
+        let (stdout, stderr, dropped) = e.finish();
+        assert_eq!(stdout, vec![b"o3\n".to_vec()]);
+        assert_eq!(stderr, vec![b"e2\n".to_vec()]);
+        assert_eq!(dropped, 3, "2 dropped from stdout + 1 from stderr");
+    }
+
+    #[test]
+    fn finishing_re_arms_the_caps_for_the_next_child() {
+        // An Emissions OUTLIVES its child: the loop owns one per source
+        // and the scheduler may respawn after an exit. Two ways to get
+        // this wrong and neither one is loud — leaving the old caps in
+        // place appends the next child's output to a dead child's lines,
+        // and leaving SPENT caps retains nothing at all.
+        let e = Emissions::new(bound(10), bound(10));
+        e.feed(Stream::Stdout, b"first-child\n", at());
+        assert_eq!(e.finish().0, vec![b"first-child\n".to_vec()]);
+        e.take();
+
+        assert!(
+            e.feed(Stream::Stdout, b"second-child\n", at()),
+            "a re-armed cap still wakes the loop"
+        );
+        let body = e.take().expect("a body");
+        assert_eq!(
+            body.stdout,
+            vec![b"second-child\n".to_vec()],
+            "the next child starts clean, neither appending nor bounded to nothing"
+        );
+        assert_eq!(body.dropped, 0, "and its drop count starts at zero");
     }
 
     #[test]

@@ -19,9 +19,12 @@ use crossterm::tty::IsTty;
 
 use crate::cli::WatchArgs;
 use crate::color::{ColorProfile, SystemEnv};
-use crate::core::child::{ChildSlot, ShutdownGuard, TickEvent, run_tick, spawn_tick};
+use crate::core::child::{
+    ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick, spawn_live_tick, spawn_tick,
+};
 use crate::core::duration::parse_interval;
 use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
+use crate::core::live::Emissions;
 use crate::core::measure::shift_chop;
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{Composition, Overflow, PaneGeometry, Registry, SourceId, SourceSpec};
@@ -355,6 +358,16 @@ pub(crate) fn run_registry(
                 schedule: TickSchedule::new(spec.interval),
                 slot: ChildSlot::default(),
                 tx: tx.clone(),
+                // Built here, once, and outliving every child: the caps
+                // must survive across reads, which is the whole
+                // difference from the batch path's per-tick accumulator.
+                // Both streams get the same policy the batch path would
+                // have used, so a follower is bounded exactly as a
+                // flooding command is.
+                emissions: spec.live.then(|| {
+                    let retention = retention_for(&registry, id);
+                    Emissions::new(retention, retention)
+                }),
                 output: None,
                 hash: 0,
                 changed_at: jiff::Timestamp::UNIX_EPOCH,
@@ -505,15 +518,38 @@ pub(crate) fn run_registry(
                 if !inline {
                     let command =
                         source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
-                    inline = spawn_tick(
-                        command,
-                        id,
-                        runtime[id.0].slot.clone(),
-                        runtime[id.0].tx.clone(),
-                        watched_union.clone(),
-                        retention,
-                    )
-                    .is_err();
+                    inline = match runtime[id.0].emissions.clone() {
+                        // A live source is spawned once and never expected
+                        // to exit, so its body reaches the loop through the
+                        // outbox rather than at EOF — and it has NO inline
+                        // fallback: running a child that never exits on this
+                        // thread would wedge the loop for good. A worker the
+                        // OS refuses is reported as the failure it is.
+                        Some(emissions) => {
+                            if let Err(err) = spawn_live_tick(
+                                command,
+                                id,
+                                runtime[id.0].slot.clone(),
+                                emissions,
+                                runtime[id.0].tx.clone(),
+                                watched_union.clone(),
+                            ) {
+                                let _ = runtime[id.0]
+                                    .tx
+                                    .send(TickEvent::Completed(not_started(id, err)));
+                            }
+                            false
+                        }
+                        None => spawn_tick(
+                            command,
+                            id,
+                            runtime[id.0].slot.clone(),
+                            runtime[id.0].tx.clone(),
+                            watched_union.clone(),
+                            retention,
+                        )
+                        .is_err(),
+                    };
                 }
                 if inline {
                     let command =
@@ -3139,6 +3175,10 @@ struct SourceRuntime {
     schedule: TickSchedule,
     slot: ChildSlot,
     tx: std::sync::mpsc::Sender<TickEvent>,
+    /// This source's shared caps and one-slot outbox — `Some` only when
+    /// the source declared itself live. `None` says batch, and the batch
+    /// path never touches one, which is what keeps its bytes identical.
+    emissions: Option<Emissions>,
     /// This source's rendered lines: without panes, the whole frame the
     /// shipped composer produced; with them, the child's own lines
     /// awaiting their box.
@@ -3948,6 +3988,7 @@ mod tests {
             schedule: TickSchedule::new(Some(Duration::from_secs(2))),
             slot: ChildSlot::default(),
             tx,
+            emissions: None,
             output: None,
             hash,
             changed_at: stamp(0),
@@ -4346,6 +4387,7 @@ mod tests {
                 schedule: TickSchedule::new(None),
                 slot: ChildSlot::default(),
                 tx,
+                emissions: None,
                 output: None,
                 hash: 0,
                 previous: None,

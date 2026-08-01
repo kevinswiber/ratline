@@ -13,9 +13,11 @@
 //! kills a parked child or bars a spawn that has not happened yet.
 //! There is no window in between.
 
+use std::io::Read;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::core::live::{Emissions, Stream};
 use crate::core::registry::SourceId;
 use crate::core::retain::{Retention, read_all};
 
@@ -80,12 +82,14 @@ pub enum TickEvent {
     /// Deliberately carries no body: the outbox is latest-wins, so N of
     /// these collapse into one render while the wakes themselves stay
     /// cheap. Which source moved is all the loop needs to go look.
-    // STAGED: nothing publishes progress until the worker does, and a
-    // bin crate under `-D warnings` refuses an unconstructed variant.
-    // This comes off with the worker's publish, and is not a permanent
-    // exemption.
-    #[allow(dead_code)]
-    Progress { source: SourceId },
+    Progress {
+        // STAGED: the drain matches this arm and drops it, so the tag is
+        // written and not yet read — the loop learns to go look when its
+        // compose gate opens on progress. The allow comes off with that
+        // change and is not a permanent exemption.
+        #[allow(dead_code)]
+        source: SourceId,
+    },
     /// A child ran to completion — the shipped path, unchanged.
     Completed(TickOutcome),
 }
@@ -138,6 +142,24 @@ pub struct TickOutcome {
     pub dropped: usize,
 }
 
+/// How a tick's two pipes are drained — the ONLY thing that differs
+/// between a batch source and a live one.
+///
+/// Everything else about running a child is one implementation on
+/// purpose: the lock that spans the spawn, the concurrent drain of both
+/// pipes, the reap, and the closing stamps. A second copy of that
+/// critical section would be a second chance to reopen the window the
+/// first one exists to close.
+enum Sink {
+    /// A private accumulator per pipe, yielded once at EOF — the shipped
+    /// path, and the only one a source without `live` ever takes.
+    Batch(Retention),
+    /// A live source's shared caps and outbox. Each reader feeds them and
+    /// wakes the loop as complete lines arrive; the completion path takes
+    /// whatever is left.
+    Live(Emissions, std::sync::mpsc::Sender<TickEvent>),
+}
+
 /// Run one configured child to completion on this thread.
 pub fn run_tick(
     command: std::process::Command,
@@ -145,7 +167,13 @@ pub fn run_tick(
     union: Vec<std::path::PathBuf>,
     retention: Retention,
 ) -> TickOutcome {
-    run_parked(command, source, &ChildSlot::default(), &union, retention)
+    run_parked(
+        command,
+        source,
+        &ChildSlot::default(),
+        &union,
+        Sink::Batch(retention),
+    )
 }
 
 /// Run one configured child on a worker thread, which posts exactly
@@ -165,10 +193,83 @@ pub fn spawn_tick(
             // On a shutdown race the receiver is already gone; the
             // failed send is the no-op it should be.
             let _ = tx.send(TickEvent::Completed(run_parked(
-                command, source, &slot, &union, retention,
+                command,
+                source,
+                &slot,
+                &union,
+                Sink::Batch(retention),
             )));
         })?;
     Ok(())
+}
+
+/// Run one LONG-LIVED child on a worker thread: same slot protocol and
+/// the same exactly-one-completion contract as `spawn_tick`, except that
+/// this one offers its body as it arrives instead of only at EOF.
+///
+/// No `Retention` parameter, and that absence is the design: the caps
+/// live inside the `Emissions` the loop owns, because they must outlive
+/// any single read. A child that never exits has no "at EOF".
+pub fn spawn_live_tick(
+    command: std::process::Command,
+    source: SourceId,
+    slot: ChildSlot,
+    emissions: Emissions,
+    tx: std::sync::mpsc::Sender<TickEvent>,
+    union: Vec<std::path::PathBuf>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("rat-watch-child".into())
+        .spawn(move || {
+            let sink = Sink::Live(emissions, tx.clone());
+            // A live child MAY still exit — a follower whose file was
+            // rotated, one killed upstream — and when it does the shipped
+            // completion path runs unchanged, so the exit badge and the
+            // final body are right.
+            let _ = tx.send(TickEvent::Completed(run_parked(
+                command, source, &slot, &union, sink,
+            )));
+        })?;
+    Ok(())
+}
+
+/// Drain one pipe into a live source's shared caps, offering what it has
+/// as it goes.
+///
+/// **Always runs to EOF**, exactly as `read_all` does and for the reason
+/// plan 0016 measured rather than reasoned about: an early exit does not
+/// hang, it drops the pipe, the child dies of SIGPIPE, and the drop count
+/// comes back ZERO while everything past the bound is silently lost.
+fn pump_live<R: Read>(
+    pipe: Option<R>,
+    stream: Stream,
+    source: SourceId,
+    emissions: &Emissions,
+    tx: &std::sync::mpsc::Sender<TickEvent>,
+) {
+    let Some(mut pipe) = pipe else { return };
+    // A read granularity, not a bound. The bound is the cap's.
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                // `feed` owns the bound AND the publish decision, because
+                // the "did anything visible move?" predicate needs both
+                // caps under the lock that mutated them. It answers true
+                // only when this call filled an EMPTY outbox, which is
+                // exactly when a wake is owed — so a child flooding an
+                // unread slot publishes silently.
+                if emissions.feed(stream, &buf[..n], jiff::Timestamp::now()) {
+                    let _ = tx.send(TickEvent::Progress { source });
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A read error yields whatever arrived: a partial frame beats
+            // tearing the dashboard down.
+            Err(_) => break,
+        }
+    }
 }
 
 fn run_parked(
@@ -176,7 +277,7 @@ fn run_parked(
     source: SourceId,
     slot: &ChildSlot,
     union: &[std::path::PathBuf],
-    retention: Retention,
+    sink: Sink,
 ) -> TickOutcome {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     // The lock spans the spawn: shutdown() takes the same lock, so it
@@ -184,11 +285,11 @@ fn run_parked(
     let (stdout, stderr) = {
         let mut state = slot.lock();
         if state.shutdown {
-            return outcome_err(source, std::io::ErrorKind::Interrupted.into());
+            return not_started(source, std::io::ErrorKind::Interrupted.into());
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
-            Err(err) => return outcome_err(source, err),
+            Err(err) => return not_started(source, err),
         };
         let pipes = (child.stdout.take(), child.stderr.take());
         state.child = Some(child);
@@ -197,12 +298,32 @@ fn run_parked(
     // Both pipes drain at once: a child filling both buffers deadlocks
     // a serial reader. The helper failing to spawn drops its pipe, so
     // the child's stderr writes fail fast and the tick still finishes.
-    let err_reader = std::thread::Builder::new()
-        .name("rat-watch-stderr".into())
-        .spawn(move || read_all(stderr, retention));
-    let (out, out_dropped) = read_all(stdout, retention);
-    let (err, err_dropped) =
-        err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
+    let (out, err, dropped) = match sink {
+        Sink::Batch(retention) => {
+            let err_reader = std::thread::Builder::new()
+                .name("rat-watch-stderr".into())
+                .spawn(move || read_all(stderr, retention));
+            let (out, out_dropped) = read_all(stdout, retention);
+            let (err, err_dropped) =
+                err_reader.map_or_else(|_| (Vec::new(), 0), |h| h.join().unwrap_or_default());
+            (out, err, out_dropped + err_dropped)
+        }
+        Sink::Live(emissions, tx) => {
+            let (their_emissions, their_tx) = (emissions.clone(), tx.clone());
+            let err_reader = std::thread::Builder::new()
+                .name("rat-watch-stderr".into())
+                .spawn(move || {
+                    pump_live(stderr, Stream::Stderr, source, &their_emissions, &their_tx);
+                });
+            pump_live(stdout, Stream::Stdout, source, &emissions, &tx);
+            if let Ok(handle) = err_reader {
+                // Joined before the caps are consumed, or the final body
+                // could be taken while a reader is still feeding it.
+                let _ = handle.join();
+            }
+            emissions.finish()
+        }
+    };
     let status = if let Some(mut child) = slot.lock().child.take() {
         // The status is no longer discarded: a pane names the code its
         // command exited with. Nobody FAILS on it — a failing child is
@@ -226,11 +347,19 @@ fn run_parked(
         close_stamps,
         // Both pipes are capped separately, so what the tick lost is
         // their sum.
-        dropped: out_dropped + err_dropped,
+        dropped,
     }
 }
 
-fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
+/// The outcome of a tick that never ran: a spawn the OS refused, a spawn
+/// barred by shutdown, or a worker thread that could not be started.
+///
+/// Public because a live source has **no inline fallback**. A batch
+/// source whose worker thread cannot start runs its child on the loop
+/// thread instead; a live child never exits, so doing that would wedge
+/// the loop forever. The caller reports the failure rather than becoming
+/// it.
+pub fn not_started(source: SourceId, err: std::io::Error) -> TickOutcome {
     TickOutcome {
         closed_at: std::time::Instant::now(),
         source,
@@ -247,11 +376,12 @@ fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::io::{Read, Write as _};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::core::live::Emission;
     use crate::core::retain::{Keep, read_all};
 
     #[cfg(unix)]
@@ -341,6 +471,85 @@ mod tests {
         {
             script(&format!("for /l %i in (0,1,{}) do @echo %i", n - 1))
         }
+    }
+
+    /// Path to the rat binary — the only fixture the live tests can use.
+    /// They need a child that prints and then DOES NOT EXIT, and the one
+    /// tool that would give them that for free is `tail -f`, which the
+    /// Windows leg does not have. So the follower is rat itself.
+    fn rat_bin() -> std::path::PathBuf {
+        assert_cmd::cargo::cargo_bin("rat")
+    }
+
+    /// A temp dir holding `log`, seeded with `contents`. The dir comes
+    /// back with it because dropping the dir deletes the file.
+    fn seeded_log(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("log");
+        std::fs::write(&log, contents).expect("seed the log");
+        (dir, log)
+    }
+
+    /// `rat __follow <log>`: print what is there, then keep running and
+    /// print whatever is appended.
+    fn follow_cmd(log: &std::path::Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(rat_bin());
+        cmd.arg("__follow").arg(log);
+        cmd
+    }
+
+    /// A log seeded with `n` lines, followed — a child that floods and
+    /// then stays alive, which is the shape a bound has to survive.
+    fn flood_then_stay_alive(n: usize) -> (tempfile::TempDir, std::process::Command) {
+        let body: String = (0..n).map(|i| format!("{i}\n")).collect();
+        let (dir, log) = seeded_log(&body);
+        let cmd = follow_cmd(&log);
+        (dir, cmd)
+    }
+
+    /// Poll the outbox until a body satisfies `ready`, or fail.
+    ///
+    /// Non-matching bodies are DISCARDED on purpose: the outbox is
+    /// latest-wins, so taking one and waiting for the next is exactly
+    /// what the loop does, and a body that has not caught up yet holds
+    /// nothing a later one lacks.
+    fn wait_for_body_where(
+        slot: &Emissions,
+        within: Duration,
+        ready: impl Fn(&Emission) -> bool,
+    ) -> Emission {
+        let deadline = Instant::now() + within;
+        let mut seen: Vec<(usize, usize, usize)> = Vec::new();
+        loop {
+            if let Some(body) = slot.take() {
+                if ready(&body) {
+                    return body;
+                }
+                seen.push((body.stdout.len(), body.stderr.len(), body.dropped));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no body satisfied the predicate; \
+                 saw (stdout lines, stderr lines, dropped): {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_body(slot: &Emissions, within: Duration) -> Emission {
+        wait_for_body_where(slot, within, |_| true)
+    }
+
+    /// Every event a channel yields until its senders are gone.
+    ///
+    /// Sound only for a child that EXITS: the worker's exit drops the
+    /// last sender and ends this. A follower would sit here for `within`.
+    fn collect_until_closed(rx: &mpsc::Receiver<TickEvent>, within: Duration) -> Vec<TickEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.recv_timeout(within) {
+            events.push(event);
+        }
+        events
     }
 
     /// The line's text, with its platform terminator removed.
@@ -803,7 +1012,7 @@ mod tests {
         let cmd = script(&format!("type nul > {}", marker.display()));
         let slot = ChildSlot::default();
         slot.shutdown();
-        let outcome = run_parked(cmd, SourceId(0), &slot, &[], ample());
+        let outcome = run_parked(cmd, SourceId(0), &slot, &[], Sink::Batch(ample()));
         let err = outcome.spawn_error.expect("barred spawn reports an error");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
         assert!(!marker.exists(), "the child must never have spawned");
@@ -940,6 +1149,224 @@ mod tests {
         assert_eq!(outcome.source, SourceId(4));
         assert!(contains(&outcome.stdout.concat(), b"hi"));
         assert_eq!(outcome.status.and_then(|status| status.code()), Some(3));
+    }
+
+    #[test]
+    fn a_live_source_publishes_before_its_child_exits() {
+        // THE WHOLE POINT. The child prints and then stays alive, so a
+        // pass cannot come from it having exited — which is exactly how
+        // main manages to render nothing at all.
+        let (_dir, log) = seeded_log("early\n");
+        let slot = Emissions::new(ample(), ample());
+        let child = ChildSlot::default();
+        let _shutdown = child.guard();
+        let (tx, rx) = mpsc::channel();
+        spawn_live_tick(
+            follow_cmd(&log),
+            SourceId(0),
+            child.clone(),
+            slot.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+
+        let body = wait_for_body(&slot, Duration::from_secs(5));
+        assert_eq!(body.stdout, vec![b"early\n".to_vec()]);
+        assert!(body.stderr.is_empty());
+        // The loop must be WOKEN, not left to poll. Read after the body
+        // on purpose: `feed` fills the outbox and only then does the
+        // worker send, so a `try_recv` here would race that send.
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_secs(5)),
+                Ok(TickEvent::Progress {
+                    source: SourceId(0)
+                })
+            ),
+            "a published body must come with a wake"
+        );
+    }
+
+    #[test]
+    fn appending_to_a_followed_file_publishes_again() {
+        // Following, not just a first read: the second body must arrive
+        // without the child exiting and without the loop asking.
+        let (_dir, log) = seeded_log("first\n");
+        let slot = Emissions::new(ample(), ample());
+        let child = ChildSlot::default();
+        let _shutdown = child.guard();
+        let (tx, _rx) = mpsc::channel();
+        spawn_live_tick(
+            follow_cmd(&log),
+            SourceId(0),
+            child.clone(),
+            slot.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+
+        // Order matters: wait for the FIRST body before appending, or one
+        // read of a two-line file would satisfy this.
+        let first = wait_for_body(&slot, Duration::from_secs(5));
+        assert_eq!(first.stdout, vec![b"first\n".to_vec()]);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("reopen the log")
+            .write_all(b"second\n")
+            .expect("append");
+        let next =
+            wait_for_body_where(&slot, Duration::from_secs(5), |body| body.stdout.len() == 2);
+        // A SNAPSHOT, not a delta: the whole retained body every time,
+        // which is what lets the shipped compose path take it unchanged.
+        assert_eq!(next.stdout, vec![b"first\n".to_vec(), b"second\n".to_vec()]);
+    }
+
+    #[test]
+    fn a_live_child_that_does_exit_still_posts_exactly_one_completion() {
+        // `tail -f` on a rotated file, a follower killed upstream: a live
+        // child MAY exit, and when it does the shipped completion path
+        // must still run, so the exit badge and the final body are right.
+        let child = ChildSlot::default();
+        let _shutdown = child.guard();
+        let (tx, rx) = mpsc::channel();
+        spawn_live_tick(
+            flooder(3),
+            SourceId(0),
+            child.clone(),
+            Emissions::new(ample(), ample()),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+        let events = collect_until_closed(&rx, Duration::from_secs(5));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, TickEvent::Completed(_)))
+                .count(),
+            1,
+            "exactly one completion, however many wakes preceded it"
+        );
+        let Some(TickEvent::Completed(outcome)) = events.into_iter().next_back() else {
+            panic!("the completion must come LAST — the body it carries is final");
+        };
+        assert_eq!(outcome.stdout.len(), 3, "the final body is the whole body");
+    }
+
+    #[test]
+    fn a_batch_source_publishes_nothing_and_completes_once() {
+        // The byte-identity witness at the unit level: a source without
+        // `live` must not touch an outbox even when one exists.
+        let slot = Emissions::new(ample(), ample());
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            flooder(3),
+            SourceId(0),
+            ChildSlot::default(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        let events = collect_until_closed(&rx, Duration::from_secs(5));
+        assert!(slot.take().is_none(), "a batch source must never publish");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], TickEvent::Completed(_)));
+    }
+
+    #[test]
+    fn a_flooding_live_child_does_not_grow_the_wake_queue() {
+        // The wake gate from the PRODUCING side. Bounding the body alone
+        // would leave the channel growing one event per read, and the
+        // loop drains that channel until empty — so the starvation the
+        // outbox exists to prevent would arrive through the wakes.
+        let (_dir, cmd) = flood_then_stay_alive(5_000);
+        let slot = Emissions::new(ample(), ample());
+        let child = ChildSlot::default();
+        let _shutdown = child.guard();
+        let (tx, rx) = mpsc::channel();
+        spawn_live_tick(cmd, SourceId(0), child.clone(), slot, tx, Vec::new())
+            .expect("spawn worker");
+        std::thread::sleep(Duration::from_millis(800));
+        // Nobody has taken a body, so at most ONE wake may be queued.
+        let wakes = rx
+            .try_iter()
+            .filter(|e| matches!(e, TickEvent::Progress { .. }))
+            .count();
+        assert!(wakes <= 1, "{wakes} wakes queued behind one unread body");
+    }
+
+    #[test]
+    fn both_pipes_reach_the_slot_and_stay_apart() {
+        // Each pipe is captured and bounded separately, so they are two
+        // ROUTES: a fixture that only ever writes stdout leaves half the
+        // live path unexercised.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (out, err) = (dir.path().join("out"), dir.path().join("err"));
+        std::fs::write(&out, "to-stdout\n").expect("seed stdout");
+        std::fs::write(&err, "to-stderr\n").expect("seed stderr");
+        let mut cmd = follow_cmd(&out);
+        cmd.arg("--stderr-file").arg(&err);
+
+        let slot = Emissions::new(ample(), ample());
+        let child = ChildSlot::default();
+        let _shutdown = child.guard();
+        let (tx, _rx) = mpsc::channel();
+        spawn_live_tick(
+            cmd,
+            SourceId(0),
+            child.clone(),
+            slot.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+        let body = wait_for_body_where(&slot, Duration::from_secs(5), |body| {
+            !body.stdout.is_empty() && !body.stderr.is_empty()
+        });
+        assert_eq!(body.stdout, vec![b"to-stdout\n".to_vec()]);
+        assert_eq!(body.stderr, vec![b"to-stderr\n".to_vec()]);
+    }
+
+    #[test]
+    fn the_bound_still_applies_to_a_live_source() {
+        // A follower is the shape most likely to flood — never stopping
+        // is the whole point of it — so it is the last place to skip a
+        // bound.
+        let (_dir, cmd) = flood_then_stay_alive(100);
+        let slot = Emissions::new(
+            Retention {
+                max_lines: 10,
+                keep: Keep::Bottom,
+            },
+            ample(),
+        );
+        let child = ChildSlot::default();
+        let _shutdown = child.guard();
+        let (tx, _rx) = mpsc::channel();
+        spawn_live_tick(
+            cmd,
+            SourceId(0),
+            child.clone(),
+            slot.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+        let body = wait_for_body_where(&slot, Duration::from_secs(5), |body| body.dropped > 0);
+        assert!(
+            body.stdout.len() <= 10,
+            "the cap must hold on the live path too: {} lines",
+            body.stdout.len()
+        );
+        assert_eq!(
+            line_text(body.stdout.last().expect("a retained line")),
+            "99",
+            "keep-bottom retains the NEWEST, and a follower's newest is what a pane wants"
+        );
     }
 
     #[test]

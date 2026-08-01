@@ -166,5 +166,52 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
             }
             Ok(())
         }
+        #[cfg(debug_assertions)]
+        Command::Follow(args) => {
+            use std::io::{Read as _, Seek as _, Write};
+
+            /// Copy whatever has appeared past `offset` and advance it.
+            /// Returns false once the sink is gone, which is how this
+            /// child learns its reader closed the pipe.
+            fn pump(path: &std::path::Path, offset: &mut u64, mut sink: impl Write) -> bool {
+                let Ok(mut file) = std::fs::File::open(path) else {
+                    // A file that is not there yet is empty, not fatal:
+                    // a follower outlives the thing it follows.
+                    return true;
+                };
+                if file.seek(std::io::SeekFrom::Start(*offset)).is_err() {
+                    return true;
+                }
+                let mut buf = Vec::new();
+                let Ok(read) = file.read_to_end(&mut buf) else {
+                    return true;
+                };
+                if read == 0 {
+                    return true;
+                }
+                *offset += read as u64;
+                // Flushed per pump, never buffered: an unflushed fixture
+                // would reproduce the very pipeline-buffering trap these
+                // tests must not measure, and the delay would look like
+                // rat failing to follow.
+                sink.write_all(&buf).is_ok() && sink.flush().is_ok()
+            }
+
+            let (mut out_at, mut err_at) = (0u64, 0u64);
+            loop {
+                if !pump(&args.file, &mut out_at, std::io::stdout().lock()) {
+                    break;
+                }
+                if let Some(path) = &args.stderr_file
+                    && !pump(path, &mut err_at, std::io::stderr().lock())
+                {
+                    break;
+                }
+                // A poll rather than a filesystem watch: portable, and
+                // short enough that a test waiting seconds never notices.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(())
+        }
     }
 }
