@@ -18,28 +18,62 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// The harness ceiling **for the cycle tests**, kept here because it is
-/// INVISIBLE where test authors choose their timeouts: nextest
-/// terminates a test after `period x 2`, so any wait longer than that is
-/// unreachable by construction — the harness kills the test before the
-/// wait can expire, and a terminated test prints nothing. A generous
-/// number written past this line buys no tolerance for a slow runner; it
-/// only trades the failure's evidence for the appearance of patience.
+/// When nextest KILLS one of the cycle tests: `period x terminate-after`
+/// from the matching override in `.config/nextest.toml`, which is
+/// `60s x 2`. Recorded because it is INVISIBLE where test authors choose
+/// their timeouts — a wait longer than this is unreachable by
+/// construction, since the harness kills the test before the wait can
+/// expire and a terminated test prints nothing.
 ///
-/// 60s rather than the suite's general 20s because these two tests EARN
-/// their verdict — 50 trigger-driven respawns inside the detector's 30s
-/// window — so their cost tracks how fast the machine spawns processes.
-/// A `macos-latest` runner has already failed the file route at the 20s
-/// ceiling while its fifo sibling passed at 10.4s.
+/// **Both numbers, not just the period.** An earlier version of this
+/// constant held the period alone and its own doc said the kill lands at
+/// `period x 2`, which made the file self-contradictory about the one
+/// fact it exists to record.
+const HARNESS_KILL: Duration = Duration::from_secs(120);
+
+/// What a cycle test allows itself before giving up and REPORTING.
 ///
-/// **Change it only alongside the matching override in
-/// `.config/nextest.toml`**, whose filter is what actually grants the
-/// allowance. This constant only spends what that grants: raise it alone
-/// and every wait derived from it becomes unreachable again, silently.
-const HARNESS_CEILING: Duration = Duration::from_secs(60);
-/// What the ceiling owes to everything that is not the wait: the
-/// shutdown probe, the kill, the diagnostic dump, and slack.
-const HARNESS_RESERVE: Duration = Duration::from_secs(4);
+/// Deliberately far under [`HARNESS_KILL`], because those two numbers do
+/// different jobs: the kill is the harness losing patience with a wedged
+/// test and it prints nothing, while this is the test losing patience
+/// with the product and saying so with evidence in hand. The 60s of gap
+/// is what pays for the shutdown probe, the kill, and the diagnostic
+/// dump — which is why there is no separate reserve to subtract.
+///
+/// 60s rather than a share of the suite's general 20s ceiling because
+/// these two tests EARN their verdict — 50 trigger-driven respawns
+/// inside the detector's 30s window — so their cost tracks how fast the
+/// machine spawns processes. A `macos-latest` runner has already failed
+/// the file route at the old ceiling while its fifo sibling passed at
+/// 10.4s.
+///
+/// **Raising this alone buys nothing**: the override in
+/// `.config/nextest.toml` is what actually grants the allowance, and a
+/// budget past what it grants becomes unreachable again, silently.
+const REPORT_BUDGET: Duration = Duration::from_secs(60);
+
+/// The two constants above only mean something in relation to each
+/// other, so the relation is asserted rather than left to a comment.
+///
+/// This is the guard the previous version of this file did not have:
+/// a budget at or past the kill is silently unreachable — the harness
+/// terminates the test before the budget can expire, and a terminated
+/// test prints nothing, so the failure looks like a hang instead of a
+/// timeout. Raising `REPORT_BUDGET` without raising the `.config/nextest.toml`
+/// override fails HERE, loudly, instead of on a loaded runner months later.
+#[test]
+fn the_report_budget_leaves_the_harness_room_to_hear_it() {
+    assert!(
+        REPORT_BUDGET < HARNESS_KILL,
+        "a budget of {REPORT_BUDGET:?} cannot be spent under a {HARNESS_KILL:?} kill"
+    );
+    // Not merely under it: a report needs time to be written after the
+    // budget expires — the shutdown probe, the kill, the diagnostic dump.
+    assert!(
+        REPORT_BUDGET * 2 <= HARNESS_KILL,
+        "{REPORT_BUDGET:?} leaves too little of {HARNESS_KILL:?} to report in"
+    );
+}
 
 /// `wait_for`, returning the accumulated bytes once `needle` appears —
 /// for assertions that need to inspect text near the needle.
@@ -957,18 +991,19 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     // the frame, so seeing it means the frame's bytes are already in
     // hand — which lets one 8.5 s run assert both surfaces.
     //
-    // The wait is DERIVED from nextest's ceiling rather than chosen. A
-    // wait longer than the ceiling is unreachable by construction — the
-    // harness terminates the test first, and a terminated test prints
-    // nothing, so the generous-looking number buys no tolerance and
-    // costs the evidence. Subtracting what has already elapsed means a
-    // slow first paint eats its own margin instead of this wait's.
+    // The wait is DERIVED from `REPORT_BUDGET` rather than chosen — the
+    // budget this test spends before giving up and saying so, which sits
+    // far under `HARNESS_KILL` so the report has room to be written. A
+    // wait past the KILL would be unreachable by construction: the
+    // harness terminates the test first and a terminated test prints
+    // nothing, so a generous-looking number buys no tolerance and costs
+    // the evidence. Subtracting what has already elapsed means a slow
+    // first paint eats its own margin instead of this wait's.
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
         "a, b: trigger loop suspected:".as_bytes(),
-        HARNESS_CEILING
-            .saturating_sub(HARNESS_RESERVE)
+        REPORT_BUDGET
             .saturating_sub(started.elapsed())
             .max(Duration::from_secs(1)),
     );
@@ -1088,19 +1123,18 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     let (painted, first_paint, _) =
         wait_for_bytes_verbose(&session, &mut terminal, b"cycle-b", Duration::from_secs(5));
     let paint_at = started.elapsed().as_secs_f64();
-    // DIAGNOSTIC BOUND, not a budget. A wait past the harness ceiling can only
-    // ever be KILLED — and a terminated test prints nothing, which is why four
-    // failing CI runs produced no evidence. Derived from what is LEFT of the
-    // ceiling rather than fixed, so a slow first paint eats its own margin
-    // instead of the report's: every second the wait does not need is a second
-    // the wait gets.
+    // DIAGNOSTIC BOUND. A wait past `HARNESS_KILL` can only ever be KILLED —
+    // and a terminated test prints nothing, which is why four failing CI runs
+    // produced no evidence. Derived from what is LEFT of `REPORT_BUDGET`
+    // rather than fixed, so a slow first paint eats its own margin instead of
+    // the report's: every second the wait does not need is a second the wait
+    // gets.
     let (found, seen, chunks) = if painted {
         wait_for_bytes_verbose(
             &session,
             &mut terminal,
             "a, b: trigger loop suspected:".as_bytes(),
-            HARNESS_CEILING
-                .saturating_sub(HARNESS_RESERVE)
+            REPORT_BUDGET
                 .saturating_sub(started.elapsed())
                 .max(Duration::from_secs(1)),
         )
