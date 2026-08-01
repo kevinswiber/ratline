@@ -234,11 +234,17 @@ fn outcome_err(source: SourceId, err: std::io::Error) -> TickOutcome {
 /// Drain one pipe to EOF, retaining at most what the policy allows.
 ///
 /// **The loop always runs to EOF.** There is no early exit when the
-/// bound fills — the accumulator discards, the reader keeps reading. A
-/// reader that stopped would leave the pipe full and the child blocked
-/// in `write`, so the tick would never finish: that trades a process
-/// that grows, which is at least visible and diagnosable, for one that
-/// hangs, which is neither.
+/// bound fills — the accumulator discards, the reader keeps reading.
+///
+/// What an early exit actually costs was measured rather than reasoned
+/// about, and it is not the deadlock one would expect: this function
+/// takes the pipe by value and drops it on return, so the read end
+/// closes before anyone waits and the child dies of SIGPIPE in
+/// milliseconds. The damage is quieter than a hang and harder to
+/// notice — the drop count comes back ZERO while everything past the
+/// bound is lost, so the one number that makes a truncation visible
+/// would report nothing was truncated, and the child's exit stops
+/// being clean. See the proof in this module's tests.
 ///
 /// Each pipe gets its own accumulator, which is the shipped shape, so a
 /// source flooding both is bounded at twice the line count. Bounded is
