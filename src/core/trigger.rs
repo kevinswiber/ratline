@@ -1153,6 +1153,41 @@ impl LoopSuspicion {
                 merged.iter().map(|g| ids(g)).collect::<Vec<_>>(),
             );
         }
+        // Only a NEGATIVE answer can be undermined by ambiguity, so this runs
+        // AFTER the graph and only when the graph implicated nobody. A loop
+        // proven through another reader or a `file:` edge is an answer, and
+        // evidence missing elsewhere cannot unprove it — abstaining there
+        // would suppress a real report, which is the opposite failure and
+        // just as wrong. The placement is the finding, not a detail.
+        if implicated.is_empty() {
+            let undecidable = candidates.iter().any(|pane| {
+                pane.readers.iter().any(|key| {
+                    let arrivals = log.arrivals(key);
+                    // Non-empty is load-bearing: a pane with no arrivals at
+                    // all is not undecidable, it is simply quiet, and a quiet
+                    // dashboard must still be able to say "no loop".
+                    !arrivals.is_empty()
+                        && arrivals.iter().all(|a| {
+                            matches!(log.classify(&a.observation), TemporalCoverage::Ambiguous)
+                        })
+                })
+            });
+            if undecidable {
+                // A hole exactly where the graph needed an edge. Reporting an
+                // empty `panes` here would assert "there is no loop" on
+                // evidence that proved nothing — the same confident negative
+                // this plan exists to remove, reached by a different route.
+                return Verdict {
+                    panes: Vec::new(),
+                    ordered: None,
+                    abstained: true,
+                    why: why.map(|mut w| {
+                        w.push_str(" | c4 ABSTAIN (all reader evidence ambiguous)");
+                        w
+                    }),
+                };
+            }
+        }
         Verdict {
             ordered: (precise && !implicated.is_empty()).then(|| implicated.clone()),
             panes: implicated,
@@ -3007,6 +3042,183 @@ mod tests {
         log.evict(t0 + ms(500));
 
         assert_eq!(log.bracket_count(), 1);
+    }
+
+    // ── Ambiguity abstains (task 4.2) ───────────────────────────────────
+
+    #[test]
+    fn a_pane_whose_reader_evidence_is_all_ambiguous_abstains() {
+        // The honest form of the shipped defect's symptom. Conditions 1 and
+        // 2 pass, but the one trigger that could produce an edge carries
+        // nothing classifiable — so the graph has a hole and the answer is
+        // unknown, not "no".
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(5), Vec::new());
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(3)),
+                observed_at: t0 + ms(7),
+            },
+        );
+        for _ in 0..60 {
+            log.record_respawn(SourceId(0), t0);
+        }
+
+        let panes = [PaneWindow {
+            source: SourceId(0),
+            trigger_respawns: 60,
+            watched: &[],
+            readers: std::slice::from_ref(&key),
+        }];
+        let v = LoopSuspicion::default().evaluate(t0 + ms(8), &empty_ledger(), &log, &panes);
+        assert!(v.abstained, "an undecidable graph must say so");
+        assert!(v.panes.is_empty(), "abstaining accuses nobody");
+    }
+
+    #[test]
+    fn ambiguity_that_does_not_decide_anything_does_not_abstain() {
+        // A dashboard will always carry SOME ambiguous observation.
+        // Abstaining on any of them would make the detector permanently
+        // silent — the opposite failure, and just as useless.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(10), Vec::new());
+        let key = TriggerKey("fifo:/tmp/a".into());
+        // One classifiable observation…
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(2)),
+                observed_at: t0 + ms(8),
+            },
+        );
+        // …and one that proves nothing.
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: None,
+                observed_at: t0 + ms(9),
+            },
+        );
+        for _ in 0..60 {
+            log.record_respawn(SourceId(0), t0);
+        }
+
+        let panes = [PaneWindow {
+            source: SourceId(0),
+            trigger_respawns: 60,
+            watched: &[],
+            readers: std::slice::from_ref(&key),
+        }];
+        let v = LoopSuspicion::default().evaluate(t0 + ms(11), &empty_ledger(), &log, &panes);
+        assert!(!v.abstained, "usable evidence exists; the answer stands");
+    }
+
+    #[test]
+    fn a_proven_loop_is_not_suppressed_by_ambiguity_elsewhere() {
+        // THE PLACEMENT TEST. A cycle proven through one reader must survive
+        // an unrelated reader carrying only ambiguous evidence — checking
+        // before the graph would throw the proven answer away.
+        //
+        // Pane 0 and pane 1 each watch the other's fifo and each write
+        // covered observations, which is a two-node cycle. Pane 2 is a
+        // candidate too, and its reader carries nothing classifiable.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let a = log.open_bracket(SourceId(0), t0, Vec::new());
+        log.close_bracket(a, t0 + ms(10), Vec::new());
+        let b = log.open_bracket(SourceId(1), t0 + ms(12), Vec::new());
+        log.close_bracket(b, t0 + ms(22), Vec::new());
+        // Pane 1 watches this: written while pane 0 ran.
+        let watched_by_1 = TriggerKey("fifo:/tmp/one".into());
+        log.observe_arrival(
+            watched_by_1.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(2)),
+                observed_at: t0 + ms(8),
+            },
+        );
+        // Pane 0 watches this: written while pane 1 ran.
+        let watched_by_0 = TriggerKey("fifo:/tmp/zero".into());
+        log.observe_arrival(
+            watched_by_0.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(14)),
+                observed_at: t0 + ms(20),
+            },
+        );
+        // And an unrelated pane whose evidence proves nothing.
+        let muddy = TriggerKey("fifo:/tmp/muddy".into());
+        log.observe_arrival(
+            muddy.clone(),
+            Observation {
+                empty_since: None,
+                observed_at: t0 + ms(21),
+            },
+        );
+        for _ in 0..60 {
+            log.record_respawn(SourceId(0), t0);
+            log.record_respawn(SourceId(1), t0);
+            log.record_respawn(SourceId(2), t0);
+        }
+
+        let panes = [
+            PaneWindow {
+                source: SourceId(0),
+                trigger_respawns: 60,
+                watched: &[],
+                readers: std::slice::from_ref(&watched_by_0),
+            },
+            PaneWindow {
+                source: SourceId(1),
+                trigger_respawns: 60,
+                watched: &[],
+                readers: std::slice::from_ref(&watched_by_1),
+            },
+            PaneWindow {
+                source: SourceId(2),
+                trigger_respawns: 60,
+                watched: &[],
+                readers: std::slice::from_ref(&muddy),
+            },
+        ];
+        let v = LoopSuspicion::default().evaluate(t0 + ms(23), &empty_ledger(), &log, &panes);
+        assert!(
+            !v.panes.is_empty(),
+            "the proven loop must still be reported"
+        );
+        assert!(!v.abstained, "a proven loop is an answer");
+    }
+
+    #[test]
+    fn a_pane_that_is_not_a_candidate_cannot_force_abstention() {
+        // A pane below the respawn threshold is not part of the answer, so
+        // its evidence quality cannot make the whole dashboard undecidable.
+        // Without this, one idle fifo pane would silence the detector
+        // forever.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let key = TriggerKey("fifo:/tmp/a".into());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: None,
+                observed_at: t0 + ms(1),
+            },
+        );
+        let panes = [PaneWindow {
+            source: SourceId(0),
+            trigger_respawns: 1, // far below min_respawns
+            watched: &[],
+            readers: std::slice::from_ref(&key),
+        }];
+        let v = LoopSuspicion::default().evaluate(t0 + ms(2), &empty_ledger(), &log, &panes);
+        assert!(!v.abstained);
     }
 
     // The boundary of the claim. Both of these assert a MISCLASSIFICATION as
