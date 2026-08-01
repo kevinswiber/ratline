@@ -563,9 +563,12 @@ impl WindowLog {
             return TemporalCoverage::Ambiguous;
         };
         let to = observation.observed_at;
+        /// A bracket's reach over this interval: when it opened, when it
+        /// closed (`None` while the child is still running, which covers
+        /// indefinitely), and what it would contribute if it covers.
         type Span = (
             std::time::Instant,
-            std::time::Instant,
+            Option<std::time::Instant>,
             SourceId,
             Option<std::time::Duration>,
         );
@@ -593,7 +596,6 @@ impl WindowLog {
             .filter(|(open, closed, _, _)| closed.is_none_or(|close| close > from) && *open <= to)
             // Past the filter an open bracket covers through the end of the
             // interval, which is all the walk below needs of it.
-            .map(|(open, closed, source, width)| (open, closed.unwrap_or(to), source, width))
             .collect();
         if spans.is_empty() {
             // Nothing COVERS the interval — but disjointness is a claim in its
@@ -625,19 +627,37 @@ impl WindowLog {
         // Contributors are NOT deduplicated by source: two brackets of one
         // source can both contribute, and `median_width` takes a median over
         // exactly that kind of list. Deduplicating would discard a sample.
-        let mut covered_to = from;
+        //
+        // `frontier` is how far coverage reaches; `unbounded` means an OPEN
+        // bracket has taken it past every finite instant, so nothing after it
+        // can leave a gap.
+        let mut frontier = from;
+        let mut unbounded = false;
         let mut contributors: Vec<(SourceId, Option<std::time::Duration>)> = Vec::new();
-        for (open, close, source, width) in spans {
-            if open > covered_to {
+        for (open, closed, source, width) in spans {
+            if !unbounded && open > frontier {
                 return TemporalCoverage::Ambiguous; // an idle gap inside the window
             }
-            if close > covered_to {
-                covered_to = close;
+            match closed {
+                None => unbounded = true,
+                Some(close) if close > frontier => frontier = close,
+                Some(_) => {}
             }
             contributors.push((source, width));
         }
-        if covered_to < to {
-            return TemporalCoverage::Ambiguous; // idle at the end of the window
+        // STRICT at the end, for the same reason the veto is strict at the
+        // start. A bracket that closed at exactly `to` reaches the interval's
+        // last instant and no further — and at a 64% clock-collision rate,
+        // `closed == observed_at` frequently means the close and the read are
+        // one sample whose true order is unknown. The close may really have
+        // preceded the write, putting it outside. That is a tie, and a tie is
+        // not a proof of coverage any more than it is a proof of disjointness.
+        //
+        // The asymmetry is deliberate and is the whole design: to CREDIT,
+        // coverage must be proved past the end; to VETO, separation must be
+        // proved; everything else is `Ambiguous`.
+        if !unbounded && frontier <= to {
+            return TemporalCoverage::Ambiguous; // idle, or a tie, at the end
         }
         TemporalCoverage::Covered(contributors)
     }
@@ -3083,6 +3103,38 @@ mod tests {
                 observed_at: t,
             }),
             TemporalCoverage::Covered(vec![(SourceId(1), None)])
+        );
+    }
+
+    #[test]
+    fn a_bracket_closing_exactly_at_the_read_does_not_prove_coverage() {
+        // The mirror of the veto-side tie, on the CREDIT side. A bracket that
+        // closed at exactly `observed_at` reaches the interval's last instant
+        // and no further — and at a 64% collision rate, `closed ==
+        // observed_at` frequently means the close and the read are one clock
+        // sample whose true order is unknown. The close may really have
+        // preceded the write, putting it outside the bracket.
+        //
+        // To credit, coverage must be proved PAST the end. A tie is not a
+        // proof of coverage any more than it is a proof of disjointness.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(8), Vec::new());
+        assert_eq!(
+            log.classify(&Observation {
+                empty_since: Some(t0 + ms(2)),
+                observed_at: t0 + ms(8), // exactly the close
+            }),
+            TemporalCoverage::Ambiguous
+        );
+        // One nanosecond of daylight and it is a proof again.
+        assert_eq!(
+            log.classify(&Observation {
+                empty_since: Some(t0 + ms(2)),
+                observed_at: t0 + ms(8) - Duration::from_nanos(1),
+            }),
+            TemporalCoverage::Covered(vec![(SourceId(1), Some(ms(8)))])
         );
     }
 
