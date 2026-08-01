@@ -149,6 +149,49 @@ impl LineCap {
         (self.retained.into(), self.dropped)
     }
 
+    // STAGED: the live source that reads these lands in task 1.2, and a
+    // bin crate under `-D warnings` refuses a method nothing calls. The
+    // allow comes off with that task; it is not a permanent exemption.
+    // (Plan 0013's precedent for exactly this shape.)
+    /// The retained lines and the drop count, WITHOUT consuming.
+    ///
+    /// `finish()` stays consuming and is still the batch path's only
+    /// exit: it was made so on purpose, since a caller that could take
+    /// the lines twice could get two different answers. Nothing here
+    /// relaxes that — a live source reads repeatedly precisely because
+    /// its child has not finished.
+    ///
+    /// **The in-progress line is excluded, and that is the difference
+    /// that matters.** `finish()` flushes it because the child is gone
+    /// and no terminator is ever coming. A live child's partial line is
+    /// mid-write, and a snapshot including it would paint half a line
+    /// that changes under the reader on the next chunk.
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> (Vec<Vec<u8>>, usize) {
+        (self.retained.iter().cloned().collect(), self.dropped)
+    }
+
+    /// How many lines are retained, without cloning any of them.
+    ///
+    /// The live worker asks this on every read to decide whether
+    /// anything a reader could see has changed; asking `snapshot()`
+    /// instead would clone the whole retained set per chunk to answer a
+    /// question about its length.
+    #[allow(dead_code)]
+    pub fn retained_len(&self) -> usize {
+        self.retained.len()
+    }
+
+    /// How many lines the bound has discarded, without cloning.
+    ///
+    /// Paired with `retained_len` because a body can change by DROPPING
+    /// alone: a full cap that evicts one line and gains one has the same
+    /// length and different content.
+    #[allow(dead_code)]
+    pub fn dropped_count(&self) -> usize {
+        self.dropped
+    }
+
     /// Add bytes to the line in progress. `bytes` never holds a `\n`.
     ///
     /// This is the one place that decides a line is over: past the
@@ -439,5 +482,62 @@ mod tests {
         let mut cap = LineCap::new(0, Keep::Bottom);
         cap.feed(b"a\nb\n");
         assert_eq!(cap.finish(), (Vec::<Vec<u8>>::new(), 2));
+    }
+
+    #[test]
+    fn a_snapshot_reads_the_retained_set_without_consuming_it() {
+        // The live path's whole reason for existing: read now, keep reading.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"a\nb\n");
+        assert_eq!(cap.snapshot(), (vec![b"a\n".to_vec(), b"b\n".to_vec()], 0));
+        // Again, unchanged — a snapshot is not a take.
+        assert_eq!(cap.snapshot(), (vec![b"a\n".to_vec(), b"b\n".to_vec()], 0));
+        // And feeding continues from where it was.
+        cap.feed(b"c\n");
+        assert_eq!(cap.snapshot().0.len(), 3);
+    }
+
+    #[test]
+    fn a_snapshot_respects_the_bound_and_reports_the_same_drop_count() {
+        let mut cap = LineCap::new(2, Keep::Bottom);
+        cap.feed(b"1\n2\n3\n4\n");
+        assert_eq!(cap.snapshot(), (vec![b"3\n".to_vec(), b"4\n".to_vec()], 2));
+    }
+
+    #[test]
+    fn a_snapshot_excludes_the_unterminated_line_that_finish_would_flush() {
+        // THE ONE ASYMMETRY, and it is deliberate. `finish()` flushes a
+        // trailing line the child never terminated because the child is
+        // gone and that is all there will ever be. A live child's partial
+        // line is not finished — it is mid-write — and showing it would
+        // paint half a line that changes under the reader.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"a\nb");
+        assert_eq!(cap.snapshot(), (vec![b"a\n".to_vec()], 0));
+        // finish() still flushes it, exactly as it does today.
+        assert_eq!(cap.finish(), (vec![b"a\n".to_vec(), b"b".to_vec()], 0));
+    }
+
+    #[test]
+    fn a_snapshot_sees_a_line_only_once_its_terminator_arrives() {
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"par");
+        assert_eq!(cap.snapshot().0, Vec::<Vec<u8>>::new());
+        cap.feed(b"tial\n");
+        assert_eq!(cap.snapshot().0, vec![b"partial\n".to_vec()]);
+    }
+
+    #[test]
+    fn the_cheap_accessors_agree_with_the_snapshot() {
+        // The live worker asks "did anything a reader could see change?"
+        // on EVERY chunk. Answering that by taking a snapshot would clone
+        // the whole retained set per read, so these two exist to answer it
+        // for free — and they must never disagree with what they stand in
+        // for.
+        let mut cap = LineCap::new(2, Keep::Bottom);
+        cap.feed(b"1\n2\n3\n");
+        let (lines, dropped) = cap.snapshot();
+        assert_eq!(cap.retained_len(), lines.len());
+        assert_eq!(cap.dropped_count(), dropped);
     }
 }
