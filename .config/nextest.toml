@@ -32,3 +32,29 @@ slow-timeout = { period = "10s", terminate-after = 2 }
 [[profile.default.overrides]]
 filter = 'test(/^core::trigger::matrix::/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
+
+# The two cycle tests earn their verdict rather than assert it: the badge
+# needs 50 trigger-driven respawns inside the detector's 30s window, and
+# every hop of the cycle costs a debounce interval and a shell spawn. So
+# their cost is not a constant — it tracks how fast the machine can spawn
+# processes, and a runner three times slower takes three times as long to
+# reach a threshold that has not moved.
+#
+# Measured: 8.1s and 5.9s idle on one macOS machine. On a loaded
+# `macos-latest` runner the fifo route took 10.4s and the file route
+# FAILED after consuming a ~15s wait — right at the edge of the general
+# 20s ceiling, which is the same coin flip the matrix sweep above was
+# losing.
+#
+# Shrinking the work is not available here, unlike the last flake of this
+# shape. The threshold and the window belong to the shipped detector, and
+# the 100ms debounce these tests declare is already the widest margin
+# that satisfies both axes at once — faster starves the rate, slower
+# misses the window.
+#
+# `HARNESS_CEILING` in tests/pty_dashboard.rs MUST match the period here:
+# both tests derive their internal wait from it, and a wait longer than
+# the ceiling is unreachable by construction.
+[[profile.default.overrides]]
+filter = 'binary(pty_dashboard) and test(/cycle/)'
+slow-timeout = { period = "60s", terminate-after = 2 }
