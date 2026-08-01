@@ -1255,24 +1255,41 @@ impl LoopSuspicion {
         watches_something && files_closed && readers_closed
     }
 
-    /// A reader route's arrivals, in the shape the credit rule takes. An
-    /// arrival whose covering bracket is still open is DEFERRED — it resolves
-    /// once that bracket closes — rather than credited with a provisional
-    /// width.
+    /// A reader route's arrivals, in the shape the credit rule takes — **all
+    /// of them, one change each**, whatever they prove.
+    ///
+    /// An arrival whose covering bracket is still open is DEFERRED from the
+    /// tightness stage, because `median_width` skips a `None` width and
+    /// yields nothing when none resolves. It still counts for coverage,
+    /// which asks only who was in flight.
     fn arrival_changes(log: &WindowLog, key: &TriggerKey) -> Vec<Change> {
         log.arrivals(key)
             .iter()
-            .filter_map(|arrival| match log.classify(&arrival.observation) {
+            .map(|arrival| match log.classify(&arrival.observation) {
                 // The other half of the inference: coverage in time, read as
                 // the endogenous credit. The contributors ARE
                 // `Change::containing`'s shape, so there is no second width
                 // resolution that could disagree with the first — which is
                 // what lets a UNION of brackets credit a source no single
                 // bracket could have supplied a width for.
-                TemporalCoverage::Covered(contributors) => Some(Change {
+                TemporalCoverage::Covered(contributors) => Change {
                     containing: contributors,
-                }),
-                TemporalCoverage::Disjoint | TemporalCoverage::Ambiguous => None,
+                },
+                // EVERY arrival is one change, including the ones that credit
+                // nobody. `credit`'s eligibility stage is
+                // `covered * 2 > changes.len()`, so this list is its
+                // DENOMINATOR — and an observation dropped here would not
+                // merely fail to support a source, it would stop counting
+                // AGAINST one. A source covered by 1 arrival out of 10 would
+                // read 1/1 rather than 1/10 and sail through a test whose
+                // entire job is to require dominance.
+                //
+                // An empty `containing` is exactly what the polled route
+                // records for a change no bracket covered, so both routes now
+                // hand the same shape to the same rule.
+                TemporalCoverage::Disjoint | TemporalCoverage::Ambiguous => Change {
+                    containing: Vec::new(),
+                },
             })
             .collect()
     }
@@ -2725,12 +2742,33 @@ mod tests {
         let t0 = Instant::now();
         let key = TriggerKey("fifo:/tmp/a".into());
         log.open_bracket(SourceId(0), t0, Vec::new()); // never closed
-        log.observe_arrival(key.clone(), at(t0 + ms(3)));
+        // A real interval, not `at()`: an OPEN bracket ends at the interval's
+        // own upper bound, so a zero-width interval can never be covered by
+        // one. A reader cannot produce a zero-width interval — its two
+        // stamps are separate `Instant::now()` calls — so this is a property
+        // of the helper, not of the classifier.
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(1)),
+                observed_at: t0 + ms(3),
+            },
+        );
 
         let changes = LoopSuspicion::arrival_changes(&log, &key);
+        // Deferred means "not CREDITED yet", not "not observed". It counts
+        // for coverage — the child really was in flight — and `median_width`
+        // withholds it from the tightness stage until the bracket closes, so
+        // nothing is credited on an elapsed-so-far width.
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].containing,
+            vec![(SourceId(0), None)],
+            "covered, with no width claimed yet"
+        );
         assert!(
-            changes.is_empty(),
-            "an unresolved arrival contributes no credit input"
+            credit(&changes).is_empty(),
+            "an unresolved width defers the credit"
         );
     }
 
@@ -2865,6 +2903,12 @@ mod tests {
     /// because touching an endpoint is not coverage. So `at(t)` against a
     /// bracket that opens exactly at `t` reads `Disjoint`, where the old
     /// code read it as contained. Put the instant strictly inside.
+    ///
+    /// It is also never covered by an **open** bracket, whose end is taken as
+    /// the interval's own upper bound — so `close > from` is `t > t`. Use a
+    /// real interval whenever an open bracket is involved. A reader cannot
+    /// produce a zero-width interval anyway: its two bounds are separate
+    /// `Instant::now()` calls.
     fn at(t: Instant) -> Observation {
         Observation {
             empty_since: Some(t),
@@ -2971,7 +3015,57 @@ mod tests {
                 observed_at: t0 + ms(7),
             },
         );
-        assert!(LoopSuspicion::arrival_changes(&log, &key).is_empty());
+        // The claim is about the EDGE, not about the list: an ambiguous
+        // arrival is still one change, because it still counts against a
+        // source's dominance. It just credits nobody.
+        let changes = LoopSuspicion::arrival_changes(&log, &key);
+        assert_eq!(changes.len(), 1, "it is still an observation");
+        assert!(changes[0].containing.is_empty(), "and it covers no source");
+        assert!(credit(&changes).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_arrivals_still_count_against_a_sources_dominance() {
+        // The eligibility stage is `covered * 2 > changes.len()`, so the
+        // change list is a DENOMINATOR. Dropping the arrivals that credit
+        // nobody would not merely fail to support a source — it would stop
+        // counting against one, and a source covering 1 arrival in 10 would
+        // read 1/1 instead of 1/10.
+        //
+        // That is a manufactured self-edge: exactly the false positive the
+        // majority rule exists to prevent, reached by deleting its
+        // denominator.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let key = TriggerKey("fifo:/tmp/a".into());
+
+        // One arrival this source genuinely covers…
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        log.close_bracket(id, t0 + ms(10), Vec::new());
+        log.observe_arrival(
+            key.clone(),
+            Observation {
+                empty_since: Some(t0 + ms(2)),
+                observed_at: t0 + ms(8),
+            },
+        );
+        // …and nine that prove nothing, straddling that bracket's close.
+        for n in 0..9 {
+            log.observe_arrival(
+                key.clone(),
+                Observation {
+                    empty_since: Some(t0 + ms(9)),
+                    observed_at: t0 + ms(11 + n),
+                },
+            );
+        }
+
+        let changes = LoopSuspicion::arrival_changes(&log, &key);
+        assert_eq!(changes.len(), 10, "all ten arrivals are in the denominator");
+        assert!(
+            credit(&changes).is_empty(),
+            "1 of 10 is not dominance, and must not be credited"
+        );
     }
 
     #[test]
