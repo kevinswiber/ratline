@@ -147,11 +147,23 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
             use std::io::Write;
 
             use anyhow::Context as _;
-            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-            for i in 0..args.count {
-                writeln!(out, "{i}").context("writing")?;
+            fn flood(mut out: impl Write, count: usize) -> anyhow::Result<()> {
+                for i in 0..count {
+                    writeln!(out, "{i}").context("writing")?;
+                }
+                out.flush().context("flushing")
             }
-            out.flush().context("flushing")?;
+            if args.stderr {
+                flood(
+                    std::io::BufWriter::new(std::io::stderr().lock()),
+                    args.count,
+                )?;
+            } else {
+                flood(
+                    std::io::BufWriter::new(std::io::stdout().lock()),
+                    args.count,
+                )?;
+            }
             Ok(())
         }
     }

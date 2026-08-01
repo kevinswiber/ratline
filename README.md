@@ -626,6 +626,14 @@ Exit codes everywhere: `0` success, `1` no selection / negative / error,
 `2` usage error, `124` timeout (`--timeout 30s`), `130` ctrl-c, and
 `rat spin` forwards the child's code.
 
+`rat spin` holds its child's output so it can replay it after the
+spinner stops, and that is bounded too: **the newest 10,000 lines of
+each stream**. Ten times what a watch pane keeps, because spin prints
+what it kept rather than rendering a window over it — enough for a full
+build log, and still a ceiling for a command that never stops. When it
+does drop something it says so on stderr, never in the output you are
+piping: `rat: 2.0k lines dropped from stdout — kept the newest 10000`.
+
 ## A complete dashboard
 
 ```sh
