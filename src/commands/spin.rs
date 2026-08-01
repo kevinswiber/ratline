@@ -20,9 +20,20 @@ use crate::theme::Palette;
 /// REPLAYS what it kept as the command's answer, and a line it drops is
 /// a line the user asked for and does not get. Ten thousand covers a
 /// full build or test log without truncating anything anyone would call
-/// output, costs a couple of MiB at worst, and still bounds a child
-/// that never stops — which is the whole point, since an unbounded
-/// drain reached 4.4 GiB in 1.8 s against `yes`.
+/// output, and still bounds a child that never stops — which is the
+/// whole point, since an unbounded drain reached 4.4 GiB in 1.8 s
+/// against `yes`.
+///
+/// **What this actually costs, stated honestly, because a line count is
+/// not a byte budget.** Ordinary output runs about 1 MiB: terminal lines
+/// average well under 100 bytes. The WORST case is far larger — a line
+/// is dropped only past `retain::MAX_LINE_BYTES` (64 KiB), so a child emitting
+/// ten thousand lines of that size retains **625 MiB per stream, 1.22
+/// GiB across both**. Reaching it takes 625 MB of uniformly enormous
+/// lines, which is pathological rather than merely large, and the same
+/// input consumed unbounded memory before this bound existed. But it is
+/// a ceiling of that height, not the couple of MiB the typical case
+/// suggests, and anyone raising `max_lines` is multiplying that number.
 ///
 /// The tail survives. The dominant use is `--show-error`, and why a
 /// command failed is usually the last thing it said. This costs the

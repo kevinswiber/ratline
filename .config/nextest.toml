@@ -52,9 +52,12 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # that satisfies both axes at once — faster starves the rate, slower
 # misses the window.
 #
-# `HARNESS_CEILING` in tests/pty_dashboard.rs MUST match the period here:
-# both tests derive their internal wait from it, and a wait longer than
-# the ceiling is unreachable by construction.
+# `HARNESS_KILL` in tests/pty_dashboard.rs records `period x
+# terminate-after` from this block — 120s, NOT the 60s period — because
+# that product is when a test is actually killed. Both tests spend a
+# `REPORT_BUDGET` well under it so a failure prints instead of being
+# terminated, and a test in that file asserts the two stay in that
+# relation.
 [[profile.default.overrides]]
 filter = 'binary(pty_dashboard) and test(/cycle/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
