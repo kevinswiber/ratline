@@ -596,7 +596,29 @@ impl WindowLog {
             .map(|(open, closed, source, width)| (open, closed.unwrap_or(to), source, width))
             .collect();
         if spans.is_empty() {
-            return TemporalCoverage::Disjoint;
+            // Nothing COVERS the interval — but disjointness is a claim in its
+            // own right and has to be proved, because it is the one value that
+            // vetoes. A bracket that merely TOUCHES the interval at an
+            // endpoint is not coverage, and it is not disjointness either: it
+            // is a tie, and a tie proves nothing.
+            //
+            // The case that forces this is `closed == from == to`, which the
+            // same 64% clock collision makes ordinary — the child's bracket
+            // closes, the reader proves the descriptor empty, and the reader
+            // reads, all reporting one `Instant`. Whether the write fell
+            // before or after that close is exactly what cannot be known, so
+            // the honest answer is `Ambiguous`. Calling it `Disjoint` would
+            // veto the pane on evidence that proves nothing — which is the
+            // defect this whole type exists to remove.
+            let touching = self
+                .brackets
+                .iter()
+                .any(|b| b.closed.is_none_or(|close| close >= from) && b.opened <= to);
+            return if touching {
+                TemporalCoverage::Ambiguous
+            } else {
+                TemporalCoverage::Disjoint
+            };
         }
         spans.sort_by_key(|(open, _, _, _)| *open);
 
@@ -3061,6 +3083,30 @@ mod tests {
                 observed_at: t,
             }),
             TemporalCoverage::Covered(vec![(SourceId(1), None)])
+        );
+    }
+
+    #[test]
+    fn an_interval_that_only_touches_a_bracket_edge_is_ambiguous_not_disjoint() {
+        // `closed == from == to` — one clock value for the child's close, the
+        // reader's proof of emptiness, and the reader's read. The same 64%
+        // collision rate makes this ordinary, not exotic.
+        //
+        // Whether the write fell before or after that close is precisely what
+        // cannot be known. Disjointness is the one value that VETOES, so it
+        // has to be proved; a tie at the boundary is not a proof, and calling
+        // it `Disjoint` would veto the pane on evidence that proves nothing.
+        let mut log = WindowLog::new(secs(30));
+        let t0 = Instant::now();
+        let id = log.open_bracket(SourceId(1), t0, Vec::new());
+        let closed_at = t0 + ms(5);
+        log.close_bracket(id, closed_at, Vec::new());
+        assert_eq!(
+            log.classify(&Observation {
+                empty_since: Some(closed_at),
+                observed_at: closed_at,
+            }),
+            TemporalCoverage::Ambiguous
         );
     }
 
