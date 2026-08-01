@@ -209,6 +209,113 @@ fn a_resize_reaches_the_panes_that_were_not_due() {
     );
 }
 
+// ── Diagnostic scaffolding for the Linux wedge ─────────────────────────
+//
+// `a_fifo_cycle_earns_its_badge_and_its_notice_too` dies on ubuntu at the
+// harness's 20 s ceiling, and a TERMINATED test prints nothing: its pty
+// buffer is a local that never reaches stdout. Four CI runs have produced
+// no evidence at all for that reason. Everything below exists to turn that
+// silence into a report, and none of it is shipping shape.
+
+/// `wait_for_bytes` that hands back what it saw even when the needle never
+/// arrives, with the arrival time of every chunk. The shipped helper drops
+/// both on timeout, which is the whole reason the failure is unexplained.
+fn wait_for_bytes_verbose(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needle: &[u8],
+    timeout: Duration,
+) -> (bool, Vec<u8>, Vec<(f64, usize)>) {
+    let start = std::time::Instant::now();
+    let deadline = start + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    let mut chunks: Vec<(f64, usize)> = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return (false, seen, chunks);
+        }
+        let chunk = session.read_available((deadline - now).min(Duration::from_millis(50)));
+        if chunk.is_empty() {
+            continue;
+        }
+        terminal.respond(session, &chunk);
+        seen.extend_from_slice(&chunk);
+        chunks.push((start.elapsed().as_secs_f64(), chunk.len()));
+        if contains(&seen, needle) {
+            return (true, seen, chunks);
+        }
+    }
+}
+
+/// The words a pty carried, with the escape sequences taken out. Positions
+/// are lost and that is fine: the questions this has to answer are whether
+/// the badge, the notice and the pane bodies ever appeared at all.
+fn visible(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            i += 1;
+            match bytes.get(i) {
+                // CSI: parameters, then one final byte in @..~.
+                Some(b'[') => {
+                    i += 1;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // OSC: runs to BEL or ST.
+                Some(b']') => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != 0x07 {
+                        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                            i += 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                // Anything else two-byte.
+                _ => i += 1,
+            }
+            out.push(' ');
+            continue;
+        }
+        if b == b'\n' || b == b'\r' {
+            out.push('\n');
+        } else if (0x20..0x7f).contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push('.');
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Bytes per whole second, so "output stopped at t=1.2" and "output kept
+/// flowing to the deadline" are told apart at a glance.
+fn per_second(chunks: &[(f64, usize)]) -> String {
+    let mut buckets: Vec<usize> = Vec::new();
+    for (at, len) in chunks {
+        let s = *at as usize;
+        if buckets.len() <= s {
+            buckets.resize(s + 1, 0);
+        }
+        buckets[s] += len;
+    }
+    buckets
+        .iter()
+        .enumerate()
+        .map(|(s, n)| format!("{s}s:{n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `wait_for_bytes`, but panicking the moment `forbidden` shows up in
 /// the accumulated output. Duplicated from the watch suite's local
 /// helper, never lifted.
@@ -893,22 +1000,76 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     }
     let decl = write_dashboard(dir.path(), &fifo_cycle_board(&fa, &fb));
 
-    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
-        .expect("spawn rat dashboard under a pty");
+    // DIAGNOSTIC: where the suspicion test writes what it decided, and why.
+    let trace = dir.path().join("trigger-trace.log");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_TRIGGER_TRACE", &trace.display().to_string())],
+    )
+    .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
-    assert!(
-        wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5)),
-        "the first composition never painted"
-    );
-    let seen = wait_for_bytes(
-        &session,
-        &mut terminal,
-        "a, b: trigger loop suspected:".as_bytes(),
-        Duration::from_secs(40),
-    );
+    let started = std::time::Instant::now();
+    let painted = wait_for(&session, &mut terminal, b"cycle-b", Duration::from_secs(5));
+    let paint_at = started.elapsed().as_secs_f64();
+    // DIAGNOSTIC BOUND, not a budget. The shipped wait is 40 s under nextest's
+    // 20 s ceiling, so this test can only ever be KILLED — and a terminated
+    // test prints nothing, which is why four failing CI runs produced no
+    // evidence. Derived from what is LEFT of the ceiling rather than fixed, so
+    // a slow first paint eats its own margin instead of the report's: every
+    // second the wait does not need is a second the wait gets.
+    const CEILING: Duration = Duration::from_secs(20);
+    const RESERVE: Duration = Duration::from_secs(3); // kill, dump, and slack
+    let (found, seen, chunks) = if painted {
+        wait_for_bytes_verbose(
+            &session,
+            &mut terminal,
+            "a, b: trigger loop suspected:".as_bytes(),
+            CEILING
+                .saturating_sub(RESERVE)
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_secs(1)),
+        )
+    } else {
+        (false, Vec::new(), Vec::new())
+    };
     session.write_bytes(b"q");
-    session.kill_if_alive(Duration::from_secs(5));
-    let seen = seen.expect("the fifo cycle never earned its report");
+    // A short kill deadline on purpose: the shipped 5 s is affordable only
+    // when the wait before it succeeded.
+    session.kill_if_alive(Duration::from_millis(300));
+    if !found {
+        let text = visible(&seen);
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(1200)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        println!("=== WEDGE REPORT ===");
+        println!("first paint: {painted} at {paint_at:.3}s");
+        println!("bytes seen after first paint: {}", seen.len());
+        println!("last chunk at: {:?}", chunks.last().map(|(at, _)| *at));
+        println!("bytes per second: {}", per_second(&chunks));
+        println!(
+            "notice text present at all: {}",
+            contains(&seen, b"trigger loop suspected")
+        );
+        println!(
+            "badge present at all: {}",
+            contains(&seen, "· looping".as_bytes())
+        );
+        println!("--- visible tail ---\n{tail}");
+        println!("--- trigger trace ---");
+        match std::fs::read_to_string(&trace) {
+            Ok(t) => println!("{t}"),
+            Err(e) => println!("(no trace: {e})"),
+        }
+        println!("=== END WEDGE REPORT ===");
+    }
+    assert!(painted, "the first composition never painted");
+    assert!(found, "the fifo cycle never earned its report");
     assert!(
         contains(&seen, "· looping".as_bytes()),
         "the badge never reached a chrome row: {:?}",
