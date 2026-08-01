@@ -220,10 +220,12 @@ pub struct Bracket {
 
 /// One observed change to one watched path.
 pub struct Change {
-    /// Every child that could have written it, with its width where that
-    /// is known yet. EMPTY means no child was in flight — which is what
-    /// makes the change EXOGENOUS, and one exogenous observation is what
-    /// clears suspicion.
+    /// Every child that was IN FLIGHT across it, with its width where that
+    /// is known yet. EMPTY means none was — which is what the exogenous veto
+    /// reads, and one such observation is what clears suspicion.
+    ///
+    /// In flight, not proven to have written it: a child that overlapped a
+    /// change is a candidate producer and nothing stronger.
     ///
     /// A `None` width means that child was still RUNNING when this was
     /// read. It counts for coverage, which asks only who was in flight,
@@ -246,8 +248,8 @@ pub struct PathLedger {
     changes: std::collections::HashMap<std::path::PathBuf, Vec<Observed>>,
 }
 
-/// One observation as the ledger holds it: when, and who could have written
-/// it BY BRACKET ID. Widths are deliberately not stored — a covering child
+/// One observation as the ledger holds it: when, and which brackets were in
+/// flight across it, BY BRACKET ID. Widths are deliberately not stored — a covering child
 /// is very often still running when the change is seen, so its width does
 /// not exist yet. `changes()` resolves them against the log on read, which
 /// is what lets a still-running child count for coverage immediately and
@@ -844,16 +846,20 @@ impl WindowLog {
             .collect()
     }
 
-    /// DIAGNOSTIC ONLY: how far an arrival that NO bracket contained sat from
-    /// the nearest one, in milliseconds. **Positive means it landed after that
-    /// bracket closed; negative means it landed before that bracket opened.**
-    /// `None` means the log held no bracket at all.
+    /// DIAGNOSTIC ONLY: how far a `Disjoint` observation sat from the nearest
+    /// bracket, in milliseconds. **Positive means it landed after that bracket
+    /// closed; negative means it landed before that bracket opened.** `None`
+    /// means the log held no bracket at all.
     ///
-    /// One such arrival reads as an outside writer and vetoes its pane for a
-    /// whole window, and the three answers want three different fixes: missing
-    /// a close by a millisecond is a clock that cannot be trusted to place the
-    /// write, landing well before any bracket is a startup ordering problem,
-    /// and no brackets at all is neither.
+    /// One such observation vetoes its pane for a whole window, and the three
+    /// answers want three different fixes: missing a close by a millisecond
+    /// used to mean an arrival clock that could not place the write — the
+    /// defect the interval model removes — landing well before any bracket is
+    /// a startup ordering problem, and no brackets at all is neither.
+    ///
+    /// A sub-millisecond positive gap should now be rare: an interval that
+    /// merely straddles a close is `Ambiguous`, not `Disjoint`, and never
+    /// reaches here. Seeing one again means the fence stopped landing.
     pub fn nearest_bracket_gap(&self, at: std::time::Instant) -> Option<(SourceId, f64)> {
         self.brackets
             .iter()
@@ -1279,7 +1285,29 @@ impl LoopSuspicion {
     }
 
     /// Condition 2: every trigger this pane watches recorded ZERO exogenous
-    /// observations. One is enough to say the path has an outside writer.
+    /// observations. One is enough to clear the pane of suspicion.
+    ///
+    /// **The two routes count different things, and neither counts
+    /// authorship.**
+    ///
+    /// - `file:` counts changes recorded with **no direct-child bracket in
+    ///   flight** (`PathLedger::exogenous`). Unchanged by the interval work
+    ///   and deliberately so: the polled route already places a change in a
+    ///   window by snapshotting either side of a bracket.
+    /// - the reader route counts observations that are **temporally
+    ///   `Disjoint`** — the interval the write could have happened in
+    ///   overlaps no bracket at all.
+    ///
+    /// Both are facts about TIME. Reading either as an outside writer is the
+    /// exogenous **veto**, which is the policy this function applies and the
+    /// only place on this path entitled to apply it.
+    ///
+    /// That inference is not sound, and the unsound case belongs here because
+    /// this is where it does its damage: a child's descendant writing after
+    /// its parent's bracket closed overlaps nothing, reads `Disjoint`, and
+    /// vetoes a pane that really is looping. Brackets model direct-child
+    /// execution, not causal descent, and no timing evidence on either route
+    /// distinguishes the two.
     fn closed_everywhere(
         &self,
         ledger: &PathLedger,
@@ -1366,7 +1394,14 @@ impl LoopSuspicion {
     }
 }
 
-/// Who wrote this path? Two stages, and both are load-bearing.
+/// Which sources are credible producers of this path's changes? Two stages,
+/// and both are load-bearing.
+///
+/// **Not "who wrote it" — that is not answerable here.** The input is
+/// coverage in time: which sources were in flight across every instant a
+/// change could have happened. Reading that as authorship is the inference
+/// this function makes, and the two stages are what make it worth making.
+/// `TemporalCoverage` names the two ways it can still be wrong.
 ///
 /// **Eligibility** keeps only the panes that were in flight for MORE than
 /// half of the path's changes. Without it, a pane whose bracket merely

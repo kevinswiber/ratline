@@ -1035,22 +1035,36 @@ struct ReaderState<'a> {
 /// terminal select/read error sets `ended` and exits — a dead source
 /// must never spin silently; transient EINTR/EAGAIN are retried.
 ///
-/// **Why this route records an instant and the polled route records a
-/// bracket.** A `file:` trigger can be stat'd before and after a child,
-/// so a change can be placed inside a window after the fact. A fifo
-/// cannot: the bytes are drained and gone, there is no state left to
-/// compare, and nothing can reconstruct when they landed. The arrival
-/// instant is therefore the only attribution signal that exists on this
-/// route, and the reader thread is the only place that has it.
+/// **What this route can know, and what it cannot.** A `file:` trigger can
+/// be stat'd before and after a child, so a change is placed inside a window
+/// after the fact. A fifo cannot: the bytes are drained and gone, and nothing
+/// reconstructs when they landed. There is no write instant available here,
+/// and the stamp this loop takes is not one — it is later than the write, than
+/// the bytes becoming readable, than `select` returning, and than `read`.
+///
+/// What it CAN prove is when the descriptor was **empty**. A zero-timeout
+/// `select` reporting not-readable establishes that at a known instant, costs
+/// no read, and is safe on a descriptor whose blocking mode this process does
+/// not control. So the reader reports an INTERVAL — bytes appeared between its
+/// last proof of emptiness and its read — and the window decides what that
+/// means.
+///
+/// The interval's WIDTH is the whole question. Bounded only by this loop's
+/// `READ_SLICE` cadence it is tens of milliseconds wide, against child
+/// brackets around a millisecond — measured at 50.3/65/104.7 ms on Linux,
+/// where not one observation in 2658 could be placed inside a bracket. That
+/// is what the control fence exists to collapse, and with it the same
+/// measurement reads 0.8-1.3 ms.
 ///
 /// **One arrival is one read, not one write.** A single `read` returns
 /// whatever is queued, so writes that land between two selects are
 /// coalesced into one arrival and the reader cannot tell them apart —
 /// nothing in the pipe records how many `write` calls produced the
 /// bytes. That under-counts a tight burst and never over-counts, which
-/// is the safe direction: the veto asks whether an outside writer was
-/// *ever* seen, and a coalesced arrival still answers that with the
-/// right instant.
+/// is the safe direction. The narrower claim that survives: coalescing
+/// loses the COUNT, never the fact that bytes arrived, and every chunk
+/// drained after one proof of emptiness shares that proof as its lower
+/// bound.
 #[cfg(unix)]
 fn trigger_read_loop(
     fds: ReaderFds,
@@ -1336,12 +1350,12 @@ mod trigger_reader_tests {
     }
 
     #[test]
-    fn the_instant_is_taken_at_arrival_not_when_the_loop_drains() {
-        // The accuracy claim, and the whole reason this route is cheaper
-        // than the polled one: the reader already knows the exact
-        // instant, where a slice poll is quantised. Delaying the drain
-        // must not move the recorded time — if the instant were taken
-        // here, it would land after the sleep and this fails.
+    fn the_stamp_is_the_readers_not_the_loops() {
+        // What this proves is narrower than its old name suggested: the
+        // upper bound belongs to the READER, taken when its read returned,
+        // and delaying the drain does not move it. It is not the write
+        // instant — nothing here knows that — it is one end of the interval,
+        // and the end that is cheap to get right.
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
         let before = std::time::Instant::now();
@@ -1406,9 +1420,9 @@ mod trigger_reader_tests {
         // Pinned because the limit is load-bearing in one direction
         // only. Coalescing UNDER-counts and can never over-count, which
         // is the safe way round: the veto asks whether an outside writer
-        // was ever seen, and a coalesced arrival still answers that with
-        // a correct instant. Over-counting would be the dangerous error
-        // — it would manufacture exogenous observations that never
+        // was ever seen, and a coalesced arrival still carries an
+        // interval containing every write it merged. Over-counting would
+        // be the dangerous error — it would manufacture observations that never
         // happened and clear a veto that should have held.
         let dir = tempfile::tempdir().unwrap();
         let (reader, mut writer) = fifo_pair(dir.path());
