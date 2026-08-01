@@ -3214,6 +3214,15 @@ fn compose_sources(
 /// by the time it reaches the engine, so the phrase is formatted back
 /// from it.
 pub(crate) fn cadence_label(spec: &SourceSpec) -> String {
+    // A live source was spawned ONCE and is not on a cadence, so an
+    // interval here would be a plain false statement — measured on
+    // main, the pane read `every 2s` while its child had been running
+    // continuously since startup. Checked FIRST because a live spec
+    // may still carry an interval (the respawn delay if the child
+    // exits) and triggers; they simply do not describe how it runs.
+    if spec.live {
+        return "live".to_string();
+    }
     match (spec.interval, spec.triggers.is_empty()) {
         (Some(interval), true) => format!("every {}", interval_words(interval)),
         (Some(interval), false) => {
@@ -3945,6 +3954,121 @@ mod tests {
         let r = retention_for(&registry, SourceId(0));
         assert_eq!(r.keep, Keep::Bottom);
         assert!(r.max_lines > 0);
+    }
+
+    /// The cadence seam's whole input space: live or not, an interval
+    /// or not, a trigger or not — the three spec fields `cadence_label`
+    /// reads.
+    fn cadence_spec(live: bool, interval: Option<Duration>, triggered: bool) -> SourceSpec {
+        SourceSpec {
+            name: "follower".to_string(),
+            command: vec!["true".to_string()],
+            shell: false,
+            interval,
+            triggers: if triggered {
+                vec![TriggerSpec::File(std::path::PathBuf::from("./t"))]
+            } else {
+                Vec::new()
+            },
+            debounce: Duration::from_millis(250),
+            live,
+        }
+    }
+
+    #[test]
+    fn a_live_source_has_no_cadence_label() {
+        // Measured on main: a live pane's chrome read `every 2s · …`
+        // while its child had run continuously since startup. The pane
+        // does not look broken, it looks idle — and the cadence is a
+        // false statement.
+        let label = cadence_label(&cadence_spec(true, Some(Duration::from_secs(2)), false));
+        assert!(
+            !label.contains("every"),
+            "a live pane has no cadence: {label}"
+        );
+        assert_eq!(label, "live");
+    }
+
+    #[test]
+    fn a_live_source_with_triggers_still_reads_as_live() {
+        // `live` outranks the trigger wording: a follower is not
+        // waiting on a trigger to run, it is already running.
+        assert_eq!(cadence_label(&cadence_spec(true, None, true)), "live");
+        assert_eq!(
+            cadence_label(&cadence_spec(true, Some(Duration::from_secs(2)), true)),
+            "live"
+        );
+    }
+
+    #[test]
+    fn every_batch_cadence_label_is_unchanged() {
+        // The byte-identity witness at the label level: all four
+        // shipped arms verbatim, so a new arm cannot quietly reorder
+        // or reword them.
+        let second = Duration::from_secs(1);
+        assert_eq!(
+            cadence_label(&cadence_spec(false, Some(second), false)),
+            "every 1s"
+        );
+        assert_eq!(
+            cadence_label(&cadence_spec(false, Some(second), true)),
+            "every 1s or on trigger"
+        );
+        assert_eq!(
+            cadence_label(&cadence_spec(false, None, true)),
+            "on trigger"
+        );
+        assert_eq!(cadence_label(&cadence_spec(false, None, false)), "once");
+    }
+
+    #[test]
+    fn a_live_panes_chrome_row_still_carries_its_time_and_exit_badge() {
+        // Through the same compose path the loop repaints with, not a
+        // hand-built row: the risk is a `live` label displacing a
+        // segment, and only the assembled row can show that.
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let registry = Registry::panes(
+            vec![cadence_spec(true, Some(Duration::from_secs(2)), false)],
+            vec![PaneBox {
+                height: 6,
+                width: PaneWidth::Weight(1),
+                overflow: Overflow::KeepBottom,
+                border: BorderPreset::Rounded,
+                padding: Sides::default(),
+                title: None,
+                chrome: true,
+            }],
+            LayoutNode::Pane(SourceId(0)),
+            0,
+            0,
+        )
+        .expect("a valid one-pane registry");
+        let mut runtime = vec![SourceRuntime::for_test()];
+        runtime[0].output = Some(vec!["seed".to_string()]);
+        runtime[0].posted = true;
+        runtime[0].failure = Some("exit 1".to_string());
+        let at = ago(60);
+        runtime[0].changed_at = at;
+        let geom = registry.geometry((60, 8));
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let block = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        let row = block
+            .lines
+            .iter()
+            .find(|line| line.contains(" · "))
+            .expect("one row is the chrome row");
+        assert!(row.contains("live"), "{row}");
+        assert!(!row.contains("every"), "{row}");
+        assert!(row.contains("exit 1"), "{row}");
+        assert!(row.contains(&local_hms(at)), "{row}");
     }
 
     #[test]
