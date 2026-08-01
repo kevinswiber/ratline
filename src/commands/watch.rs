@@ -1001,6 +1001,17 @@ pub(crate) fn run_registry(
                     // child of THIS source predates: a respawn, never a
                     // plain request.
                     r.schedule.request_respawn();
+                    // A live child never completes on its own, so the
+                    // request above would wait out single-in-flight
+                    // forever. The revocable kill is what discharges
+                    // it: the killed child's completion hands the slot
+                    // back, and the surviving request spawns the
+                    // replacement. A batch child is NOT killed — its
+                    // own completion discharges the request, as it
+                    // always has.
+                    if registry.spec(id).live {
+                        r.slot.kill_current();
+                    }
                     // The one site where a respawn is trigger-driven. Recorded
                     // as an EVENT, never a running count: a count that cannot
                     // fall could never let a repaired dashboard stop being

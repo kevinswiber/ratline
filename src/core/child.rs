@@ -45,6 +45,35 @@ impl ChildSlot {
         }
     }
 
+    /// Kill whatever is parked WITHOUT barring the slot — the supersede
+    /// verb, as distinct from `shutdown()`'s exit verb.
+    ///
+    /// The distinction is load-bearing: `shutdown()` is called from
+    /// `ShutdownGuard::Drop` on the way out of the process, where
+    /// barring the slot forever is exactly right and a later spawn
+    /// would be a leak. A supersede is the opposite — it kills so that
+    /// the NEXT spawn can happen. Sharing one method would make each
+    /// caller wrong half the time.
+    ///
+    /// Never lifts an existing bar: a supersede racing process exit
+    /// must not resurrect a slot the exit path has already closed.
+    ///
+    /// **This SIGNALS; it does not sequence.** The parked child's
+    /// worker still owns its pipe readers and has not reaped it, so the
+    /// caller must wait for that worker's `Completed` before spawning a
+    /// replacement. Spawning immediately overwrites `SlotState.child`,
+    /// after which the old worker can take and wait on the REPLACEMENT
+    /// child instead of its own — a swap with no symptom until
+    /// something hangs. The loop's trigger path gets this for free: a
+    /// respawn request waits out single-in-flight, and the killed
+    /// child's completion is what discharges it.
+    pub fn kill_current(&self) {
+        let mut state = self.lock();
+        if let Some(child) = state.child.as_mut() {
+            let _ = child.kill();
+        }
+    }
+
     /// A Drop guard: hold one in `run()` (`let _shutdown =
     /// slot.guard();` — a NAMED binding; a bare `let _ =` drops at
     /// once) so every exit — returns, `?`, panics — shuts the slot
@@ -1030,6 +1059,179 @@ mod tests {
         // a bare `let _ =` drops immediately, as exploited here.)
         drop(slot.guard());
         assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+    }
+
+    #[test]
+    fn a_revoked_kill_lets_the_next_spawn_through_after_the_old_worker_finishes() {
+        // The difference from shutdown(), and the only reason this
+        // exists — but the ORDER is load-bearing. `kill_current` only
+        // signals; the old worker still owns its pipe readers and has
+        // not yet reaped its child. Spawning immediately would
+        // overwrite `SlotState.child`, after which the old worker can
+        // wait on the REPLACEMENT child instead of its own.
+        //
+        // So revocation is kill-then-await-Completed, and that is the
+        // protocol under test.
+        let slot = ChildSlot::default();
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx.clone(),
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        wait_until_parked(&slot);
+        slot.kill_current();
+        // The old worker's completion is the handshake: it means the
+        // child is reaped, the readers are done, and the slot is free.
+        let done = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the killed child completes");
+        assert!(matches!(done, TickEvent::Completed(_)));
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        wait_until_parked(&slot);
+        assert!(parked(&slot), "kill_current must not bar the slot");
+    }
+
+    #[test]
+    fn a_killed_child_still_posts_its_completion() {
+        // What makes the handshake above possible at all. Without it a
+        // caller has nothing to wait on and must guess.
+        let slot = ChildSlot::default();
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        wait_until_parked(&slot);
+        slot.kill_current();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a killed child must complete, or nothing can sequence a respawn"
+        );
+    }
+
+    #[test]
+    fn shutdown_still_bars_the_slot_forever() {
+        // The property the exit path depends on. If this ever loosens,
+        // ShutdownGuard stops guaranteeing anything. Awaits the barred
+        // outcome rather than sleeping: the worker posts it, and the
+        // wait is for the fact.
+        let slot = ChildSlot::default();
+        slot.shutdown();
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        let done = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a barred spawn still posts");
+        let TickEvent::Completed(outcome) = done else {
+            panic!("a barred spawn posts a completion");
+        };
+        assert_eq!(
+            outcome
+                .spawn_error
+                .expect("barred spawn reports an error")
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(!parked(&slot), "shutdown must keep barring spawns");
+    }
+
+    #[test]
+    fn kill_current_on_an_empty_slot_is_a_no_op() {
+        ChildSlot::default().kill_current(); // must not panic or block
+    }
+
+    #[test]
+    fn kill_current_after_shutdown_does_not_clear_the_bar() {
+        // The dangerous ordering: a supersede racing process exit must
+        // not resurrect a slot the exit path has already closed.
+        let slot = ChildSlot::default();
+        slot.shutdown();
+        slot.kill_current();
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        let done = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a barred spawn still posts");
+        let TickEvent::Completed(outcome) = done else {
+            panic!("a barred spawn posts a completion");
+        };
+        assert!(
+            outcome.spawn_error.is_some(),
+            "kill_current must never lift the bar"
+        );
+        assert!(!parked(&slot));
+    }
+
+    #[test]
+    fn a_killed_live_child_is_reaped_not_left_a_zombie() {
+        // A follower killed and respawned repeatedly is the shape that
+        // accumulates zombies if the reap is skipped. The completion is
+        // the reap's receipt on every platform; unix additionally asks
+        // the process table, because a worker that skipped the wait
+        // would still post.
+        let slot = ChildSlot::default();
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        wait_until_parked(&slot);
+        let pid = slot.lock().child.as_ref().expect("parked").id();
+        slot.kill_current();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the killed child must complete"
+        );
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps");
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert!(!stat.starts_with('Z'), "pid {pid} is a zombie: {stat:?}");
+        }
+        #[cfg(windows)]
+        let _ = pid;
     }
 
     #[test]
