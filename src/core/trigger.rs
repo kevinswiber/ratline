@@ -514,21 +514,7 @@ pub struct WindowLog {
     respawns: Vec<(SourceId, std::time::Instant)>,
     arrivals: Vec<Arrival>,
     overflows: Vec<std::time::Instant>,
-    /// DIAGNOSTIC ONLY (task 2.3): the intervals the reader reported, kept
-    /// so the trace can show their width distribution and what `classify`
-    /// makes of them. Off unless `RAT_TRIGGER_TRACE` is set, bounded when
-    /// on, and read by nothing the four conditions touch.
-    traced: Option<Vec<Observation>>,
 }
-
-/// How many traced observations to keep. The trace is a diagnostic; a run
-/// that fires several times a second for thirty seconds must not grow a
-/// vector without limit just because someone left the variable set.
-///
-/// Only `note_observation_for_trace` reads it, and that has only a unix-only
-/// caller — so on the Windows leg it is genuinely dead.
-#[cfg_attr(windows, allow(dead_code))]
-const TRACED_CAP: usize = 4096;
 
 impl WindowLog {
     pub fn new(window: std::time::Duration) -> WindowLog {
@@ -539,72 +525,7 @@ impl WindowLog {
             respawns: Vec::new(),
             arrivals: Vec::new(),
             overflows: Vec::new(),
-            traced: None,
         }
-    }
-
-    /// DIAGNOSTIC ONLY (task 2.3). Start keeping the reader's intervals so
-    /// the trace can report their widths and classifications. The loop calls
-    /// this exactly when `RAT_TRIGGER_TRACE` opened a file.
-    pub fn trace_observations(&mut self) {
-        self.traced = Some(Vec::new());
-    }
-
-    /// DIAGNOSTIC ONLY (task 2.3). No-op unless tracing was switched on.
-    ///
-    /// Its only caller is `drain_reader_arrivals`, which is `cfg(unix)` —
-    /// the reader route does not exist on Windows — so this is dead on the
-    /// cross-compile leg and nowhere else.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub fn note_observation_for_trace(&mut self, observation: Observation) {
-        if let Some(traced) = self.traced.as_mut()
-            && traced.len() < TRACED_CAP
-        {
-            traced.push(observation);
-        }
-    }
-
-    /// DIAGNOSTIC ONLY (task 2.3). The premise this plan rests on, as a
-    /// number: interval widths in ms (min/median/max), how many observations
-    /// had no lower bound at all, and how `classify` answers for each.
-    ///
-    /// The question it exists to settle is whether an UNFENCED interval can
-    /// ever sit inside a child's bracket. If `cov` is not near zero here,
-    /// the fence is unnecessary and the plan is wrong.
-    pub fn traced_summary(&self) -> Option<String> {
-        let traced = self.traced.as_ref()?;
-        if traced.is_empty() {
-            return Some("obs=0".to_string());
-        }
-        let mut widths: Vec<f64> = Vec::new();
-        let mut unbounded = 0usize;
-        let (mut cov, mut dis, mut amb) = (0usize, 0usize, 0usize);
-        for observation in traced {
-            match observation.empty_since {
-                Some(from) => widths.push(
-                    observation
-                        .observed_at
-                        .saturating_duration_since(from)
-                        .as_secs_f64()
-                        * 1000.0,
-                ),
-                None => unbounded += 1,
-            }
-            match self.classify(observation) {
-                TemporalCoverage::Covered(_) => cov += 1,
-                TemporalCoverage::Disjoint => dis += 1,
-                TemporalCoverage::Ambiguous => amb += 1,
-            }
-        }
-        widths.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a duration"));
-        let stats = match widths.as_slice() {
-            [] => "none".to_string(),
-            w => format!("{:.1}/{:.1}/{:.1}", w[0], w[w.len() / 2], w[w.len() - 1]),
-        };
-        Some(format!(
-            "obs={} widthms={stats} nobound={unbounded} cov={cov} dis={dis} amb={amb}",
-            traced.len()
-        ))
     }
 
     pub fn open_bracket(
@@ -1222,9 +1143,6 @@ impl LoopSuspicion {
         );
         if let Some((min, med, max)) = log.bracket_widths_ms() {
             let _ = write!(w, " brkms={min:.2}/{med:.2}/{max:.2}");
-        }
-        if let Some(summary) = log.traced_summary() {
-            let _ = write!(w, " | {summary}");
         }
         for pane in panes {
             for key in pane.readers {
