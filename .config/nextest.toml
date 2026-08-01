@@ -1,2 +1,34 @@
 [profile.default]
+# The general ceiling: a test running past this is almost certainly wedged
+# rather than working, and 20s is generous for everything in this suite except
+# the domain sweeps below.
 slow-timeout = { period = "10s", terminate-after = 2 }
+
+# The matrix module sweeps a bounded domain exhaustively — thousands of
+# generated graph shapes each evaluated through the whole suspicion test — so
+# it is legitimately CPU-bound, and its wall time tracks machine load rather
+# than anything about the code.
+#
+# Measured on one macOS machine: 1.4s idle, 5.6s under light load, 13.4s
+# loaded, past 20s whenever the machine is genuinely busy. On the GitHub
+# `windows-latest` runner it exceeded the old 20s ceiling on 3 of 3 dispatches
+# against one branch AND 2 of 3 against `main` — so this was never a property
+# of a change under review, it was the gate failing about two runs in three
+# for everybody.
+#
+# **It takes 22.1s there.** That is the whole story: the ceiling sat a couple
+# of seconds under the real cost, so which side of it a run landed on was
+# decided by load. A ceiling that fires on load is not a hang detector, it is
+# a coin flip.
+#
+# 60s x 2 leaves roughly 5x headroom over the measured cost, which is enough
+# that load cannot cross it and still short enough to catch a genuine hang.
+# Verified: 5 of 5 `windows-latest` dispatches green afterwards, against 2 of 3
+# failing before.
+#
+# Scoped to the module rather than one test name because every test in it is
+# the same kind of work, and a new sweep should inherit the allowance rather
+# than rediscover this the hard way.
+[[profile.default.overrides]]
+filter = 'test(/^core::trigger::matrix::/)'
+slow-timeout = { period = "60s", terminate-after = 2 }
