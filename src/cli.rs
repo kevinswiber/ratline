@@ -94,6 +94,23 @@ pub enum Command {
     #[cfg(debug_assertions)]
     #[command(name = "__lines", hide = true)]
     Lines(LinesArgs),
+    /// Test harness: print a file's bytes and then KEEP RUNNING, printing
+    /// whatever is appended — a portable `tail -f` that is rat itself.
+    #[cfg(debug_assertions)]
+    #[command(name = "__follow", hide = true)]
+    Follow(FollowArgs),
+}
+
+#[cfg(debug_assertions)]
+#[derive(clap::Args)]
+pub struct FollowArgs {
+    /// The file printed to stdout, and then followed.
+    pub file: std::path::PathBuf,
+    /// A second file followed onto STDERR, so one child writes both
+    /// pipes. Separate files rather than one, because a capture bounds
+    /// each pipe on its own and a test needs to drive them apart.
+    #[arg(long)]
+    pub stderr_file: Option<std::path::PathBuf>,
 }
 
 #[cfg(debug_assertions)]
