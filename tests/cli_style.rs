@@ -51,6 +51,22 @@ fn forced_color_survives_piped_stdout() {
 }
 
 #[test]
+fn reverse_emits_sgr_7_and_ascii_stays_plain() {
+    rat()
+        .env("TERM", "xterm-256color")
+        .args(["--color", "always", "style", "--reverse", "X"])
+        .assert()
+        .success()
+        .stdout("\x1b[7mX\x1b[0m\n");
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["style", "--reverse", "X"])
+        .assert()
+        .success()
+        .stdout("X\n");
+}
+
+#[test]
 fn multiple_args_join_with_newline() {
     rat()
         .env("NO_COLOR", "1")

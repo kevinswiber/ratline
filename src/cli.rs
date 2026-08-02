@@ -166,6 +166,9 @@ pub struct StyleArgs {
     pub italic: bool,
     #[arg(long)]
     pub underline: bool,
+    /// Swap foreground and background (reverse video)
+    #[arg(long)]
+    pub reverse: bool,
     #[arg(long)]
     pub strikethrough: bool,
     /// Foreground color: name, 256 index, or #rrggbb
