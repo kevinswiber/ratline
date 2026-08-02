@@ -234,8 +234,6 @@ impl Registry {
         self
     }
 
-    // Staged: the `?` diagnostics section becomes the caller.
-    #[allow(dead_code)]
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }
