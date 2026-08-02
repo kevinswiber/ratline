@@ -70,7 +70,8 @@ impl UiApp for FilterApp {
             let mut x = 0u16;
             let marker = if at_cursor { &self.indicator } else { "  " };
             buf.set_string(x, y, marker, selection);
-            x += marker.chars().count() as u16;
+            // x is a cell cursor: a wide glyph advances it by two.
+            x += marker.width() as u16;
             if self.multi {
                 let prefix = if self.state.selected[m.index] {
                     &self.selected_prefix
@@ -78,7 +79,7 @@ impl UiApp for FilterApp {
                     &self.unselected_prefix
                 };
                 buf.set_string(x, y, prefix, Style::default());
-                x += prefix.chars().count() as u16;
+                x += prefix.as_str().width() as u16;
             }
             let item = &self.state.items[m.index];
             let base = if at_cursor {
@@ -87,11 +88,15 @@ impl UiApp for FilterApp {
                 Style::default()
             };
             buf.set_string(x, y, item, base);
-            // Highlight the matched characters.
+            // Highlight the matched characters. `positions` are char
+            // indices into the item; the buffer takes cells, so the
+            // offset is the width of everything before the match — a
+            // char index would repaint an earlier cell.
             for &pos in &m.positions {
                 if let Some(c) = item.chars().nth(pos as usize) {
+                    let before: String = item.chars().take(pos as usize).collect();
                     buf.set_string(
-                        x + pos as u16,
+                        x + before.width() as u16,
                         y,
                         c.to_string(),
                         base.add_modifier(Modifier::BOLD).fg(self.palette.r#match),
@@ -290,6 +295,71 @@ mod tests {
         );
         // The prompt is a prompt, not a selection: it stays on accent.
         assert_eq!(buf.cell((0, 0)).unwrap().fg, Color::Indexed(212), "prompt");
+    }
+
+    #[test]
+    fn a_match_highlight_lands_on_its_own_cell_past_a_wide_glyph() {
+        // `positions` are CHAR indices; the buffer takes CELLS. Treating
+        // one as the other repaints the match over an earlier cell — a
+        // query of "o" against "🔥 hot" rewrote the 'h', so the row read
+        // "🔥 oot".
+        let app = FilterApp {
+            state: FilterState::new(
+                vec!["🔥 hot".into(), "日本 jp".into()],
+                Some(1),
+                5,
+                true,
+                true,
+                "o".into(),
+            ),
+            prompt: "> ".into(),
+            placeholder: "filter".into(),
+            indicator: "> ".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi: false,
+            header: None,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        // Row 1: indicator "> " (2 cells), then 🔥 (2), ' ', 'h', 'o', 't'.
+        let line = &crate::term::buffer_ansi::buffer_to_lines(&buf, ColorProfile::Ascii)[1];
+        assert!(
+            line.contains("🔥 hot"),
+            "the item text must survive its own highlight: {line:?}"
+        );
+        // The 'o' sits at column 2 + 2 + 1 + 1 = 6 and carries the match.
+        let cell = buf.cell((6, 1)).expect("the matched cell is painted");
+        assert_eq!(cell.symbol(), "o");
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        // And the 'h' before it is untouched.
+        assert_eq!(buf.cell((5, 1)).unwrap().symbol(), "h");
+    }
+
+    #[test]
+    fn a_wide_indicator_or_prefix_advances_by_cells() {
+        // The running x is a cell cursor, so a wide indicator must move
+        // it two cells, not one char.
+        let app = FilterApp {
+            state: FilterState::new(vec!["ab".into()], None, 5, true, true, String::new()),
+            prompt: "> ".into(),
+            placeholder: "filter".into(),
+            indicator: "日".into(),
+            selected_prefix: "[x] ".into(),
+            unselected_prefix: "[ ] ".into(),
+            multi: true,
+            header: None,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        // 日 spans columns 0-1, so the "[ ] " prefix starts at 2 and the
+        // item at 6.
+        assert_eq!(buf.cell((2, 1)).unwrap().symbol(), "[");
+        assert_eq!(buf.cell((6, 1)).unwrap().symbol(), "a");
     }
 
     #[test]
