@@ -11,7 +11,10 @@ use crate::exit::AppResult;
 use crate::theme::Palette;
 
 pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppResult {
-    let registry = load(&args.file)?;
+    // A load error prints before any UI exists, so the profile is the
+    // one color authority it gets: anything above Ascii earns the
+    // colored snippet theme.
+    let registry = load(&args.file, profile != ColorProfile::Ascii)?;
     let once_timeout = args
         .once_timeout
         .as_deref()
