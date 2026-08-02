@@ -663,7 +663,7 @@ pub(crate) fn run_registry(
                             .into());
                         }
                         Some(err) => (
-                            spawn_error_text("watch", &registry.spec(id).command[0], &err)
+                            watch_spawn_error_text(&registry.spec(id).command[0], &err)
                                 .into_bytes(),
                             Vec::new(),
                         ),
@@ -2897,11 +2897,20 @@ fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
     grew
 }
 
-/// The looping spawn-error wording. `rat watch` passes `"watch"` and
-/// reproduces its shipped line byte for byte; a pane passes its own
-/// name, so the failure names itself inside its box.
-fn spawn_error_text(label: &str, program: &str, err: &std::io::Error) -> String {
-    format!("{label}: {program:?}: {err}")
+/// A pane's spawn-error wording: the pane names itself (the default
+/// border draws no title, so the body is the only surface that can),
+/// the OS reason comes next, the path comes last. A pane truncates
+/// from the RIGHT at a declared width no terminal can widen, so
+/// whatever sits last is what no reader sees — and the path is the
+/// part the author just typed, while the reason exists nowhere else.
+fn pane_spawn_error_text(pane: &str, program: &str, err: &std::io::Error) -> String {
+    format!("{pane}: {err}: {program:?}")
+}
+
+/// Plain watch's looping spawn-error line, byte for byte the shipped
+/// wording. Full-width, so nothing truncates the reason off the end.
+fn watch_spawn_error_text(program: &str, err: &std::io::Error) -> String {
+    format!("watch: {program:?}: {err}")
 }
 
 /// One pane's body lines for one outcome: the spawn-error text when the
@@ -2913,11 +2922,11 @@ fn pane_body(
     stdout: &[u8],
     stderr: &[u8],
     spawn_error: Option<&std::io::Error>,
-    label: &str,
+    pane: &str,
     program: &str,
 ) -> Vec<String> {
     if let Some(err) = spawn_error {
-        return vec![spawn_error_text(label, program, err)];
+        return vec![pane_spawn_error_text(pane, program, err)];
     }
     output_lines(stdout, stderr)
 }
@@ -4374,18 +4383,29 @@ mod tests {
         let err = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(
             pane_body(&[], &[], Some(&err), "plan", "no-such-binary"),
-            vec![format!("plan: {:?}: {err}", "no-such-binary")]
+            vec![format!("plan: {err}: {:?}", "no-such-binary")]
         );
         assert_eq!(exit_badge(None), None);
     }
 
     #[test]
-    fn the_shipped_watch_wording_is_what_the_plain_label_produces() {
-        // `rat watch`'s looping spawn-error line is byte-frozen. The
-        // label is the only thing a pane changes.
+    fn a_panes_spawn_error_leads_with_the_reason_and_ends_with_the_path() {
+        // A pane is chopped from the RIGHT, and a declared width no
+        // terminal can widen — whatever sits last is what no reader sees.
+        // The path is the least informative part and the one the author
+        // just typed; the OS reason exists nowhere else.
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let body = pane_body(&[], &[], Some(&err), "flood", "/long/path/ra");
+        assert_eq!(body, vec![format!("flood: {err}: {:?}", "/long/path/ra")]);
+    }
+
+    #[test]
+    fn the_shipped_watch_wording_keeps_its_bytes() {
+        // `rat watch`'s looping spawn-error line is byte-frozen: the
+        // pane wording reordered, this one must not move.
         let err = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(
-            spawn_error_text("watch", "no-such-binary", &err),
+            watch_spawn_error_text("no-such-binary", &err),
             format!("watch: {:?}: {err}", "no-such-binary")
         );
     }
