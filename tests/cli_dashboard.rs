@@ -199,6 +199,7 @@ fn an_unreadable_file_names_the_path() {
 /// there is no format selection left to point at.
 #[test]
 fn a_file_that_is_not_kdl_names_the_path() {
+    use predicates::boolean::PredicateBooleanExt;
     // The path AND the place: the syntax error carries its line and
     // column through load's context and main's prefix. Shape only —
     // the message text between them is upstream's.
@@ -212,8 +213,10 @@ fn a_file_that_is_not_kdl_names_the_path() {
         .stderr(predicates::str::contains("line "))
         .stderr(predicates::str::contains("column "))
         // The rustc-style snippet reaches the user: the offending
-        // source line is echoed on stderr, pointed at by the span.
-        .stderr(predicates::str::contains("gap = 0"));
+        // source line is echoed on stderr, pointed at by the span —
+        // uncolored, because a piped run earns the plain profile.
+        .stderr(predicates::str::contains("gap = 0"))
+        .stderr(predicates::str::contains("\u{1b}").not());
 }
 
 /// The failure lives in the failing pane's own box — its text, its

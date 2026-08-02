@@ -330,20 +330,28 @@ fn syntax_error_text(line: usize, column: usize, message: Option<&str>) -> Strin
 /// noise that says nothing the blocks do not. Unpinned by design: the
 /// block glyphs are miette's to change; ours is the head line and the
 /// fact that the source is echoed.
-fn syntax_error(text: &str, err: &kdl::KdlError) -> anyhow::Error {
+fn syntax_error(text: &str, err: &kdl::KdlError, colored: bool) -> anyhow::Error {
     use std::fmt::Write;
     let Some(first) = err.diagnostics.iter().min_by_key(|d| d.span.offset()) else {
         return anyhow!("{err}");
     };
     let (line, column) = line_column(text, first.span.offset());
     let mut message = syntax_error_text(line, column, first.message.as_deref());
-    // No color and a fixed width, deliberately: this renders into an
-    // anyhow message printed by `rat: {err:#}`, where rat's own color
-    // policy does not reach — and an uncolored snippet is right in
-    // every pipe, log, and terminal.
-    let handler =
-        miette::GraphicalReportHandler::new_themed(miette::GraphicalTheme::unicode_nocolor())
-            .with_width(80);
+    // The caller's stream decides the theme — never an env sniff here,
+    // so `--color` and `NO_COLOR` keep their one authority. Colored is
+    // plain 16-color ANSI (rustc's own choice): right at every depth,
+    // degrading nowhere. The width is fixed either way: this renders
+    // into an anyhow message printed by `rat: {err:#}`, where no
+    // terminal re-measure reaches.
+    let theme = if colored {
+        miette::GraphicalTheme {
+            characters: miette::ThemeCharacters::unicode(),
+            styles: miette::ThemeStyles::ansi(),
+        }
+    } else {
+        miette::GraphicalTheme::unicode_nocolor()
+    };
+    let handler = miette::GraphicalReportHandler::new_themed(theme).with_width(80);
     let mut blocks: Vec<&kdl::KdlDiagnostic> = err.diagnostics.iter().collect();
     blocks.sort_by_key(|d| d.span.offset());
     for diagnostic in blocks {
@@ -355,6 +363,13 @@ fn syntax_error(text: &str, err: &kdl::KdlError) -> anyhow::Error {
     anyhow!("{message}")
 }
 
+/// The test suite's spelling: `parse_styled` with the plain theme,
+/// so hundreds of error-byte assertions never mention color.
+#[cfg(test)]
+fn parse(text: &str) -> anyhow::Result<DashboardFile> {
+    parse_styled(text, false)
+}
+
 /// The document: settings, then the tree. A pane is declared inside the
 /// `row`/`column` that places it.
 ///
@@ -363,8 +378,16 @@ fn syntax_error(text: &str, err: &kdl::KdlError) -> anyhow::Error {
 /// handed out — and its name becomes a `LayoutDecl::Pane` in the tree.
 /// `DashboardFile` never learns where the panes were written, so
 /// `into_registry` stays the one validation path.
-pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
-    let doc: kdl::KdlDocument = text.parse().map_err(|err| syntax_error(text, &err))?;
+///
+/// `colored` styles the error snippets for the caller's stream: it
+/// says the reader has a color-capable terminal (the caller's
+/// `ColorProfile` verdict — profile detection already folds in
+/// `--color`, `NO_COLOR`, `CI`, and the stream's ttyness). The parse
+/// outcome is identical either way.
+pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> {
+    let doc: kdl::KdlDocument = text
+        .parse()
+        .map_err(|err| syntax_error(text, &err, colored))?;
     let mut file = DashboardFile::default();
     // The tree is walked AFTER the whole first pass, so a `defaults`
     // node anywhere in the document still supplies the `shell` the
@@ -1003,6 +1026,24 @@ mod tests {
     }
 
     #[test]
+    fn a_colored_parse_paints_the_snippet_and_the_plain_one_does_not() {
+        let bad = "pane \"log\" interval=5s {\n    command \"date\"\n}\n";
+        let colored = format!("{:#}", parse_styled(bad, true).expect_err("still invalid"));
+        let plain = format!("{:#}", parse_styled(bad, false).expect_err("still invalid"));
+        assert!(colored.contains('\u{1b}'), "got {colored:?}");
+        assert!(
+            colored.starts_with("line 1, column "),
+            "color never touches the greppable head: {colored:?}"
+        );
+        assert!(!plain.contains('\u{1b}'), "got {plain:?}");
+        assert_eq!(
+            plain,
+            format!("{:#}", parse(bad).expect_err("still invalid")),
+            "`parse` IS the plain spelling"
+        );
+    }
+
+    #[test]
     fn a_kdl_syntax_error_carries_its_line_and_column() {
         // The reported repro: a bare token in property position is
         // not a KDL value, and the answer must say where — AND show
@@ -1028,7 +1069,10 @@ mod tests {
             input: std::sync::Arc::new(String::new()),
             diagnostics: Vec::new(),
         };
-        assert_eq!(format!("{}", syntax_error("", &err)), format!("{err}"));
+        assert_eq!(
+            format!("{}", syntax_error("", &err, false)),
+            format!("{err}")
+        );
     }
 
     #[test]

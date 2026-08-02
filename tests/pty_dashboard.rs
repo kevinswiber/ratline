@@ -1767,3 +1767,38 @@ fn a_trigger_respawns_a_live_child_that_already_exited() {
     );
     assert_counter_settled_at(&counter, 2);
 }
+
+/// A syntax error on a real terminal paints its snippet. The load
+/// error prints before any UI exists, and the colored theme is gated
+/// on the profile the tty earns. `RAT_APPEARANCE` suppresses the
+/// startup OSC probe, so every escape in the drained bytes belongs to
+/// the snippet — the plain path emits none at all.
+#[test]
+fn a_syntax_error_on_a_tty_paints_its_snippet() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = dir.path().join("bad.kdl");
+    std::fs::write(
+        &decl,
+        "pane \"log\" interval=5s {\n    command \"date\"\n}\n",
+    )
+    .expect("write declaration");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"line 1, column",
+        Duration::from_secs(5),
+    )
+    .expect("the load error never printed");
+    assert!(
+        bytes.windows(2).any(|w| w == b"\x1b["),
+        "the snippet is colored on a tty: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+}

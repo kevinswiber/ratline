@@ -386,11 +386,12 @@ fn resolve_node(
     }
 }
 
-/// Read + parse + validate.
-pub fn load(path: &std::path::Path) -> anyhow::Result<Registry> {
+/// Read + parse + validate. `colored` styles the syntax-error
+/// snippets for the caller's stream; it changes no parse outcome.
+pub fn load(path: &std::path::Path, colored: bool) -> anyhow::Result<Registry> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file = crate::core::dashboard_kdl::parse(&text)
+    let file = crate::core::dashboard_kdl::parse_styled(&text, colored)
         .with_context(|| format!("in {}", path.display()))?;
     file.into_registry()
         .with_context(|| format!("in {}", path.display()))
