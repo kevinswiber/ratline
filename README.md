@@ -253,6 +253,21 @@ where it labels that one box's border — the file position keeps the
 two meanings apart.) A declared title costs one row of the frame's
 height budget, exactly like a pane row.
 
+`title` may also point at a pane: `title "Deploy status" ref="#header"`
+makes the pane with id `header` the dashboard's title. The pane stays
+exactly where the file placed it and IS the visible title — styled
+however its command likes, updating on its own cadence — and no extra
+line is rendered; the positional text is the title's fallback until
+the pane first speaks. A reference is a URI fragment, `#` plus a pane
+id, and nothing else is accepted there yet, on purpose. Duplicate ids
+load first-win — a `ref` binds the first declaration — and are listed
+under `?`'s diagnostics section.
+
+An interactive dashboard also carries its title to the terminal tab:
+`▞` plus the declared text, the referenced pane's latest first line,
+or the file's stem — restored on exit where the terminal supports the
+title stack. Piped and `--once` runs never touch the tab.
+
 A pane may even run `rat dashboard … --once` as its child: the inner
 one-shot sizes itself to the pane through the handed-down `RAT_WIDTH`/
 `RAT_HEIGHT` and renders as a dashboard-in-a-dashboard, re-run at the
