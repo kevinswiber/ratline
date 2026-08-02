@@ -302,13 +302,13 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// One line: `line N, column M: <message>[ — <help>][ (and K more)]`.
-/// Upstream's message ships verbatim — rewriting it is string surgery
-/// against a crate that can reword on a patch bump — and its `help` is
-/// upstream's only teaching payload, so it rides along. Deliberately
-/// NO source echo, caret, or snippet: echoing the offending line needs
-/// a truncation policy, and an unbudgeted echo is exactly the class of
-/// defect where a fixed width eats the part that matters.
+/// The head line: `line N, column M: <message>` — the greppable form
+/// scripts and logs key on. Upstream's message ships verbatim:
+/// rewriting it is string surgery against a crate that can reword on
+/// a patch bump. Help and the other diagnostics are not here — they
+/// live in the miette snippet blocks `syntax_error` renders below,
+/// which echo and point into the source at a bounded width (the
+/// budgeted echo the original one-line-only rule was waiting for).
 fn syntax_error_text(line: usize, column: usize, message: Option<&str>) -> String {
     format!(
         "line {line}, column {column}: {}",
