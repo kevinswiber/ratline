@@ -212,6 +212,32 @@ fn sgr_left_open(s: &str) -> bool {
     state.is_open()
 }
 
+/// Seal rows so each starts and ends with a clean SGR state: a row that
+/// leaves styling open is closed with a reset and the open state replayed
+/// at the start of the next row — `wrap_display`'s close-and-replay rule
+/// over a whole row stack. A deliberate multi-row span keeps its look
+/// while chrome painted after any row starts from a clean terminal, and
+/// every sealed row repaints correctly in isolation (the diff renderer
+/// rewrites rows out of context). Rows that open nothing pass through
+/// byte-identical, so an Ascii/NO_COLOR frame gains no SGR of rat's own.
+pub fn seal_rows(rows: Vec<String>) -> Vec<String> {
+    let mut carried = SgrState::default();
+    rows.into_iter()
+        .map(|row| {
+            let replay = carried.prefix();
+            carried.apply_all(&row);
+            if !carried.is_open() && replay.is_empty() {
+                return row;
+            }
+            let mut built = format!("{replay}{row}");
+            if carried.is_open() {
+                built.push_str("\x1b[0m");
+            }
+            built
+        })
+        .collect()
+}
+
 /// Break one line into lines of at most `width` display cells, preferring
 /// spaces and hard-breaking over-long words. SGR open at a break is closed
 /// at the line end and reopened on the next line.
@@ -515,5 +541,42 @@ mod tests {
     fn a_wide_rune_cut_on_either_edge_is_dropped_whole() {
         assert_eq!(shift_chop("你好", 1, 3), "好");
         assert_eq!(shift_chop("a你", 0, 2), "a");
+    }
+
+    #[test]
+    fn seal_closes_an_open_row_and_replays_it_on_the_next() {
+        assert_eq!(
+            seal_rows(vec!["\x1b[31mred".into(), "still red".into()]),
+            vec!["\x1b[31mred\x1b[0m", "\x1b[31mstill red\x1b[0m"]
+        );
+    }
+
+    #[test]
+    fn seal_stops_replaying_once_the_source_closes() {
+        assert_eq!(
+            seal_rows(vec!["\x1b[31ma\x1b[0m".into(), "b".into()]),
+            vec!["\x1b[31ma\x1b[0m", "b"]
+        );
+        // A reset mid-row ends the carry from that point on.
+        assert_eq!(
+            seal_rows(vec!["\x1b[31ma".into(), "b\x1b[0m done".into(), "c".into()]),
+            vec!["\x1b[31ma\x1b[0m", "\x1b[31mb\x1b[0m done", "c"]
+        );
+    }
+
+    #[test]
+    fn seal_leaves_plain_rows_byte_identical() {
+        let rows = vec!["plain".to_string(), String::new(), "also plain".to_string()];
+        assert_eq!(seal_rows(rows.clone()), rows);
+    }
+
+    #[test]
+    fn seal_is_a_no_op_over_already_sealed_rows() {
+        // The chop path closes what its kept segment opens, so sealing its
+        // output must change nothing — and sealing twice equals sealing once.
+        let chopped = vec![shift_chop("\x1b[31mabcdef", 0, 4), "plain".to_string()];
+        assert_eq!(seal_rows(chopped.clone()), chopped);
+        let sealed = seal_rows(vec!["\x1b[31mred".into(), "tail".into()]);
+        assert_eq!(seal_rows(sealed.clone()), sealed);
     }
 }

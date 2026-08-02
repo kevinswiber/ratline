@@ -2622,3 +2622,41 @@ fn question_mark_pages_the_key_reference_before_the_first_frame() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn the_status_row_never_wears_the_childs_open_color() {
+    // The child opens red and never closes it. Rows join on bare CRLF,
+    // so without a seal the faint status row (CSI 2m adds an attribute,
+    // clears nothing) paints faint AND red. The body row must end
+    // closed; the child's bytes still arrive first, verbatim.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "100ms",
+            "--",
+            "/usr/bin/printf",
+            r"\033[31mred",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(&session, &mut terminal, b"? help", Duration::from_secs(3))
+        .expect("expected a first frame with the status row");
+    let text = String::from_utf8_lossy(&seen);
+    assert!(
+        text.contains("\x1b[31mred\x1b[0m"),
+        "the body row must close what the child left open: {text:?}"
+    );
+    assert!(
+        !text.contains("\x1b[31mred\r\n"),
+        "no row may hand its open color to the next: {text:?}"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}

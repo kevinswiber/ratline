@@ -25,7 +25,7 @@ use crate::core::child::{
 use crate::core::duration::parse_interval;
 use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::live::Emissions;
-use crate::core::measure::shift_chop;
+use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{Composition, Overflow, PaneGeometry, Registry, SourceId, SourceSpec};
 use crate::core::retain::{Keep, Retention, compact_count};
@@ -2431,9 +2431,7 @@ fn compose_frame(
     lines
 }
 
-/// The single place a tty frame body is painted: truncate the window's
-/// slice, append the paused row or the truncation notice, then the
-/// one-shot notice row, draw.
+/// The single place a tty frame body is painted: assemble the rows, draw.
 #[allow(clippy::too_many_arguments)]
 fn paint_frame(
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
@@ -2452,6 +2450,46 @@ fn paint_frame(
     mark_cell: &str,
     dropped: Option<&str>,
 ) -> anyhow::Result<()> {
+    let kept = frame_rows(
+        lines,
+        offset,
+        mode,
+        view,
+        notice,
+        size,
+        max_height,
+        faint,
+        profile,
+        time_live,
+        time_paused,
+        marks,
+        mark_cell,
+        dropped,
+    );
+    renderer.draw(&kept, size.0).context("writing frame")?;
+    Ok(())
+}
+
+/// One painted frame's rows: truncate the window's slice, seal the body,
+/// append the paused row or the truncation notice, then the one-shot
+/// notice row.
+#[allow(clippy::too_many_arguments)]
+fn frame_rows(
+    lines: &[String],
+    offset: usize,
+    mode: FrameMode,
+    view: ViewState,
+    notice: Option<String>,
+    size: (u16, u16),
+    max_height: Option<u16>,
+    faint: &StyleSpec,
+    profile: ColorProfile,
+    time_live: &str,
+    time_paused: &str,
+    marks: Option<&[LineMark]>,
+    mark_cell: &str,
+    dropped: Option<&str>,
+) -> Vec<String> {
     let (cols, rows) = size;
     let max_rows = window_rows(max_height, rows);
     let start = match mode {
@@ -2506,6 +2544,12 @@ fn paint_frame(
     {
         kept = prefix_rows(kept, marks, start, mark_cell);
     }
+    // Seal AFTER the splice and the gutter margin (their cell indices
+    // count the pre-seal bytes): each body row ends closed and reopens
+    // what the child left open, so the chrome below — and the terminal
+    // at rest — never inherits a child color. The chop path above
+    // already closes per row, so sealing it changes nothing.
+    kept = seal_rows(kept);
     let status = match mode {
         FrameMode::Paused => paused_notice(time_paused, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => scrolled_notice(offset, kept.len(), lines.len()),
@@ -2515,8 +2559,7 @@ fn paint_frame(
     if let Some(text) = notice {
         kept.push(faint.render(&text, profile));
     }
-    renderer.draw(&kept, cols).context("writing frame")?;
-    Ok(())
+    kept
 }
 
 /// Write `lines` to a timestamped file and describe the outcome for the
@@ -3892,6 +3935,83 @@ mod tests {
                 .any(|line| line.contains("trigger")),
             "the untriggered reference must not mention triggers"
         );
+    }
+
+    #[test]
+    fn the_row_before_the_status_row_starts_the_chrome_clean() {
+        let view = ViewState {
+            wrap: true,
+            hshift: 0,
+            gutter: false,
+            highlight: false,
+            alt_time: false,
+        };
+        let faint = StyleSpec {
+            faint: true,
+            ..StyleSpec::default()
+        };
+        // A child that leaves its color open: the body row must end
+        // closed so the status row's CSI 2m starts from a clean state,
+        // and the carry replays across body rows so a deliberate span
+        // still looks the same.
+        let lines = vec!["\x1b[31mred".to_string(), "still".to_string()];
+        let rows = frame_rows(
+            &lines,
+            0,
+            FrameMode::Live,
+            view,
+            None,
+            (80, 24),
+            None,
+            &faint,
+            ColorProfile::TrueColor,
+            "since 12:00:00",
+            "",
+            None,
+            "▌ ",
+            None,
+        );
+        assert_eq!(rows[0], "\x1b[31mred\x1b[0m");
+        assert_eq!(rows[1], "\x1b[31mstill\x1b[0m");
+        assert!(
+            rows[2].starts_with("\x1b[2m"),
+            "the status row is chrome: {:?}",
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn plain_rows_reach_the_renderer_byte_identical() {
+        let view = ViewState {
+            wrap: true,
+            hshift: 0,
+            gutter: false,
+            highlight: false,
+            alt_time: false,
+        };
+        let faint = StyleSpec {
+            faint: true,
+            ..StyleSpec::default()
+        };
+        let lines = vec!["plain".to_string(), "\x1b[31mclosed\x1b[0m".to_string()];
+        let rows = frame_rows(
+            &lines,
+            0,
+            FrameMode::Live,
+            view,
+            None,
+            (80, 24),
+            None,
+            &faint,
+            ColorProfile::TrueColor,
+            "since 12:00:00",
+            "",
+            None,
+            "▌ ",
+            None,
+        );
+        assert_eq!(rows[0], "plain");
+        assert_eq!(rows[1], "\x1b[31mclosed\x1b[0m");
     }
 
     #[test]
