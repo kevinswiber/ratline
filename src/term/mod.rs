@@ -5,6 +5,7 @@ pub mod history;
 pub mod inline;
 pub mod marks;
 pub mod scroll;
+pub mod tab_title;
 // Live on the unix input path only; the pure parts stay platform-agnostic
 // so every leg keeps their unit coverage, which dead-code analysis does
 // not count as use.
