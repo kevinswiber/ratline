@@ -364,10 +364,48 @@ stopped or slowed to make this happen** — rat reads the output to the
 end and stops *keeping*, so a command never blocks writing into a pipe
 nobody is draining.
 
+**A pane can follow instead of poll.** `live #true` spawns the pane's
+command once and paints its output as it arrives — the shape of
+`tail -f`, `kubectl logs -f`, `docker logs -f` — instead of running it
+on a cadence. The chrome row says `live` in place of an interval,
+because there is none to report; the stamp still moves only when the
+output changes. A live pane keeps the *tail* of its stream by default,
+and `keep-top` is refused at load — a follower's newest line is the
+point of it. The bound above applies unchanged, and a follower is the
+shape most likely to reach it: a stream with no end meets a retained
+set with one, and the pane wears the marker when it does.
+
+`interval` still means something on a live pane — just not a cadence.
+It is how soon a replacement spawns if the child ever exits: nothing
+while the child runs, the delay before a fresh one when it dies. It is
+deliberately not refused, because `defaults interval="5s"` would
+otherwise be a load error for every live pane that inherits it, and a
+mixed dashboard is the normal shape. `interval "never"` means no
+replacement — the pane keeps its exit badge. A `trigger` on a live
+pane *restarts* the child: the running one is killed and the
+replacement spawned once it is reaped, debounced like every other
+fire. Resizes and theme flips leave a live child alone — a follower
+mid-stream is not restarted for cosmetics — so give it a `trigger` if
+you want a handle to restart it by. `?` says all of this where the
+chrome row has no room to.
+
+**What `live` cannot fix: a pipeline that buffers.** The last stage of
+a pipeline block-buffers its stdout when it is not a terminal, and
+under rat it is not one. Measured plainly: `tail -f log` alone
+delivered each line at its emission instant, while
+`tail -f log | grep ERROR` delivered 0 bytes in 4 seconds — the same
+log, the same appends. That is the stage's stdio buffering, not the
+follower, and nothing rat does can change it. Give the stage a
+line-buffered mode and the pipeline follows fine: `grep
+--line-buffered`, `awk '{print; fflush()}'`, or `stdbuf -oL` in front
+of a tool with no such flag.
+
 A runnable declaration lives at
 [`examples/panes.kdl`](examples/panes.kdl);
 [`examples/panes-nested.kdl`](examples/panes-nested.kdl) shows nested
-rows and columns and a dashboard-in-a-dashboard pane together.
+rows and columns and a dashboard-in-a-dashboard pane together, and
+[`examples/follow.kdl`](examples/follow.kdl) is a live log follower
+beside a batch pane.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 

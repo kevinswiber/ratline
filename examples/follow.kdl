@@ -1,0 +1,38 @@
+// A live pane follows a long-lived command instead of running one on
+// a cadence: `live #true` spawns the child ONCE and paints its output
+// as it arrives — the shape of `tail -f`. Try it:
+//
+//   rat dashboard examples/follow.kdl
+//
+// then, from another terminal:
+//
+//   echo "hello" >> /tmp/rat-follow-demo.log
+//
+// The follower's chrome reads `live` rather than a cadence, because it
+// is not on one. The `interval` it inherits from `defaults` is how
+// soon a replacement spawns if the child ever exits — not how often it
+// runs — and a `trigger` on a live pane restarts the child. A live
+// pane keeps the TAIL of its output by default, and the retention
+// bound still applies: a follower that outruns it wears the
+// `lines dropped` marker on its chrome row.
+
+gap 1
+
+defaults interval="5s" border="rounded" padding="0 1"
+
+row {
+    pane "follow" live=#true {
+        // -F keeps following across the file not existing yet, and
+        // across a rotation replacing it.
+        command "tail" "-F" "/tmp/rat-follow-demo.log"
+        height 12
+    }
+}
+
+row {
+    pane "clock" {
+        command "date" "+%H:%M:%S"
+        interval "1s"
+        height 4
+    }
+}
