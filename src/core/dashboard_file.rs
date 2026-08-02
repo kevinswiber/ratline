@@ -134,7 +134,8 @@ impl DashboardFile {
             self.gap.unwrap_or(0),
             self.row_gap.unwrap_or(0),
         )?
-        .with_title(self.title.clone()))
+        .with_title(self.title.clone())
+        .with_diagnostics(Self::collect_diagnostics(&names)))
     }
 
     /// Every pane's name, in declaration order. Names are the file's
@@ -146,12 +147,29 @@ impl DashboardFile {
             let Some(id) = decl.id.as_deref() else {
                 bail!("pane #{}: every pane needs an id", index + 1);
             };
-            if names.iter().any(|seen| seen == id) {
-                bail!("pane {id:?} is declared twice: pane ids must be unique");
-            }
+            // First-win, not fatal: a duplicate only matters once a
+            // ref points at it, and refs bind the first declaration.
+            // The duplicate is surfaced as a diagnostic instead.
             names.push(id.to_string());
         }
         Ok(names)
+    }
+
+    /// The load-time facts worth telling but not worth failing over.
+    fn collect_diagnostics(names: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for id in names {
+            if seen.contains(&id.as_str()) {
+                let line = format!("duplicate id {id:?} — refs bind to the first declaration");
+                if !out.contains(&line) {
+                    out.push(line);
+                }
+            } else {
+                seen.push(id);
+            }
+        }
+        out
     }
 }
 
@@ -351,19 +369,25 @@ fn resolve_node(
 ) -> anyhow::Result<LayoutNode> {
     match decl {
         LayoutDecl::Pane(wanted) => {
+            // The first UNPLACED pane with this id, in document order:
+            // occurrences bind pairwise, so duplicate ids place both
+            // panes while refs (which never place) bind the first.
             let id = names
                 .iter()
-                .position(|name| name == wanted)
+                .enumerate()
+                .position(|(i, name)| name == wanted && !placed[i])
                 .map(SourceId)
                 .ok_or_else(|| {
-                    anyhow!(
-                        "layout names unknown pane {wanted:?}: declared panes are {}",
-                        names.join(", ")
-                    )
+                    if names.iter().any(|name| name == wanted) {
+                        anyhow!("layout places pane {wanted:?} more times than it is declared")
+                    } else {
+                        anyhow!(
+                            "layout names unknown pane {wanted:?}: declared panes are {}",
+                            names.join(", ")
+                        )
+                    }
                 })?;
-            if std::mem::replace(&mut placed[id.0], true) {
-                bail!("layout places pane {wanted:?} twice");
-            }
+            placed[id.0] = true;
             Ok(LayoutNode::Pane(id))
         }
         LayoutDecl::Row(cells) => {
@@ -713,10 +737,46 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_pane_name_is_rejected() {
-        let err = err_of(file(vec![pane("git", &["date"]), pane("git", &["date"])]));
-        assert!(err.contains("git"), "{err}");
-        assert!(err.contains("twice") || err.contains("duplicate"), "{err}");
+    fn a_duplicate_id_is_first_win_not_fatal() {
+        // A duplicate only matters once a ref points at it, so it is
+        // a diagnostic, never a load failure. Layout cells bind the
+        // first UNPLACED pane with the id, in document order — so
+        // both panes still render, and refs (which never place) bind
+        // the first declaration.
+        let registry = file(vec![pane("git", &["date"]), pane("git", &["uptime"])])
+            .into_registry()
+            .expect("duplicates load");
+        assert_eq!(registry.len(), 2, "both panes survive");
+        assert!(
+            registry
+                .diagnostics()
+                .iter()
+                .any(|d| d.contains("duplicate id \"git\"")),
+            "the duplicate is surfaced as a diagnostic: {:?}",
+            registry.diagnostics()
+        );
+        let Composition::Panes { layout, .. } = registry.composition() else {
+            panic!("panes")
+        };
+        let LayoutNode::Column(cells) = layout else {
+            panic!("two top-level panes stack: {layout:?}")
+        };
+        assert_eq!(
+            cells.as_slice(),
+            &[LayoutNode::Pane(SourceId(0)), LayoutNode::Pane(SourceId(1))],
+            "occurrences bind in document order"
+        );
+    }
+
+    #[test]
+    fn a_pane_placed_more_often_than_declared_is_refused() {
+        let mut f = file(vec![pane("git", &["date"])]);
+        f.layout = Some(vec![
+            LayoutDecl::Pane("git".to_string()),
+            LayoutDecl::Pane("git".to_string()),
+        ]);
+        let err = format!("{:#}", f.into_registry().unwrap_err());
+        assert!(err.contains("more times than"), "{err}");
     }
 
     #[test]
@@ -906,7 +966,10 @@ mod tests {
             ..DashboardFile::default()
         };
         let err = format!("{:#}", dup.into_registry().unwrap_err());
-        assert!(err.contains("\"a\"") && err.contains("twice"), "{err}");
+        assert!(
+            err.contains("\"a\"") && err.contains("more times than"),
+            "{err}"
+        );
 
         let empty = DashboardFile {
             panes: vec![pane("a", &["date"])],
