@@ -577,9 +577,11 @@ mod tests {
     /// The line's text, with its platform terminator removed.
     ///
     /// Production bytes are untouched — this normalizes the ASSERTION,
-    /// never the payload. Unix `echo` ends a line `\n` and `cmd`'s ends
-    /// it `\r\n`, and the accumulator keeps the `\r` deliberately, so a
-    /// hardcoded `b"99\n"` would pass here and fail the Windows leg.
+    /// never the payload. The accumulator now recognises a CRLF
+    /// terminator whole, so what reaches here ends `\n` on both
+    /// platforms; the `\r` trim stays because this helper is also
+    /// pointed at raw child bytes, and because a bare `\r` the child
+    /// meant to send is content the accumulator deliberately keeps.
     fn line_text(line: &[u8]) -> &str {
         std::str::from_utf8(line)
             .expect("the fixture emits ASCII")

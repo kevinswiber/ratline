@@ -206,6 +206,22 @@ impl LineCap {
     }
 
     /// The line in progress ended at a `\n`.
+    ///
+    /// A `\r` immediately before that `\n` is the other half of a CRLF
+    /// terminator rather than content, and it is dropped here — the one
+    /// place a line ending is decided, so the two halves are recognised
+    /// together or the split drifts.
+    ///
+    /// Keeping it was not harmless. The paint path writes a row and then
+    /// pads it to the pane's width, so a `\r` riding along returns the
+    /// cursor to column 0 and the padding erases the row it just drew: a
+    /// line shorter than its pane vanished outright, and a longer one
+    /// kept only the tail the padding could not reach. Every Windows
+    /// child ends its lines this way, so on Windows this was most of
+    /// them.
+    ///
+    /// A BARE `\r` is content and stays: a child that rewrites its own
+    /// line without ever sending `\n` — a progress meter — means it.
     fn end_line(&mut self) {
         if self.overlong {
             // Already counted; the split resynchronizes here, so the
@@ -214,6 +230,9 @@ impl LineCap {
             return;
         }
         let mut line = std::mem::take(&mut self.partial);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
         line.push(b'\n');
         self.accept(&line);
         // Hand the buffer back so the next line reuses its capacity.
@@ -346,6 +365,47 @@ mod tests {
         // The last line has no terminator, and that is preserved:
         // concat() must reproduce exactly what the child wrote.
         assert_eq!(cap.finish(), (vec![b"a\n".to_vec(), b"b".to_vec()], 0));
+    }
+
+    #[test]
+    fn a_crlf_terminator_is_recognised_whole() {
+        // The `\r` is half a terminator, not content. Retaining it put a
+        // carriage return inside the row the pane paints, and the padding
+        // that follows the row to the pane's width then erased the row —
+        // blank panes for every Windows child.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"a\r\nb\r\n");
+        assert_eq!(cap.finish(), (vec![b"a\n".to_vec(), b"b\n".to_vec()], 0));
+    }
+
+    #[test]
+    fn a_crlf_split_across_two_reads_is_still_one_terminator() {
+        // A pipe breaks where it likes, and the `\r` landing at the end of
+        // one chunk is the case a strip inside `feed` would miss: by the
+        // time the `\n` arrives the `\r` is already buffered.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"a\r");
+        cap.feed(b"\nb\r\n");
+        assert_eq!(cap.finish(), (vec![b"a\n".to_vec(), b"b\n".to_vec()], 0));
+    }
+
+    #[test]
+    fn a_bare_carriage_return_is_content_and_survives() {
+        // A progress meter rewrites its own line with `\r` and sends no
+        // `\n` at all. Only the `\r` that a `\n` follows is a terminator;
+        // stripping any other would rewrite what the child wrote.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"10%\r50%\r100%\n");
+        assert_eq!(cap.finish(), (vec![b"10%\r50%\r100%\n".to_vec()], 0));
+    }
+
+    #[test]
+    fn an_unterminated_line_keeps_its_trailing_carriage_return() {
+        // No `\n` ever arrives, so nothing here is a CRLF terminator and
+        // the flush must not invent one to strip.
+        let mut cap = LineCap::new(10, Keep::Bottom);
+        cap.feed(b"a\r\nb\r");
+        assert_eq!(cap.finish(), (vec![b"a\n".to_vec(), b"b\r".to_vec()], 0));
     }
 
     #[test]
