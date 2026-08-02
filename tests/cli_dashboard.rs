@@ -294,6 +294,23 @@ fn stdout_stream(stdout: std::process::ChildStdout) -> std::sync::mpsc::Receiver
     rx
 }
 
+/// `stdout_stream`'s stderr sibling: the once notice is a STDERR
+/// surface, and the frame must stay off it.
+fn stderr_stream(stderr: std::process::ChildStderr) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 /// Drain the stream until the needle appears — a missing frame is a
 /// clean failure, never a hang.
 fn read_until(stream: &std::sync::mpsc::Receiver<Vec<u8>>, seen: &mut String, needle: &str) {
@@ -492,6 +509,79 @@ pane "slow" {{
         "the quick pane printed once: {stdout:?}"
     );
     assert!(stdout.contains("two"), "the slow pane arrived: {stdout:?}");
+}
+
+/// The one deliberately slow test in this file: the notice fires only
+/// after the quiet threshold (5s), and the wait IS the surface under
+/// test. A test-only env knob to shrink the threshold was rejected —
+/// it would ship an undocumented surface.
+#[test]
+fn once_says_which_pane_it_is_still_waiting_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("empty.log");
+    std::fs::write(&log, "").expect("seed");
+    let decl = dir.path().join("dash.kdl");
+    std::fs::write(
+        &decl,
+        format!(
+            r#"
+defaults {{
+    height 3
+    border "none"
+    chrome #false
+}}
+
+pane "build" {{
+    command "{rat}" "__lines" "1"
+}}
+
+pane "logs" {{
+    command "{rat}" "__follow" "{log}"
+}}
+"#,
+            rat = rat_bin().escape_default(),
+            log = log.display().to_string().escape_default(),
+        ),
+    )
+    .expect("write declaration");
+
+    let dash = std::process::Command::new(rat_bin())
+        .args(["dashboard", &decl.display().to_string(), "--once"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rat dashboard piped");
+    let mut dash = KillOnDrop(dash);
+    let errs = stderr_stream(dash.0.stderr.take().expect("piped stderr"));
+    let outs = stdout_stream(dash.0.stdout.take().expect("piped stdout"));
+    let mut seen = String::new();
+    read_until(&errs, &mut seen, "\"logs\"");
+    assert!(
+        seen.contains("still waiting"),
+        "the notice says so: {seen:?}"
+    );
+    assert!(
+        !seen.contains("\"build\""),
+        "the finished pane is never named: {seen:?}"
+    );
+    // No stdout byte moved: a partial wave never reaches the pipe, and
+    // the diagnostic must not change that.
+    assert!(
+        outs.try_recv().is_err(),
+        "stdout stays empty while --once waits"
+    );
+    // One line, once: keep draining and the notice must not repeat —
+    // the loop spins in 50ms slices, so a broken one-shot would say it
+    // again a dozen times over this window.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    while let Ok(chunk) = errs.try_recv() {
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert_eq!(
+        seen.matches("still waiting").count(),
+        1,
+        "the notice is one-shot: {seen:?}"
+    );
 }
 
 #[test]
