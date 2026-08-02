@@ -199,13 +199,18 @@ fn an_unreadable_file_names_the_path() {
 /// there is no format selection left to point at.
 #[test]
 fn a_file_that_is_not_kdl_names_the_path() {
+    // The path AND the place: the syntax error carries its line and
+    // column through load's context and main's prefix. Shape only —
+    // the message text between them is upstream's.
     let dir = tempfile::tempdir().expect("tempdir");
     let file = fixture(dir.path(), "board.conf", "gap = 0\n");
     rat()
         .args(["dashboard", &file])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("board.conf"));
+        .stderr(predicates::str::contains("board.conf"))
+        .stderr(predicates::str::contains("line "))
+        .stderr(predicates::str::contains("column "));
 }
 
 /// The failure lives in the failing pane's own box — its text, its
