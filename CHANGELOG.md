@@ -2,6 +2,22 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.12.0](https://github.com/kevinswiber/ratto/compare/f966dede69b7f8656b28cbf41c2555da05771345..v0.12.0) - 2026-08-02
+#### Features
+- the wheel scrolls a captured frame - ([1b9e446](https://github.com/kevinswiber/ratto/commit/1b9e44626268c4271ee8cfbed0b08cebbbfdc310)) - [@kevinswiber](https://github.com/kevinswiber)
+- rat watch and dashboard learn --fullscreen - ([17ae581](https://github.com/kevinswiber/ratto/commit/17ae581952ea677387d3e69dc6ab2f69efb19f01)) - [@kevinswiber](https://github.com/kevinswiber)
+- the scrolled row carries the time and cadence - ([444e3c7](https://github.com/kevinswiber/ratto/commit/444e3c7174cd6decb5536db5ff6051a32dc5203f)) - [@kevinswiber](https://github.com/kevinswiber)
+- a step past the newest frame returns to the live view - ([fb09a32](https://github.com/kevinswiber/ratto/commit/fb09a32e1e6abb81cbe275fa15fec1443381716e)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- windows mouse capture goes through the console mode - ([eaff696](https://github.com/kevinswiber/ratto/commit/eaff696bb1e5d9205b19a1d11db33c28601b3a31)) - [@kevinswiber](https://github.com/kevinswiber)
+- the gutter takes its columns from the layout, not the border - ([0141f25](https://github.com/kevinswiber/ratto/commit/0141f25c212ceebdc853dbe51a78640136455520)) - [@kevinswiber](https://github.com/kevinswiber)
+- a changed bar cell recolors its ink instead of inverting it - ([91c6bc0](https://github.com/kevinswiber/ratto/commit/91c6bc09a80fc335d2c8796db40a85b615f30d4f)) - [@kevinswiber](https://github.com/kevinswiber)
+- a highlight clips at the pane's own edge - ([808fee8](https://github.com/kevinswiber/ratto/commit/808fee89d150a089ed2096430805cf958c80798b)) - [@kevinswiber](https://github.com/kevinswiber)
+- a pane's padding and border keep rat's own colors - ([de94f25](https://github.com/kevinswiber/ratto/commit/de94f2588f3cee4162fc266492493d3ecfffd8dc)) - [@kevinswiber](https://github.com/kevinswiber)
+- a row closes what it opens before the chrome paints - ([29dd1db](https://github.com/kevinswiber/ratto/commit/29dd1db7b75cd1dfc27f37059b60caea306f5685)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.11.0](https://github.com/kevinswiber/ratto/compare/7ba9007d68f818278c54a73bf1867a134a6733df..v0.11.0) - 2026-08-02
 #### Features
 - the caret is the terminal's own cursor - ([738fef3](https://github.com/kevinswiber/ratto/commit/738fef3897ff2c5d1f86f15ea07afb0bb5ea4a64)) - [@kevinswiber](https://github.com/kevinswiber)
