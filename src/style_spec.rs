@@ -12,6 +12,7 @@ pub struct StyleSpec {
     pub faint: bool,
     pub italic: bool,
     pub underline: bool,
+    pub reverse: bool,
     pub strikethrough: bool,
     pub foreground: Option<Color>,
     pub background: Option<Color>,
@@ -34,6 +35,7 @@ impl StyleSpec {
             (self.faint, "2"),
             (self.italic, "3"),
             (self.underline, "4"),
+            (self.reverse, "7"),
             (self.strikethrough, "9"),
         ] {
             if on {
@@ -288,10 +290,22 @@ mod tests {
             faint: true,
             italic: true,
             underline: true,
+            reverse: true,
             strikethrough: true,
             ..StyleSpec::default()
         };
-        assert_eq!(spec.sgr_prefix(ColorProfile::Ansi), "1;2;3;4;9");
+        assert_eq!(spec.sgr_prefix(ColorProfile::Ansi), "1;2;3;4;7;9");
         assert_eq!(spec.sgr_prefix(ColorProfile::Ascii), "");
+    }
+
+    #[test]
+    fn reverse_maps_to_sgr_7() {
+        let spec = StyleSpec {
+            reverse: true,
+            ..StyleSpec::default()
+        };
+        assert_eq!(spec.sgr_prefix(ColorProfile::Ansi), "7");
+        assert_eq!(spec.render("X", ColorProfile::Ansi256), "\x1b[7mX\x1b[0m");
+        assert_eq!(spec.render("X", ColorProfile::Ascii), "X");
     }
 }

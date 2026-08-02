@@ -10,6 +10,7 @@ fn cell_spec(cell: &ratatui::buffer::Cell) -> StyleSpec {
         faint: cell.modifier.contains(Modifier::DIM),
         italic: cell.modifier.contains(Modifier::ITALIC),
         underline: cell.modifier.contains(Modifier::UNDERLINED),
+        reverse: cell.modifier.contains(Modifier::REVERSED),
         strikethrough: cell.modifier.contains(Modifier::CROSSED_OUT),
         foreground: (cell.fg != Color::Reset).then_some(cell.fg),
         background: (cell.bg != Color::Reset).then_some(cell.bg),
@@ -135,5 +136,25 @@ mod tests {
         buf.set_string(0, 0, "hi", ratatui::style::Style::default());
         let lines = buffer_to_lines(&buf, ColorProfile::Ascii);
         assert_eq!(lines, vec!["hi"]);
+    }
+
+    #[test]
+    fn a_reversed_cell_emits_sgr_7() {
+        let style = Style::default().add_modifier(Modifier::REVERSED);
+        let buf = buf_with("x", Some(style));
+        let lines = buffer_to_lines(&buf, ColorProfile::Ansi256);
+        assert_eq!(lines, vec!["\x1b[7mx\x1b[0m"]);
+    }
+
+    #[test]
+    fn a_trailing_reversed_blank_survives_the_trim() {
+        // The caret one past the end of the line is a reversed space; it
+        // must reach the terminal, not fall to the trailing-blank trim.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "hi", Style::default());
+        buf.set_string(2, 0, " ", Style::default().add_modifier(Modifier::REVERSED));
+        let lines = buffer_to_lines(&buf, ColorProfile::Ansi256);
+        assert_eq!(lines, vec!["hi\x1b[7m \x1b[0m"]);
     }
 }

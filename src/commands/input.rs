@@ -115,10 +115,9 @@ mod tests {
 
     #[test]
     fn the_rendered_input_frame_is_pinned() {
-        // Byte-identity goldens: captured on v0.5.0 render code, before the
-        // placeholder/cursor rewire. The mid-string frames show finding F-0:
-        // the REVERSED caret emits no SGR at all (no \x1b[7m anywhere), so
-        // "abc" reaches the terminal completely plain.
+        // Byte-identity goldens for the empty frames; the mid-string frames
+        // pin the caret: the cell under the cursor travels as reverse video
+        // (the cursor token is Reset at the default, so SGR 7 alone).
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         assert_eq!(
@@ -131,11 +130,11 @@ mod tests {
         );
         assert_eq!(
             rendered(dark, "abc", 1),
-            ["\u{1b}[38;5;212m> \u{1b}[0mabc", ""]
+            ["\u{1b}[38;5;212m> \u{1b}[0ma\u{1b}[7mb\u{1b}[0mc", ""]
         );
         assert_eq!(
             rendered(light, "abc", 1),
-            ["\u{1b}[38;5;129m> \u{1b}[0mabc", ""]
+            ["\u{1b}[38;5;129m> \u{1b}[0ma\u{1b}[7mb\u{1b}[0mc", ""]
         );
     }
 
@@ -170,6 +169,17 @@ mod tests {
     }
 
     #[test]
+    fn the_caret_one_past_the_end_reaches_the_terminal() {
+        // End-of-line caret: cursor sits one past the last char, on a
+        // reversed space that the trailing-blank trim must not eat.
+        let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        assert_eq!(
+            rendered(dark, "abc", 3),
+            ["\u{1b}[38;5;212m> \u{1b}[0mabc\u{1b}[7m \u{1b}[0m", ""]
+        );
+    }
+
+    #[test]
     fn the_caret_reads_the_cursor_token() {
         let palette = Palette {
             cursor: Color::Indexed(96),
@@ -177,8 +187,7 @@ mod tests {
         };
         let cell = cell_at(palette, "abc", 1, 3);
         assert_eq!(cell.fg, Color::Indexed(96));
-        // REVERSED holds at the cell level even though cell_spec drops it
-        // on the way to the terminal (finding F-0).
+        // REVERSED is what makes the caret visible; the token colors it.
         assert!(cell.modifier.contains(Modifier::REVERSED));
     }
 

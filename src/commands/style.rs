@@ -15,6 +15,7 @@ pub fn run(args: StyleArgs, profile: ColorProfile, palette: Palette) -> AppResul
         faint: args.faint,
         italic: args.italic,
         underline: args.underline,
+        reverse: false,
         strikethrough: args.strikethrough,
         foreground: args
             .foreground
