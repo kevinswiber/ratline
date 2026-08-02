@@ -10,6 +10,8 @@ pub mod tab_title;
 // so every leg keeps their unit coverage, which dead-code analysis does
 // not count as use.
 #[cfg_attr(windows, allow(dead_code))]
+pub mod mouse;
+#[cfg_attr(windows, allow(dead_code))]
 pub mod tap;
 #[cfg_attr(windows, allow(dead_code))]
 pub mod theme_notify;

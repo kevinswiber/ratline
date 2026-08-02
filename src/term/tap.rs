@@ -14,10 +14,37 @@ use crate::ui::key::Key;
 pub enum TapEvent {
     /// A decoded key, from `crate::ui::key`.
     Key(Key),
+    /// A parsed SGR mouse report (only ever on the wire after rat
+    /// enabled reporting; a platform-neutral vocabulary so the
+    /// crossterm pump converts into the same events).
+    Mouse(MouseEvent),
     /// A parsed DSR 997 push.
     ThemeNotification(Appearance),
     /// A parsed OSC 10/11 reply.
     OscColor(OscColorKind, xterm_color::Color),
+}
+
+/// One mouse report, decoded. Coordinates are deliberately absent:
+/// nothing maps a position yet (the frame's absolute screen origin is
+/// untracked), and carrying them would imply otherwise.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    pub shift: bool,
+    /// How many identical reports this event stands for; the parser
+    /// always says 1, and the consumer may fold a burst.
+    pub notches: u16,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum MouseKind {
+    WheelUp,
+    WheelDown,
+    WheelLeft,
+    WheelRight,
+    /// Presses, releases, and motion: reported because mode 1000 has
+    /// no wheel-only form, mapped to nothing.
+    Other,
 }
 
 /// Bytes accumulated for an escape sequence in progress may not grow past
@@ -39,6 +66,12 @@ pub const ESC_HOLD: std::time::Duration = std::time::Duration::from_millis(50);
 pub struct TapScanner {
     buf: Vec<u8>,
     silent: std::time::Duration,
+    /// Payload bytes still owed to an X10 mouse report (`ESC [ M` plus
+    /// three raw bytes). A terminal that honors mode 1000 but not the
+    /// SGR encoding puts coordinates offset by 32 on the wire — deep
+    /// in the printable range — so without this swallow a click near
+    /// column 81 decodes as the `q` key and quits the session.
+    x10_pending: u8,
 }
 
 impl TapScanner {
@@ -46,6 +79,7 @@ impl TapScanner {
         TapScanner {
             buf: Vec::new(),
             silent: std::time::Duration::ZERO,
+            x10_pending: 0,
         }
     }
 
@@ -53,6 +87,10 @@ impl TapScanner {
         self.silent = std::time::Duration::ZERO;
         let mut events = Vec::new();
         for &byte in chunk {
+            if self.x10_pending > 0 {
+                self.x10_pending -= 1;
+                continue;
+            }
             if self.buf.is_empty() {
                 if byte == 0x1b {
                     self.buf.push(byte);
@@ -88,8 +126,14 @@ impl TapScanner {
                 // parser is offered the run first — a DSR 997 report can
                 // never be decoded as a key.
                 if (0x40..=0x7e).contains(&byte) {
-                    if let Some(appearance) = parse_color_scheme_report(&self.buf) {
+                    if self.buf == b"\x1b[M" {
+                        // The X10 fallback: three raw payload bytes
+                        // follow the final. Swallow them whole.
+                        self.x10_pending = 3;
+                    } else if let Some(appearance) = parse_color_scheme_report(&self.buf) {
                         events.push(TapEvent::ThemeNotification(appearance));
+                    } else if let Some(mouse) = parse_sgr_mouse(&self.buf) {
+                        events.push(TapEvent::Mouse(mouse));
                     } else if let Some(key) = decode_csi(&self.buf) {
                         events.push(TapEvent::Key(key));
                     }
@@ -149,6 +193,44 @@ pub fn decode_key(byte: u8) -> Option<Key> {
         0x20..=0x7e => Some(Key::Char(byte as char)),
         _ => None,
     }
+}
+
+/// A complete SGR mouse report: `ESC [ < Cb ; Cx ; Cy (M|m)`. The `M`
+/// final is a press (for the wheel, the notch itself), `m` a release.
+/// Modifier bits ride Cb (+4 shift, +8 meta, +16 control) and bit 32
+/// flags motion; the wheel is buttons 64-67. Anything malformed is
+/// None — the run then falls through the offer chain and drops.
+pub fn parse_sgr_mouse(seq: &[u8]) -> Option<MouseEvent> {
+    let final_byte = *seq.last()?;
+    if !matches!(final_byte, b'M' | b'm') {
+        return None;
+    }
+    let body = seq.strip_prefix(b"\x1b[<")?;
+    let body = &body[..body.len() - 1];
+    let mut parts = body.split(|&b| b == b';');
+    let cb: u16 = std::str::from_utf8(parts.next()?).ok()?.parse().ok()?;
+    // Cx and Cy must be present and numeric for the report to be one,
+    // even though nothing consumes them yet.
+    for _ in 0..2 {
+        let _: u16 = std::str::from_utf8(parts.next()?).ok()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    let shift = cb & 4 != 0;
+    let kind = match (cb & !28, final_byte) {
+        _ if cb & 32 != 0 => MouseKind::Other,
+        (64, b'M') => MouseKind::WheelUp,
+        (65, b'M') => MouseKind::WheelDown,
+        (66, b'M') => MouseKind::WheelLeft,
+        (67, b'M') => MouseKind::WheelRight,
+        _ => MouseKind::Other,
+    };
+    Some(MouseEvent {
+        kind,
+        shift,
+        notches: 1,
+    })
 }
 
 /// Exact matches only: ESC [ A/B/C/D, ESC [ H/F, ESC [ 1~/4~/7~/8~,
@@ -447,6 +529,109 @@ mod tests {
         assert_eq!(scanner.feed(b"\x1b[?123;4x"), vec![]);
         // The buffer must not have retained anything from the discarded run.
         assert_eq!(scanner.feed(b"z"), vec![TapEvent::Key(Key::Char('z'))]);
+    }
+
+    #[test]
+    fn sgr_wheel_reports_decode_and_are_never_keys() {
+        let mut scanner = TapScanner::new();
+        let wheel = |kind, shift| {
+            TapEvent::Mouse(MouseEvent {
+                kind,
+                shift,
+                notches: 1,
+            })
+        };
+        assert_eq!(
+            scanner.feed(b"\x1b[<64;10;5M"),
+            vec![wheel(MouseKind::WheelUp, false)]
+        );
+        assert_eq!(
+            scanner.feed(b"\x1b[<65;10;5M"),
+            vec![wheel(MouseKind::WheelDown, false)]
+        );
+        assert_eq!(
+            scanner.feed(b"\x1b[<66;1;1M"),
+            vec![wheel(MouseKind::WheelLeft, false)]
+        );
+        assert_eq!(
+            scanner.feed(b"\x1b[<67;1;1M"),
+            vec![wheel(MouseKind::WheelRight, false)]
+        );
+        // Shift rides bit 4 of Cb.
+        assert_eq!(
+            scanner.feed(b"\x1b[<69;10;5M"),
+            vec![wheel(MouseKind::WheelDown, true)]
+        );
+        // A report split across feeds reassembles.
+        assert_eq!(scanner.feed(b"\x1b[<6"), vec![]);
+        assert_eq!(
+            scanner.feed(b"5;10;5M"),
+            vec![wheel(MouseKind::WheelDown, false)]
+        );
+        // Sandwiched between two keys, order holds.
+        assert_eq!(
+            scanner.feed(b"a\x1b[<65;1;1Mb"),
+            vec![
+                TapEvent::Key(Key::Char('a')),
+                wheel(MouseKind::WheelDown, false),
+                TapEvent::Key(Key::Char('b')),
+            ]
+        );
+    }
+
+    #[test]
+    fn presses_releases_and_motion_map_to_other() {
+        let mut scanner = TapScanner::new();
+        // Press (button 0), release final, and a motion-flagged report.
+        for report in [
+            &b"\x1b[<0;10;5M"[..],
+            &b"\x1b[<0;10;5m"[..],
+            &b"\x1b[<35;10;5M"[..],
+        ] {
+            let events = scanner.feed(report);
+            assert_eq!(events.len(), 1, "{report:?}");
+            assert!(
+                matches!(
+                    events[0],
+                    TapEvent::Mouse(MouseEvent {
+                        kind: MouseKind::Other,
+                        ..
+                    })
+                ),
+                "{report:?} decoded {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_sgr_mouse_run_drops_without_becoming_a_key() {
+        // Still framed as one CSI run (parameter bytes then a final),
+        // but not a report: missing or empty fields.
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b[<;;M"), vec![]);
+        assert_eq!(scanner.feed(b"\x1b[<65;2M"), vec![]);
+        assert_eq!(scanner.feed(b"\x1b[<65;2;3;4M"), vec![]);
+        assert_eq!(scanner.feed(b"z"), vec![TapEvent::Key(Key::Char('z'))]);
+    }
+
+    #[test]
+    fn an_x10_mouse_report_never_produces_a_key() {
+        // A terminal that honors 1000 but not 1006 falls back to the
+        // X10 encoding: ESC [ M plus THREE raw payload bytes whose
+        // coordinates are offset by 32 — squarely printable. A click
+        // near column 81 arrives as `q` and would quit the session;
+        // the scanner must swallow the payload explicitly.
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b[M q!"), vec![]);
+        // Reassembly across feeds: the payload may arrive late.
+        assert_eq!(scanner.feed(b"\x1b[M"), vec![]);
+        assert_eq!(scanner.feed(b" q"), vec![]);
+        assert_eq!(scanner.feed(b"!"), vec![]);
+        // The swallow ends exactly at three bytes: the next one is a key.
+        assert_eq!(
+            scanner.feed(b"\x1b[M q!z"),
+            vec![TapEvent::Key(Key::Char('z'))]
+        );
     }
 
     #[test]

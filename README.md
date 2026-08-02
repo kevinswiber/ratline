@@ -124,6 +124,13 @@ nothing pauses, new output keeps arriving under you, `G` sticks to the
 end, and `g` (or scrolling back to the top) returns to the live view.
 The bottom row keeps the live row's time and cadence around the range:
 `live · since 12:07:45 · lines 9-30 of 46 · every 2s · ? help`.
+With `--mouse`, the wheel drives the same scrolling — a notch is three
+lines, shift+wheel a half window, a horizontal wheel the `h`/`l`
+shift. Capture is opt-in because the terminal reports the whole mouse
+or nothing: while rat holds it, the wheel cannot reach the terminal's
+own scrollback and plain-drag selection needs the terminal's escape
+hatch (usually shift). `m` hands the mouse back mid-session and takes
+it again.
 Scrolled lines render chopped, like a horizontally shifted view. If the
 output changes shape while you're scrolled, the window rides along —
 the row's total updates, a pinned window keeps tracking the end — and

@@ -40,10 +40,11 @@ use crate::style_spec::StyleSpec;
 use crate::term::history::History;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
 use crate::term::marks::{GUTTER_COLS, LineMark, changed_marks, mark_cells_with, prefix_rows};
+use crate::term::mouse::MouseGuard;
 use crate::term::scroll::{
     HSHIFT_STEP, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
 };
-use crate::term::tap::TapEvent;
+use crate::term::tap::{MouseEvent, MouseKind, TapEvent};
 #[cfg(unix)]
 use crate::term::tap::{TapChunk, TapScanner, TriggerReader, TtyTap};
 #[cfg(unix)]
@@ -117,6 +118,10 @@ pub(crate) struct SessionArgs {
     pub fullscreen: bool,
     pub no_hide_cursor: bool,
     pub no_sync: bool,
+    /// Capture the mouse: the wheel scrolls the frame instead of the
+    /// terminal's scrollback. Opt-in — capture costs plain-drag text
+    /// selection for the whole window; `m` hands it back mid-session.
+    pub mouse: bool,
     pub wrap: bool,
     pub max_height: Option<u16>,
     pub snapshot_dir: Option<std::path::PathBuf>,
@@ -184,6 +189,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         once_timeout: None,
         clear: args.clear,
         fullscreen: args.fullscreen,
+        mouse: args.mouse,
         no_hide_cursor: args.no_hide_cursor,
         no_sync: args.no_sync,
         wrap: !args.no_wrap,
@@ -256,6 +262,14 @@ pub(crate) fn run_registry(
     // exactly as it was on every unwinding exit path.
     let _alt_guard = if fullscreen {
         Some(AltScreenGuard::enter().context("entering the alternate screen")?)
+    } else {
+        None
+    };
+    // After the raw guard, so its disable is written while echo is
+    // still suppressed. Opt-in: capture takes the terminal's own wheel
+    // (and plain-drag selection) for the whole window.
+    let mut mouse_guard = if interactive && session.mouse {
+        Some(MouseGuard::enable(std::io::stdout()).context("enabling mouse reporting")?)
     } else {
         None
     };
@@ -1395,10 +1409,25 @@ pub(crate) fn run_registry(
         };
         #[cfg(windows)]
         let events = crossterm_slice(nap)?;
+        // A fast wheel spin delivers several notches in one read; fold
+        // each same-direction run into one stepped action so a burst
+        // repaints once, not once per notch.
+        let events = fold_wheel(events);
         for event in events {
             match event {
-                TapEvent::Key(key) => {
-                    match action_for(key, mode_of(pause.as_ref(), live_scroll)) {
+                TapEvent::Key(_) | TapEvent::Mouse(_) => {
+                    let action = match event {
+                        TapEvent::Key(key) => action_for(key, mode_of(pause.as_ref(), live_scroll)),
+                        // Gated on LIVE capture, not just the flag: a
+                        // terminal that keeps reporting after a release
+                        // (or that was never asked) must change nothing.
+                        TapEvent::Mouse(ev) if mouse_guard.as_ref().is_some_and(|g| g.active()) => {
+                            action_for_mouse(ev)
+                        }
+                        TapEvent::Mouse(_) => WatchAction::Ignore,
+                        _ => unreachable!("matched above"),
+                    };
+                    match action {
                         WatchAction::Abort => {
                             renderer.finish().context("restoring terminal")?;
                             return Err(AppError::Aborted);
@@ -1428,6 +1457,16 @@ pub(crate) fn run_registry(
                             #[cfg(unix)]
                             if let Some(sub) = theme_sub.as_mut() {
                                 let _ = sub.suspend();
+                            }
+                            // The pager doesn't speak SGR mouse reports;
+                            // leaving tracking on sprays bytes into its
+                            // command line. Remember whether capture was
+                            // ours to restore — an m-released mouse must
+                            // stay released across the round trip.
+                            let mouse_was_active =
+                                mouse_guard.as_ref().is_some_and(MouseGuard::active);
+                            if let Some(guard) = mouse_guard.as_mut() {
+                                let _ = guard.suspend();
                             }
                             // Park our reader and require its confirmation
                             // before handing the input stream over.
@@ -1459,6 +1498,9 @@ pub(crate) fn run_registry(
                                 // state we stopped listening to.
                                 verify = VerifyState::default();
                             }
+                            if mouse_was_active && let Some(guard) = mouse_guard.as_mut() {
+                                let _ = guard.resume();
+                            }
                             // Repaint immediately from the frame on hand:
                             // the content is already current, and a forced
                             // tick would stall the return by a whole child
@@ -1488,31 +1530,45 @@ pub(crate) fn run_registry(
                                 )?);
                             }
                         }
-                        WatchAction::Scroll(step) => {
+                        action @ (WatchAction::Scroll(_) | WatchAction::ScrollN(..)) => {
+                            let (step, n) = match action {
+                                WatchAction::Scroll(step) => (step, 1),
+                                WatchAction::ScrollN(step, n) => (step, n),
+                                _ => unreachable!("matched above"),
+                            };
                             let Some(live) = live.as_ref() else { continue };
                             // The repaint happens here, in place —
                             // re-entering the tick loop would re-run the
-                            // child per keypress. A frozen window scrolls
-                            // its copy; otherwise scrolling is always a
-                            // live viewport — freezing is explicit (p or
-                            // <), never a side effect of navigation.
+                            // child per keypress; a stepped action (one
+                            // wheel notch is three lines) repaints once.
+                            // A frozen window scrolls its copy; otherwise
+                            // scrolling is always a live viewport —
+                            // freezing is explicit (p or <), never a side
+                            // effect of navigation.
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             let window = usize::from(window_rows(session.max_height, size.1));
-                            if let Some(p) = pause.as_mut() {
-                                p.scroll = p.scroll.step(step, p.frozen.len(), window);
-                            } else if let Some(ls) = live_scroll {
-                                let stepped = ls.step(step, live.lines.len(), window);
-                                live_scroll = (!stepped.at_top()).then_some(stepped);
-                            } else {
-                                let ls = LiveScroll::start(step, live.lines.len(), window);
-                                if ls.at_top() {
-                                    // A top-reaching entry never enters
-                                    // the mode — including any scroll
-                                    // over a frame that fits the window:
-                                    // stay Live, nothing to paint.
-                                    continue;
+                            let was_live = pause.is_none() && live_scroll.is_none();
+                            for _ in 0..n {
+                                if let Some(p) = pause.as_mut() {
+                                    p.scroll = p.scroll.step(step, p.frozen.len(), window);
+                                } else if let Some(ls) = live_scroll {
+                                    let stepped = ls.step(step, live.lines.len(), window);
+                                    live_scroll = (!stepped.at_top()).then_some(stepped);
+                                } else {
+                                    let ls = LiveScroll::start(step, live.lines.len(), window);
+                                    if ls.at_top() {
+                                        // A top-reaching entry never
+                                        // enters the mode — stay Live.
+                                        break;
+                                    }
+                                    live_scroll = Some(ls);
                                 }
-                                live_scroll = Some(ls);
+                            }
+                            if was_live && pause.is_none() && live_scroll.is_none() {
+                                // Never left the live view: nothing to
+                                // paint — including any scroll over a
+                                // frame that fits the window.
+                                continue;
                             }
                             previous_key = Some(repaint(
                                 &mut renderer,
@@ -1768,6 +1824,41 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
+                        WatchAction::ToggleMouse => {
+                            // Hand the mouse back (plain-drag selection
+                            // returns to the terminal) or take it again:
+                            // a two-keystroke round trip instead of a
+                            // condition lasting the whole session.
+                            // Unbound without --mouse.
+                            let Some(guard) = mouse_guard.as_mut() else {
+                                continue;
+                            };
+                            let text = if guard.active() {
+                                let _ = guard.suspend();
+                                "mouse released — the wheel scrolls the terminal; m recaptures"
+                            } else {
+                                let _ = guard.resume();
+                                "mouse captured — the wheel scrolls the frame"
+                            };
+                            let Some(live) = live.as_ref() else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                Some(text.to_string()),
                                 size,
                                 session.max_height,
                                 fullscreen,
@@ -2043,12 +2134,16 @@ enum WatchAction {
     ScrubBack,
     ScrubForward,
     Scroll(ScrollStep),
+    /// A stepped scroll: one wheel notch is three lines, and a folded
+    /// burst is one repaint.
+    ScrollN(ScrollStep, usize),
     ToggleWrap,
     ShiftLeft,
     ShiftRight,
     ToggleGutter,
     ToggleHighlight,
     ToggleTime,
+    ToggleMouse,
     Ignore,
 }
 
@@ -2079,12 +2174,51 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('D') => WatchAction::ToggleGutter,
         Key::Char('c') => WatchAction::ToggleHighlight,
         Key::Char('t') => WatchAction::ToggleTime,
+        Key::Char('m') => WatchAction::ToggleMouse,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
         Key::Char('>') | Key::Char('.') if mode == FrameMode::Paused => WatchAction::ScrubForward,
         _ => WatchAction::Ignore,
     }
+}
+
+/// The mouse's half of the binding table: the wheel drives the scroll
+/// actions the keys already drive (a notch is three lines; shift, a
+/// half window; a horizontal wheel, the h/l shift), and every other
+/// report maps to nothing. The event loop gates on live capture
+/// before consulting this table — a report rat did not ask for (or
+/// one arriving after `m` released the mouse) changes nothing.
+fn action_for_mouse(ev: MouseEvent) -> WatchAction {
+    let n = usize::from(ev.notches.max(1));
+    match ev.kind {
+        MouseKind::WheelDown if ev.shift => WatchAction::ScrollN(ScrollStep::HalfDown, n),
+        MouseKind::WheelUp if ev.shift => WatchAction::ScrollN(ScrollStep::HalfUp, n),
+        MouseKind::WheelDown => WatchAction::ScrollN(ScrollStep::LineDown, 3 * n),
+        MouseKind::WheelUp => WatchAction::ScrollN(ScrollStep::LineUp, 3 * n),
+        MouseKind::WheelLeft => WatchAction::ShiftLeft,
+        MouseKind::WheelRight => WatchAction::ShiftRight,
+        MouseKind::Other => WatchAction::Ignore,
+    }
+}
+
+/// Fold consecutive same-direction wheel notches into one event with a
+/// summed notch count. Keys and other events pass through in order.
+fn fold_wheel(events: Vec<TapEvent>) -> Vec<TapEvent> {
+    let mut out: Vec<TapEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        if let TapEvent::Mouse(m) = &event
+            && matches!(m.kind, MouseKind::WheelUp | MouseKind::WheelDown)
+            && let Some(TapEvent::Mouse(prev)) = out.last_mut()
+            && prev.kind == m.kind
+            && prev.shift == m.shift
+        {
+            prev.notches = prev.notches.saturating_add(m.notches);
+            continue;
+        }
+        out.push(event);
+    }
+    out
 }
 
 /// A frozen frame and the window's place in it. The copy never changes
@@ -2299,6 +2433,7 @@ fn help_lines(heading: &str, extra: &[String]) -> Vec<String> {
                 "  D                  toggle the change gutter",
                 "  c                  toggle the change highlights",
                 "  t                  time style: wall-clock stamps or counting ages",
+                "  m                  capture or release the mouse (with --mouse)",
             ]
             .into_iter()
             .map(str::to_string),
@@ -2957,14 +3092,29 @@ fn crossterm_slice(nap: Duration) -> anyhow::Result<Vec<TapEvent>> {
     if !crossterm::event::poll(nap).context("polling events")? {
         return Ok(Vec::new());
     }
-    let crossterm::event::Event::Key(key_event) =
-        crossterm::event::read().context("reading event")?
-    else {
-        return Ok(Vec::new());
-    };
-    match from_crossterm(key_event) {
-        Some(key) => Ok(vec![TapEvent::Key(key)]),
-        None => Ok(Vec::new()),
+    match crossterm::event::read().context("reading event")? {
+        crossterm::event::Event::Key(key_event) => match from_crossterm(key_event) {
+            Some(key) => Ok(vec![TapEvent::Key(key)]),
+            None => Ok(Vec::new()),
+        },
+        crossterm::event::Event::Mouse(mouse_event) => {
+            use crossterm::event::MouseEventKind as K;
+            let kind = match mouse_event.kind {
+                K::ScrollUp => MouseKind::WheelUp,
+                K::ScrollDown => MouseKind::WheelDown,
+                K::ScrollLeft => MouseKind::WheelLeft,
+                K::ScrollRight => MouseKind::WheelRight,
+                _ => return Ok(Vec::new()),
+            };
+            Ok(vec![TapEvent::Mouse(MouseEvent {
+                kind,
+                shift: mouse_event
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::SHIFT),
+                notches: 1,
+            })])
+        }
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -4252,6 +4402,69 @@ mod tests {
         // A --max-height cap keeps the author's number: no padding.
         let rows = build(None, Some(5));
         assert_eq!(rows.len(), 2, "a capped frame still floats");
+    }
+
+    #[test]
+    fn the_wheel_drives_the_scroll_actions_the_keys_already_drive() {
+        let wheel = |kind, shift, notches| MouseEvent {
+            kind,
+            shift,
+            notches,
+        };
+        // A notch is three lines; a folded burst multiplies.
+        assert_eq!(
+            action_for_mouse(wheel(MouseKind::WheelDown, false, 1)),
+            WatchAction::ScrollN(ScrollStep::LineDown, 3)
+        );
+        assert_eq!(
+            action_for_mouse(wheel(MouseKind::WheelUp, false, 4)),
+            WatchAction::ScrollN(ScrollStep::LineUp, 12)
+        );
+        // Shift flips to half windows.
+        assert_eq!(
+            action_for_mouse(wheel(MouseKind::WheelDown, true, 2)),
+            WatchAction::ScrollN(ScrollStep::HalfDown, 2)
+        );
+        // A horizontal wheel is the h/l shift.
+        assert_eq!(
+            action_for_mouse(wheel(MouseKind::WheelLeft, false, 1)),
+            WatchAction::ShiftLeft
+        );
+        assert_eq!(
+            action_for_mouse(wheel(MouseKind::WheelRight, false, 1)),
+            WatchAction::ShiftRight
+        );
+        // Presses, releases, motion: mapped to nothing.
+        assert_eq!(
+            action_for_mouse(wheel(MouseKind::Other, false, 1)),
+            WatchAction::Ignore
+        );
+    }
+
+    #[test]
+    fn a_wheel_burst_folds_into_one_stepped_event() {
+        let notch = |kind| {
+            TapEvent::Mouse(MouseEvent {
+                kind,
+                shift: false,
+                notches: 1,
+            })
+        };
+        let folded = fold_wheel(vec![
+            notch(MouseKind::WheelDown),
+            notch(MouseKind::WheelDown),
+            notch(MouseKind::WheelDown),
+            TapEvent::Key(Key::Char('q')),
+            notch(MouseKind::WheelDown),
+        ]);
+        assert_eq!(folded.len(), 3, "three down, a key, one more down");
+        assert!(matches!(
+            folded[0],
+            TapEvent::Mouse(MouseEvent { notches: 3, .. })
+        ));
+        // Direction changes never merge.
+        let folded = fold_wheel(vec![notch(MouseKind::WheelDown), notch(MouseKind::WheelUp)]);
+        assert_eq!(folded.len(), 2);
     }
 
     #[test]

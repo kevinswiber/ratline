@@ -2919,3 +2919,192 @@ fn the_fullscreen_pager_round_trip_re_enters_the_alternate_screen() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn the_wheel_scrolls_only_when_the_mouse_is_captured() {
+    // Opt-in, both arms. Without --mouse the reports never reach the
+    // wire (nothing asked for them), but a terminal misbehaving must
+    // still not scroll: the same bytes change nothing. With --mouse,
+    // one notch opens a three-line live window.
+    let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
+    let rat = rat_bin();
+    let mut args: Vec<&str> = vec!["watch", "-n", "50ms", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat, &args, &[]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· ? help".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the live frame"
+    );
+    session.write_bytes(b"\x1b[<65;10;5M");
+    let noop = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        !contains(&noop, "live · ".as_bytes()),
+        "an uncaptured wheel must not scroll: {:?}",
+        String::from_utf8_lossy(&noop)
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+
+    let mut args: Vec<&str> = vec!["watch", "--mouse", "-n", "50ms", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat, &args, &[]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "· ? help".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected the live frame");
+    assert!(
+        contains(&seen, b"\x1b[?1000h") && contains(&seen, b"\x1b[?1006h"),
+        "capture must be requested in the SGR encoding: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"\x1b[<65;10;5M");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            "lines 4-25 of 30 · every 50ms · ? help".as_bytes(),
+            b"paused",
+            Duration::from_secs(2)
+        ),
+        "one notch must scroll three lines, live"
+    );
+    session.write_bytes(b"q");
+    let tail = drain_for(&session, Duration::from_millis(600));
+    assert!(
+        contains(&tail, b"\x1b[?1000l"),
+        "exit must release the mouse: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn an_x10_click_payload_never_quits_the_session() {
+    // A terminal honoring 1000 but not 1006 falls back to X10: three
+    // raw payload bytes after ESC [ M. A click near column 81 puts a
+    // literal `q` on the wire — the session must survive it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count").display().to_string();
+    let script = format!("echo x >> {count}; n=$(wc -l < {count}); printf 'v%06d\\n' $n");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "--mouse", "-n", "100ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
+        "expected a first counter frame"
+    );
+    session.write_bytes(b"\x1b[M q!");
+    // The counter keeps advancing: the payload's q did not quit.
+    assert!(
+        wait_for(&session, &mut terminal, b"v000004", Duration::from_secs(3)),
+        "the session must keep running after an X10 payload"
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn m_hands_the_mouse_back_and_takes_it_again() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "--mouse",
+            "-n",
+            "1s",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected the first frame"
+    );
+    session.write_bytes(b"m");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"mouse released",
+        Duration::from_secs(2),
+    )
+    .expect("m must release the mouse and say so");
+    assert!(
+        contains(&seen, b"\x1b[?1000l"),
+        "the release must reach the wire: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"m");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"mouse captured",
+        Duration::from_secs(2),
+    )
+    .expect("m must recapture and say so");
+    assert!(
+        contains(&seen, b"\x1b[?1000h"),
+        "the recapture must reach the wire: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn the_pager_round_trip_releases_and_recaptures_the_mouse() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "--mouse",
+            "-n",
+            "50ms",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected the first frame"
+    );
+    let _ = drain_for(&session, Duration::from_millis(100));
+    session.write_bytes(b"v");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"\x1b[?1000h",
+        Duration::from_secs(3),
+    )
+    .expect("the pager return must recapture the mouse");
+    assert!(
+        position(&seen, b"\x1b[?1000l").is_some(),
+        "the pager handoff must release the mouse first: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}

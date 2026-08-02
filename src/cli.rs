@@ -455,6 +455,11 @@ pub struct WatchArgs {
     /// never enter scrollback. Ignored when output is piped.
     #[arg(long)]
     pub fullscreen: bool,
+    /// Capture the mouse so the wheel scrolls the frame (a notch is
+    /// three lines); costs plain-drag text selection while captured —
+    /// press `m` to hand the mouse back mid-session
+    #[arg(long)]
+    pub mouse: bool,
     /// Leave the cursor visible
     #[arg(long)]
     pub no_hide_cursor: bool,
@@ -503,6 +508,11 @@ pub struct DashboardArgs {
     /// never enter scrollback. Ignored when output is piped.
     #[arg(long)]
     pub fullscreen: bool,
+    /// Capture the mouse so the wheel scrolls the frame (a notch is
+    /// three lines); costs plain-drag text selection while captured —
+    /// press `m` to hand the mouse back mid-session
+    #[arg(long)]
+    pub mouse: bool,
     /// Leave the cursor visible
     #[arg(long)]
     pub no_hide_cursor: bool,
