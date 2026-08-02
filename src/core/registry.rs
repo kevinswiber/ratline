@@ -130,6 +130,9 @@ pub struct Registry {
     /// Empty under `Composition::Plain`: watch declares no box.
     panes: Vec<PaneBox>,
     composition: Composition,
+    /// Load-time facts worth telling but not worth failing over —
+    /// the `?` reference's diagnostics section reads these.
+    diagnostics: Vec<String>,
 }
 
 /// One pane's resolved box for the current terminal width.
@@ -153,6 +156,7 @@ impl Registry {
             sources: vec![spec],
             panes: Vec::new(),
             composition: Composition::Plain { title },
+            diagnostics: Vec::new(),
         }
     }
 
@@ -208,6 +212,7 @@ impl Registry {
                 row_gap,
                 title: None,
             },
+            diagnostics: Vec::new(),
         })
     }
 
@@ -220,6 +225,19 @@ impl Registry {
             *slot = title;
         }
         self
+    }
+
+    /// Load-time diagnostics, applied after construction like the
+    /// title — advisory only, never a refusal.
+    pub fn with_diagnostics(mut self, diagnostics: Vec<String>) -> Registry {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    // Staged: the `?` diagnostics section becomes the caller.
+    #[allow(dead_code)]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
     }
 
     pub fn len(&self) -> usize {
