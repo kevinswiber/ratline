@@ -782,11 +782,23 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
         [value] => value.as_string().map(str::to_string).ok_or_else(|| {
             anyhow!("{label}: a pane's name is a string — write `pane \"log\" {{ … }}`")
         }),
-        [first, second, ..] => bail!(
-            "{label}: a pane takes ONE name, but {} follows {}",
-            as_written(second),
-            as_written(first)
-        ),
+        [first, second, ..] => {
+            // The scan starts at index 1: index 0 is the name slot,
+            // always. KNOWN LIMIT, kept deliberately: `pane shell
+            // #true` (the name omitted AND the bare spelling) keeps
+            // the name error, because a stray key at index 0 cannot
+            // be told apart from a pane genuinely named "shell" —
+            // both defects are real, and the name error surfaces
+            // first.
+            if let Some(k) = stray_key(&values[1..]) {
+                return Err(stray_key_err(label, k, &values[1..]));
+            }
+            bail!(
+                "{label}: a pane takes ONE name, but {} follows {}",
+                as_written(second),
+                as_written(first)
+            )
+        }
         [] => bail!("{label}: this pane needs a name — write `pane \"log\" {{ … }}`"),
     }
 }
@@ -896,6 +908,24 @@ mod tests {
         assert_eq!(
             container_err("defaults gap 1\npane \"a\" { command \"true\" height 3 }"),
             "defaults: `gap` is the whole dashboard's, declared once at the top level as `gap 1`"
+        );
+    }
+
+    #[test]
+    fn a_bare_key_after_a_pane_name_teaches_the_property_spelling() {
+        assert_eq!(
+            container_err("pane \"a\" shell #true { command \"true\" height 3 }"),
+            "pane #1: `shell` is a key, not a name — write `shell=#true`"
+        );
+        // The breadcrumb survives nesting, and the spelling echoes the
+        // author's own value.
+        assert_eq!(
+            container_err("row {\n    pane \"a\" height 3 { command \"true\" }\n}"),
+            "row #1 > pane #1: `height` is a key, not a name — write `height=3`"
+        );
+        assert_eq!(
+            container_err("pane \"a\" command \"git\" \"log\" { height 3 }"),
+            "pane #1: `command` holds a list, so it must be a child node — write `command \"git\" \"log\"` inside the block"
         );
     }
 
