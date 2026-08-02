@@ -309,48 +309,50 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
 /// NO source echo, caret, or snippet: echoing the offending line needs
 /// a truncation policy, and an unbudgeted echo is exactly the class of
 /// defect where a fixed width eats the part that matters.
-fn syntax_error_text(
-    line: usize,
-    column: usize,
-    message: Option<&str>,
-    help: Option<&str>,
-    more: usize,
-) -> String {
-    use std::fmt::Write;
-    let mut text = format!(
+fn syntax_error_text(line: usize, column: usize, message: Option<&str>) -> String {
+    format!(
         "line {line}, column {column}: {}",
         message.unwrap_or("invalid KDL")
-    );
-    if let Some(help) = help {
-        let _ = write!(text, " — {help}");
-    }
-    if more > 0 {
-        let _ = write!(text, " (and {more} more)");
-    }
-    text
+    )
 }
 
 /// The placed error for a document that failed to parse: the earliest
-/// diagnostic by span offset names the line and column, the rest are
-/// only counted — the first failure is the one the author can act on,
-/// and recovery errors downstream of it are usually its echoes. An
-/// error with no diagnostics keeps the crate's own sentence verbatim;
+/// diagnostic by span offset heads the message — the first failure is
+/// the one the author can act on — and EVERY diagnostic then renders
+/// its own miette snippet block, pointing into the source the way
+/// rustc would, with upstream's help text inside the block. An error
+/// with no diagnostics keeps the crate's own sentence verbatim;
 /// fabricating a position would point at nothing.
+///
+/// Rendered per-DIAGNOSTIC rather than through the `KdlError` wrapper:
+/// the wrapper's own report leads with its constant "Failed to parse
+/// KDL document" sentence and an `Error:` separator per related item —
+/// noise that says nothing the blocks do not. Unpinned by design: the
+/// block glyphs are miette's to change; ours is the head line and the
+/// fact that the source is echoed.
 fn syntax_error(text: &str, err: &kdl::KdlError) -> anyhow::Error {
+    use std::fmt::Write;
     let Some(first) = err.diagnostics.iter().min_by_key(|d| d.span.offset()) else {
         return anyhow!("{err}");
     };
     let (line, column) = line_column(text, first.span.offset());
-    anyhow!(
-        "{}",
-        syntax_error_text(
-            line,
-            column,
-            first.message.as_deref(),
-            first.help.as_deref(),
-            err.diagnostics.len() - 1,
-        )
-    )
+    let mut message = syntax_error_text(line, column, first.message.as_deref());
+    // No color and a fixed width, deliberately: this renders into an
+    // anyhow message printed by `rat: {err:#}`, where rat's own color
+    // policy does not reach — and an uncolored snippet is right in
+    // every pipe, log, and terminal.
+    let handler =
+        miette::GraphicalReportHandler::new_themed(miette::GraphicalTheme::unicode_nocolor())
+            .with_width(80);
+    let mut blocks: Vec<&kdl::KdlDiagnostic> = err.diagnostics.iter().collect();
+    blocks.sort_by_key(|d| d.span.offset());
+    for diagnostic in blocks {
+        let mut block = String::new();
+        if handler.render_report(&mut block, diagnostic).is_ok() {
+            let _ = write!(message, "\n{}", block.trim_end());
+        }
+    }
+    anyhow!("{message}")
 }
 
 /// The document: settings, then the tree. A pane is declared inside the
@@ -1003,12 +1005,19 @@ mod tests {
     #[test]
     fn a_kdl_syntax_error_carries_its_line_and_column() {
         // The reported repro: a bare token in property position is
-        // not a KDL value, and the answer must say where.
+        // not a KDL value, and the answer must say where — AND show
+        // the offending line itself, rustc-style. The snippet's exact
+        // glyphs are miette's and stay unpinned; the SOURCE ECHO is
+        // the contract.
         let err = parse("pane \"log\" interval=5s {\n    command \"date\"\n}\n")
             .expect_err("5s is not a valid KDL value");
         let text = format!("{err:#}");
         assert!(text.starts_with("line 1, column "), "got {text}");
         assert!(!text.contains("Failed to parse KDL document"), "got {text}");
+        assert!(
+            text.contains("pane \"log\" interval=5s {"),
+            "the offending source line is echoed: {text}"
+        );
     }
 
     #[test]
@@ -1023,41 +1032,35 @@ mod tests {
     }
 
     #[test]
-    fn the_earliest_diagnostic_is_the_one_placed() {
-        // Two bad values on two lines: the first failure is the one
-        // the author can act on, the rest are counted, not shown.
-        // Shape-only assertions; the message text is upstream's.
+    fn the_earliest_diagnostic_heads_and_every_diagnostic_gets_a_block() {
+        // Two bad values on two lines: the first failure heads the
+        // message, and each diagnostic renders its own snippet block
+        // below — no counting, no hiding. The `[line:column]` span
+        // marker is the loosest stable probe of miette's block
+        // header; revisit if a miette bump reformats it.
         let err = parse("a 1.\nb 2.\n").expect_err("both floats are invalid");
         let text = format!("{err:#}");
         assert!(text.starts_with("line 1, column "), "got {text}");
-        assert!(text.ends_with("more)"), "got {text}");
-        assert!(!text.contains("line 2"), "got {text}");
+        assert!(text.contains("[1:3]"), "the first block is placed: {text}");
+        assert!(text.contains("[2:3]"), "the second block is placed: {text}");
     }
 
     #[test]
-    fn a_placed_syntax_error_reads_as_one_line() {
+    fn the_head_line_is_the_place_and_the_message() {
         // OUR frame is pinned whole; upstream's message text is a
-        // plain value here, never byte-pinned at the route.
+        // plain value here, never byte-pinned at the route. Help and
+        // the other diagnostics live in the snippet blocks now, so
+        // the head is just the greppable place + message.
         assert_eq!(
-            syntax_error_text(1, 20, Some("Expected valid value"), None, 0),
+            syntax_error_text(1, 20, Some("Expected valid value")),
             "line 1, column 20: Expected valid value"
         );
         assert_eq!(
-            syntax_error_text(3, 1, Some("No closing '}' for child block"), None, 1),
-            "line 3, column 1: No closing '}' for child block (and 1 more)"
+            syntax_error_text(3, 1, Some("No closing '}' for child block")),
+            "line 3, column 1: No closing '}' for child block"
         );
         assert_eq!(
-            syntax_error_text(
-                2,
-                14,
-                Some("bad float"),
-                Some("numbers after the decimal point"),
-                0
-            ),
-            "line 2, column 14: bad float — numbers after the decimal point"
-        );
-        assert_eq!(
-            syntax_error_text(1, 1, None, None, 0),
+            syntax_error_text(1, 1, None),
             "line 1, column 1: invalid KDL"
         );
     }
