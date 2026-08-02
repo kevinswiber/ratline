@@ -84,7 +84,7 @@ impl LayoutDecl {
 /// One pane's declaration (or the `defaults` block), tokens unparsed.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct PaneDecl {
-    pub name: Option<String>,
+    pub id: Option<String>,
     /// Split argv, or one raw script string under `shell`.
     pub command: Option<Vec<String>>,
     pub shell: Option<bool>,
@@ -115,7 +115,7 @@ impl DashboardFile {
         if self.panes.is_empty() {
             bail!("no panes declared: a dashboard needs at least one pane");
         }
-        if self.defaults.name.is_some() {
+        if self.defaults.id.is_some() {
             bail!("`name` is not a default: give each pane its own name");
         }
 
@@ -143,13 +143,13 @@ impl DashboardFile {
     fn pane_names(&self) -> anyhow::Result<Vec<String>> {
         let mut names: Vec<String> = Vec::with_capacity(self.panes.len());
         for (index, decl) in self.panes.iter().enumerate() {
-            let Some(name) = decl.name.as_deref() else {
-                bail!("pane #{}: every pane needs a `name`", index + 1);
+            let Some(id) = decl.id.as_deref() else {
+                bail!("pane #{}: every pane needs an id", index + 1);
             };
-            if names.iter().any(|seen| seen == name) {
-                bail!("pane {name:?} is declared twice: pane names must be unique");
+            if names.iter().any(|seen| seen == id) {
+                bail!("pane {id:?} is declared twice: pane ids must be unique");
             }
-            names.push(name.to_string());
+            names.push(id.to_string());
         }
         Ok(names)
     }
@@ -162,7 +162,7 @@ fn at(name: &str) -> String {
     format!("pane {name:?}")
 }
 
-fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Result<SourceSpec> {
+fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<SourceSpec> {
     let shell = decl.shell.or(defaults.shell).unwrap_or(false);
     let live = decl.live.or(defaults.live).unwrap_or(false);
     // A command string is word-split (or kept verbatim) at PARSE time,
@@ -174,7 +174,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
             "{}: inherits `command` from `defaults` but overrides `shell` — \
              the inherited command was read under the defaults' shell mode; \
              declare the pane's own `command`",
-            at(name)
+            at(id)
         );
     }
     let command = decl
@@ -182,7 +182,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
         .clone()
         .or_else(|| defaults.command.clone())
         .filter(|words| !words.is_empty())
-        .ok_or_else(|| anyhow!("{}: needs a `command`", at(name)))?;
+        .ok_or_else(|| anyhow!("{}: needs a `command`", at(id)))?;
 
     let triggers = decl
         .trigger
@@ -190,13 +190,13 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
         .or_else(|| defaults.trigger.clone())
         .unwrap_or_default()
         .iter()
-        .map(|spec| parse_trigger(spec).with_context(|| at(name)))
+        .map(|spec| parse_trigger(spec).with_context(|| at(id)))
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     let token = decl.interval.as_deref().or(defaults.interval.as_deref());
     let interval = match (token, triggers.is_empty()) {
         (Some("never"), _) => None,
-        (Some(token), _) => Some(parse_interval(token).with_context(|| at(name))?),
+        (Some(token), _) => Some(parse_interval(token).with_context(|| at(id))?),
         (None, false) => None,
         (None, true) => Some(DEFAULT_INTERVAL),
     };
@@ -206,12 +206,12 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
         .as_deref()
         .or(defaults.trigger_debounce.as_deref())
     {
-        Some(token) => parse_interval(token).with_context(|| at(name))?,
+        Some(token) => parse_interval(token).with_context(|| at(id))?,
         None => DEFAULT_DEBOUNCE,
     };
 
     Ok(SourceSpec {
-        name: name.to_string(),
+        id: id.to_string(),
         // Verbatim: a shell pane's script must never round-trip through
         // split-then-join.
         command,
@@ -223,16 +223,16 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
     })
 }
 
-fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Result<PaneBox> {
+fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<PaneBox> {
     let height = decl.height.or(defaults.height).ok_or_else(|| {
         anyhow!(
             "{}: needs a `height` — declare one on the pane or in `defaults`",
-            at(name)
+            at(id)
         )
     })?;
     let width = match decl.width.as_deref().or(defaults.width.as_deref()) {
         None | Some("auto") => PaneWidth::Weight(1),
-        Some(token) => parse_width(token, name)?,
+        Some(token) => parse_width(token, id)?,
     };
     // `None` and an explicit "keep-top" are NOT the same arm here, even
     // though they resolve alike for a batch pane. A live pane is read at
@@ -249,22 +249,22 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Resu
              pane is read at its tail, and keeping the head silently disables the \
              `D` and `c` change markers. Use `overflow \"keep-bottom\"`, or drop \
              `live`.",
-            at(name)
+            at(id)
         ),
         (Some("keep-top"), false) => Overflow::KeepTop,
         (Some("keep-bottom"), _) => Overflow::KeepBottom,
         (Some(other), _) => bail!(
             "{}: unknown overflow {other:?}: expected keep-top or keep-bottom",
-            at(name)
+            at(id)
         ),
     };
     let border = match decl.border.as_deref().or(defaults.border.as_deref()) {
         None => BorderPreset::None,
-        Some(token) => parse_border(token, name)?,
+        Some(token) => parse_border(token, id)?,
     };
     let padding = match decl.padding.as_deref().or(defaults.padding.as_deref()) {
         None => Sides::default(),
-        Some(token) => parse_sides(token).with_context(|| at(name))?,
+        Some(token) => parse_sides(token).with_context(|| at(id))?,
     };
     Ok(PaneBox {
         height,
@@ -280,11 +280,11 @@ fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Resu
 /// `"40"` = exact cells, `"2fr"` = a share of what is left, `"auto"` =
 /// one share. The grammar is CSS-grid-shaped because that is the one
 /// every reader already knows.
-fn parse_width(token: &str, name: &str) -> anyhow::Result<PaneWidth> {
+fn parse_width(token: &str, id: &str) -> anyhow::Result<PaneWidth> {
     let teach = || {
         anyhow!(
             "{}: invalid width {token:?}: expected CELLS, Nfr, or auto",
-            at(name)
+            at(id)
         )
     };
     if let Some(weight) = token.strip_suffix("fr") {
@@ -300,7 +300,7 @@ fn parse_width(token: &str, name: &str) -> anyhow::Result<PaneWidth> {
 /// `BorderPreset` has no free-function parser — it is a
 /// `clap::ValueEnum`, so the flag and the file accept exactly the same
 /// words, and the teaching error enumerates them from the same source.
-fn parse_border(token: &str, name: &str) -> anyhow::Result<BorderPreset> {
+fn parse_border(token: &str, id: &str) -> anyhow::Result<BorderPreset> {
     use clap::ValueEnum;
     BorderPreset::from_str(token, true).map_err(|_| {
         let known: Vec<String> = BorderPreset::value_variants()
@@ -309,7 +309,7 @@ fn parse_border(token: &str, name: &str) -> anyhow::Result<BorderPreset> {
             .collect();
         anyhow!(
             "{}: unknown border {token:?}: expected one of {}",
-            at(name),
+            at(id),
             known.join(", ")
         )
     })
@@ -411,9 +411,9 @@ mod tests {
     use crate::core::registry::{Composition, LayoutNode, SourceId};
 
     /// The smallest legal pane: a name, a command, a declared height.
-    fn pane(name: &str, command: &[&str]) -> PaneDecl {
+    fn pane(id: &str, command: &[&str]) -> PaneDecl {
         PaneDecl {
-            name: Some(name.to_string()),
+            id: Some(id.to_string()),
             command: Some(command.iter().map(|s| s.to_string()).collect()),
             height: Some(3),
             ..PaneDecl::default()
@@ -454,7 +454,7 @@ mod tests {
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
-                name: Some("b".to_string()),
+                id: Some("b".to_string()),
                 shell: Some(true),
                 height: Some(3),
                 ..PaneDecl::default()
@@ -809,7 +809,7 @@ mod tests {
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
-                name: Some("plain".to_string()),
+                id: Some("plain".to_string()),
                 shell: Some(false),
                 ..PaneDecl::default()
             }],
@@ -827,7 +827,7 @@ mod tests {
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
-                name: Some("shelly".to_string()),
+                id: Some("shelly".to_string()),
                 shell: Some(true),
                 ..PaneDecl::default()
             }],
@@ -845,7 +845,7 @@ mod tests {
             panes: vec![
                 pane("fine", &["unused"]),
                 PaneDecl {
-                    name: Some("inheriting".to_string()),
+                    id: Some("inheriting".to_string()),
                     command: None,
                     ..pane("inheriting", &["unused"])
                 },

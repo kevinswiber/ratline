@@ -212,11 +212,13 @@ pane "clock" {
 }
 ```
 
-A pane is declared inside the row or column that places it, so its name
+A pane is declared inside the row or column that places it, so its id
 is written once. `defaults` supplies anything a pane omits. A pane's
-name is its identity — its default title, and the value of `RAT_PANE`
-in the child's environment, so one script can serve every pane by
-dispatching on it. `command` is a string split like a shell word list,
+id is its identity — its default title, the value of `RAT_PANE` in the
+child's environment (so one script can serve every pane by dispatching
+on it), and the anchor a `ref="#id"` points at. An id sticks to
+letters, digits, and `-` `.` `_` `~` — every id is a valid URI
+fragment — and display text belongs in `title`. `command` is a string split like a shell word list,
 multiple arguments taken verbatim as argv, or a raw script string with
 `shell #true`. For a script with backslashes in it — a `sed` program,
 say — reach for KDL's raw strings (`command #"sed 's/\t/ · /'"#`) so
@@ -344,7 +346,7 @@ dashboard.
 titles, heights, and the side-by-side layout are the loop's job, so a
 child that draws its own border just gets another drawn around it.
 Each child is told its pane's inner size through `RAT_WIDTH` and
-`RAT_HEIGHT` (and its name through `RAT_PANE`) and should format to
+`RAT_HEIGHT` (and its id through `RAT_PANE`) and should format to
 that width; height-stable output keeps repaints cheapest, which is
 equally true for plain `rat watch` scripts — a placeholder row beats a
 row that comes and goes.

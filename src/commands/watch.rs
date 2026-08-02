@@ -145,7 +145,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
     let help_extra = trigger_help(&triggers);
     let registry = Registry::single(
         SourceSpec {
-            name: String::new(),
+            id: String::new(),
             command: if args.shell {
                 // A shell source keeps the raw script as ONE element,
                 // or split-then-join would destroy its quoting.
@@ -638,7 +638,7 @@ pub(crate) fn run_registry(
                         // An emission is output. A spawn error is a
                         // completion's business and cannot arrive here.
                         None,
-                        &spec.name,
+                        &spec.id,
                         program,
                     );
                     let changed_now = record_pane_body(
@@ -738,7 +738,7 @@ pub(crate) fn run_registry(
                         &outcome.stdout.concat(),
                         &outcome.stderr.concat(),
                         outcome.spawn_error.as_ref(),
-                        &spec.name,
+                        &spec.id,
                         program,
                     );
                     record_pane_body(
@@ -2660,7 +2660,7 @@ fn source_command(
 ) -> std::process::Command {
     let mut command = build_source_command(registry.spec(id), interactive, appearance, geom);
     if registry.pane(id).is_some() {
-        command.env("RAT_PANE", &registry.spec(id).name);
+        command.env("RAT_PANE", &registry.spec(id).id);
     }
     command
 }
@@ -2842,7 +2842,7 @@ fn detect_resize(
 /// question "whose trigger/whose error?" has an answer.
 fn pane_label(registry: &Registry, id: SourceId) -> String {
     match registry.pane(id) {
-        Some(_) => format!("pane {}: ", registry.spec(id).name),
+        Some(_) => format!("pane {}: ", registry.spec(id).id),
         None => String::new(),
     }
 }
@@ -2854,7 +2854,7 @@ fn pane_label(registry: &Registry, id: SourceId) -> String {
 #[cfg_attr(windows, allow(dead_code))]
 fn ended_text(registry: &Registry, id: SourceId, spec: &TriggerSpec) -> String {
     match registry.pane(id) {
-        Some(_) => format!("{}: trigger ended: {spec}", registry.spec(id).name),
+        Some(_) => format!("{}: trigger ended: {spec}", registry.spec(id).id),
         None => format!("trigger ended: {spec}"),
     }
 }
@@ -2882,7 +2882,7 @@ fn looping_text(registry: &Registry, panes: &[SourceId]) -> String {
     let names: Vec<&str> = panes
         .iter()
         .filter(|id| registry.pane(**id).is_some())
-        .map(|id| registry.spec(*id).name.as_str())
+        .map(|id| registry.spec(*id).id.as_str())
         .collect();
     let mut watched: Vec<String> = Vec::new();
     for spec in panes.iter().map(|id| registry.spec(*id)) {
@@ -2954,7 +2954,7 @@ fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
 fn pane_list(registry: &Registry, waiting: &[SourceId]) -> String {
     let names = waiting
         .iter()
-        .map(|id| format!("{:?}", registry.spec(*id).name))
+        .map(|id| format!("{:?}", registry.spec(*id).id))
         .collect::<Vec<_>>()
         .join(", ");
     let noun = if waiting.len() == 1 { "pane" } else { "panes" };
@@ -3331,7 +3331,7 @@ fn compose_sources(
                 local_hms(source.changed_at)
             };
             let chrome = PaneChrome {
-                title: pane.title.as_deref().unwrap_or(&spec.name),
+                title: pane.title.as_deref().unwrap_or(&spec.id),
                 cadence: &cadence,
                 stamp: &stamp,
                 failure: source.failure.as_deref(),
@@ -4012,8 +4012,8 @@ mod tests {
     fn panes_keeping_opposite_ends() -> Registry {
         use crate::core::box_model::{BorderPreset, Sides};
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
-        let spec = |name: &str| SourceSpec {
-            name: name.to_string(),
+        let spec = |id: &str| SourceSpec {
+            id: id.to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: Some(Duration::from_secs(3600)),
@@ -4048,8 +4048,8 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let sources = panes
             .iter()
-            .map(|(name, live)| SourceSpec {
-                name: (*name).to_string(),
+            .map(|(id, live)| SourceSpec {
+                id: (*id).to_string(),
                 command: vec!["true".to_string()],
                 shell: false,
                 interval: Some(Duration::from_secs(3600)),
@@ -4233,7 +4233,7 @@ mod tests {
         // for what its command is printing now.
         let registry = Registry::single(
             SourceSpec {
-                name: "watch".to_string(),
+                id: "watch".to_string(),
                 command: vec!["true".to_string()],
                 shell: false,
                 interval: Some(Duration::from_secs(2)),
@@ -4254,7 +4254,7 @@ mod tests {
     /// reads.
     fn cadence_spec(live: bool, interval: Option<Duration>, triggered: bool) -> SourceSpec {
         SourceSpec {
-            name: "follower".to_string(),
+            id: "follower".to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval,
@@ -4921,8 +4921,8 @@ mod tests {
     fn two_weighted_panes() -> Registry {
         use crate::core::box_model::{BorderPreset, Sides};
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
-        let spec = |name: &str| SourceSpec {
-            name: name.to_string(),
+        let spec = |id: &str| SourceSpec {
+            id: id.to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: Some(Duration::from_secs(3600)),
@@ -5209,8 +5209,8 @@ mod tests {
     fn two_triggered_panes(a: &str, b: &str) -> Registry {
         use crate::core::box_model::{BorderPreset, Sides};
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
-        let spec = |name: &str, path: &str| SourceSpec {
-            name: name.to_string(),
+        let spec = |id: &str, path: &str| SourceSpec {
+            id: id.to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: None,
@@ -5288,7 +5288,7 @@ mod tests {
         // already follows.
         let registry = Registry::single(
             SourceSpec {
-                name: "watch".to_string(),
+                id: "watch".to_string(),
                 command: vec!["true".to_string()],
                 shell: false,
                 interval: None,
@@ -5445,7 +5445,7 @@ mod tests {
 
     fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
         SourceSpec {
-            name: String::new(),
+            id: String::new(),
             command: command.iter().map(|s| s.to_string()).collect(),
             shell,
             interval: Some(Duration::from_secs(2)),

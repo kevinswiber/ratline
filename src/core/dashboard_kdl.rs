@@ -424,7 +424,7 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
                     if let Some(name) = stray_setting(&values) {
                         return Err(stray_setting_err("defaults", name, &values));
                     }
-                    bail!("defaults takes no name — it holds the keys every pane inherits");
+                    bail!("defaults takes no id — it holds the keys every pane inherits");
                 }
                 file.defaults = pane_block(node, None, false)?;
             }
@@ -484,7 +484,7 @@ fn inline_node(
     if kind == "pane" {
         // The same name reader the flat list used: a name is not an
         // internal handle, so exactly one string, unannotated.
-        let name = one_name(node, label)?;
+        let name = one_id(node, label)?;
         panes.push(pane_block(node, Some(name.clone()), default_shell)?);
         return Ok(LayoutDecl::Pane(name));
     }
@@ -508,7 +508,7 @@ fn inline_node(
             );
         }
         bail!(
-            "{label}: a {kind} holds `pane` blocks, not pane names — \
+            "{label}: a {kind} holds `pane` blocks, not pane ids — \
              declare the pane where it sits, like `{kind} {{ pane \"log\" {{ … }} }}`"
         );
     }
@@ -546,10 +546,10 @@ fn inline_node(
 /// `shell` is the one thing the parser resolves against defaults.
 fn pane_block(
     node: &kdl::KdlNode,
-    name: Option<String>,
+    id: Option<String>,
     default_shell: bool,
 ) -> anyhow::Result<PaneDecl> {
-    let at = match name.as_deref() {
+    let at = match id.as_deref() {
         Some(name) => format!("pane {name:?}"),
         None => "defaults".to_string(),
     };
@@ -559,7 +559,7 @@ fn pane_block(
         shell: shell.unwrap_or(default_shell),
     };
     let mut decl = PaneDecl {
-        name,
+        id,
         ..PaneDecl::default()
     };
     let mut seen: Vec<&'static str> = Vec::new();
@@ -751,7 +751,7 @@ fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error 
         .map(|value| format!("{}={}", k.name, as_written(value)))
         .unwrap_or_else(|| k.property_example());
     anyhow!(
-        "{at}: `{}` is a key, not a name — write `{spelling}`",
+        "{at}: `{}` is a key, not an id — write `{spelling}`",
         k.name
     )
 }
@@ -811,10 +811,10 @@ fn as_written(value: &kdl::KdlValue) -> String {
     }
 }
 
-/// A pane's name: exactly one string, unannotated. It is not an
+/// A pane's id: exactly one string, unannotated. It is not an
 /// internal handle — it renders as the box title and reaches the child
 /// as `RAT_PANE` — so a second name or a number cannot be dropped.
-fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
+fn one_id(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
     // Either position: `(u8)pane "log"` and `pane (name)"log"` are both
     // a token that reaches nothing (D-7).
     let annotation = std::iter::once(node.ty())
@@ -834,11 +834,27 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
     }
     let values = positional(node);
     match values.as_slice() {
-        [value] => value.as_string().map(str::to_string).ok_or_else(|| {
-            anyhow!("{label}: a pane's name is a string — write `pane \"log\" {{ … }}`")
-        }),
+        [value] => {
+            let id = value.as_string().map(str::to_string).ok_or_else(|| {
+                anyhow!("{label}: a pane's id is a string — write `pane \"log\" {{ … }}`")
+            })?;
+            // RFC 3986 unreserved, one or more: every id is literally
+            // a valid URI fragment, so `ref="#id"` never needs
+            // percent-encoding. Display text belongs in `title`.
+            if id.is_empty()
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+            {
+                bail!(
+                    "{label}: a pane's id sticks to letters, digits, and - . _ ~ — \
+                     display text belongs in `title`"
+                );
+            }
+            Ok(id)
+        }
         [first, second, ..] => {
-            // The scan starts at index 1: index 0 is the name slot,
+            // The scan starts at index 1: index 0 is the id slot,
             // always. KNOWN LIMIT, kept deliberately: `pane shell
             // #true` (the name omitted AND the bare spelling) keeps
             // the name error, because a stray key at index 0 cannot
@@ -849,12 +865,12 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
                 return Err(stray_key_err(label, k, &values[1..]));
             }
             bail!(
-                "{label}: a pane takes ONE name, but {} follows {}",
+                "{label}: a pane takes ONE id, but {} follows {}",
                 as_written(second),
                 as_written(first)
             )
         }
-        [] => bail!("{label}: this pane needs a name — write `pane \"log\" {{ … }}`"),
+        [] => bail!("{label}: this pane needs an id — write `pane \"log\" {{ … }}`"),
     }
 }
 
@@ -981,11 +997,11 @@ mod tests {
     fn a_bare_key_on_defaults_teaches_the_property_spelling() {
         assert_eq!(
             container_err("defaults shell #true\npane \"a\" { command \"true\" height 3 }"),
-            "defaults: `shell` is a key, not a name — write `shell=#true`"
+            "defaults: `shell` is a key, not an id — write `shell=#true`"
         );
         assert_eq!(
             container_err("defaults interval \"5s\"\npane \"a\" { command \"true\" height 3 }"),
-            "defaults: `interval` is a key, not a name — write `interval=\"5s\"`"
+            "defaults: `interval` is a key, not an id — write `interval=\"5s\"`"
         );
         // A List key has no property spelling — the child-node
         // sentence, the same one the property path teaches.
@@ -1006,13 +1022,13 @@ mod tests {
     fn a_bare_key_after_a_pane_name_teaches_the_property_spelling() {
         assert_eq!(
             container_err("pane \"a\" shell #true { command \"true\" height 3 }"),
-            "pane #1: `shell` is a key, not a name — write `shell=#true`"
+            "pane #1: `shell` is a key, not an id — write `shell=#true`"
         );
         // The breadcrumb survives nesting, and the spelling echoes the
         // author's own value.
         assert_eq!(
             container_err("row {\n    pane \"a\" height 3 { command \"true\" }\n}"),
-            "row #1 > pane #1: `height` is a key, not a name — write `height=3`"
+            "row #1 > pane #1: `height` is a key, not an id — write `height=3`"
         );
         assert_eq!(
             container_err("pane \"a\" command \"git\" \"log\" { height 3 }"),
@@ -1029,11 +1045,11 @@ mod tests {
         // is the fallback.
         assert_eq!(
             container_err("pane \"a\" shell height 3 { command \"true\" }"),
-            "pane #1: `shell` is a key, not a name — write `shell=#true`"
+            "pane #1: `shell` is a key, not an id — write `shell=#true`"
         );
         assert_eq!(
             container_err("defaults height #true\npane \"a\" { command \"true\" height 3 }"),
-            "defaults: `height` is a key, not a name — write `height=7`"
+            "defaults: `height` is a key, not an id — write `height=7`"
         );
         // The same rule for a document setting: `gap` takes an
         // integer, so a non-integer is never echoed into the example.
@@ -1304,7 +1320,7 @@ pane "nested" {
     fn names_of(file: &DashboardFile) -> Vec<&str> {
         file.panes
             .iter()
-            .map(|decl| decl.name.as_deref().expect("a named pane"))
+            .map(|decl| decl.id.as_deref().expect("a named pane"))
             .collect()
     }
 
@@ -1425,19 +1441,19 @@ pane "nested" {
             container_err(
                 "row {\n    pane \"log\" {\n        command \"date\"\n    }\n    pane {\n        command \"date\"\n    }\n}\n"
             ),
-            "row #1 > pane #2: this pane needs a name — write `pane \"log\" { … }`"
+            "row #1 > pane #2: this pane needs an id — write `pane \"log\" { … }`"
         );
     }
 
     #[test]
-    fn a_pane_takes_one_name() {
+    fn a_pane_takes_one_id() {
         assert_eq!(
             container_err("row {\n    pane \"a\" \"b\" {\n        command \"date\"\n    }\n}\n"),
-            "row #1 > pane #1: a pane takes ONE name, but \"b\" follows \"a\""
+            "row #1 > pane #1: a pane takes ONE id, but \"b\" follows \"a\""
         );
         assert_eq!(
             container_err("row {\n    pane 3 {\n        command \"date\"\n    }\n}\n"),
-            "row #1 > pane #1: a pane's name is a string — write `pane \"log\" { … }`"
+            "row #1 > pane #1: a pane's id is a string — write `pane \"log\" { … }`"
         );
     }
 
@@ -1447,7 +1463,7 @@ pane "nested" {
     fn a_row_holds_pane_blocks_not_pane_names() {
         assert_eq!(
             container_err("row \"log\"\n"),
-            "row #1: a row holds `pane` blocks, not pane names — declare the pane where it sits, like `row { pane \"log\" { … } }`"
+            "row #1: a row holds `pane` blocks, not pane ids — declare the pane where it sits, like `row { pane \"log\" { … } }`"
         );
     }
 
@@ -1561,7 +1577,7 @@ pane "all" {
         )
         .expect("parses");
         let pane = &file.panes[0];
-        assert_eq!(pane.name.as_deref(), Some("all"));
+        assert_eq!(pane.id.as_deref(), Some("all"));
         assert_eq!(
             pane.command,
             Some(vec!["git".to_string(), "log".to_string()])
@@ -1603,6 +1619,22 @@ pane "all" {
         ] {
             let err = format!("{:#}", parse(text).unwrap_err());
             assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn an_id_sticks_to_unreserved_characters() {
+        // RFC 3986 unreserved, one or more: every id is literally a
+        // valid URI fragment, so reference syntax never needs
+        // percent-encoding. Display text belongs in `title`.
+        for bad in ["repo status", "a#b", "a/b", "caf\u{e9}", "a%b", ""] {
+            let text = format!("pane {bad:?} {{\n    height 3\n    command \"date\"\n}}\n");
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert!(err.contains("letters, digits"), "for {bad:?}: {err}");
+        }
+        for good in ["a", "A-1", "a.b", "under_score", "til~de", "0"] {
+            let text = format!("pane {good:?} {{\n    height 3\n    command \"date\"\n}}\n");
+            parse(&text).unwrap_or_else(|e| panic!("{good:?} should parse: {e:#}"));
         }
     }
 
@@ -1674,12 +1706,12 @@ pane "all" {
     }
 
     #[test]
-    fn defaults_takes_no_name() {
+    fn defaults_takes_no_id() {
         let err = format!(
             "{:#}",
             parse("defaults \"x\" {\n    height 3\n}\n").unwrap_err()
         );
-        assert!(err.contains("no name"), "{err}");
+        assert!(err.contains("no id"), "{err}");
     }
 
     /// The top-level pane name was read with a first-one-wins helper, so
@@ -1687,7 +1719,7 @@ pane "all" {
     #[test]
     fn a_top_level_pane_takes_exactly_one_string_name() {
         for (text, wanted) in [
-            ("pane \"a\" \"b\" {\n    height 3\n}\n", "ONE name"),
+            ("pane \"a\" \"b\" {\n    height 3\n}\n", "ONE id"),
             ("pane 3 {\n    height 3\n}\n", "is a string"),
             ("(u8)pane \"a\" {\n    height 3\n}\n", "type annotation"),
         ] {

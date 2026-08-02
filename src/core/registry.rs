@@ -19,7 +19,7 @@ pub struct SourceId(pub usize);
 /// What one source runs and how often — what every surface constructs.
 #[derive(Clone, PartialEq, Debug)]
 pub struct SourceSpec {
-    pub name: String,
+    pub id: String,
     /// argv when `shell` is false; the single script string (joined
     /// with spaces, exactly as `rat watch --shell` does) when it is
     /// true.
@@ -178,12 +178,12 @@ impl Registry {
             match count {
                 0 => bail!(
                     "pane {:?} is declared but never placed in the layout",
-                    source.name
+                    source.id
                 ),
                 1 => {}
                 n => bail!(
                     "pane {:?} is placed {n} times in the layout; place it once",
-                    source.name
+                    source.id
                 ),
             }
         }
@@ -193,7 +193,7 @@ impl Registry {
                 bail!(
                     "pane {:?} is {} rows tall, but its border, padding, and status row \
                      already take {frame}: give it at least {}",
-                    source.name,
+                    source.id,
                     pane.height,
                     frame.saturating_add(1)
                 );
@@ -425,9 +425,9 @@ fn declared_weight(width: PaneWidth) -> usize {
 mod tests {
     use super::*;
 
-    fn spec(name: &str) -> SourceSpec {
+    fn spec(id: &str) -> SourceSpec {
         SourceSpec {
-            name: name.to_string(),
+            id: id.to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: Some(Duration::from_secs(2)),
@@ -723,7 +723,7 @@ mod tests {
             registry.ids().collect::<Vec<_>>(),
             vec![SourceId(0), SourceId(1), SourceId(2)]
         );
-        assert_eq!(registry.spec(SourceId(2)).name, "guardrails");
+        assert_eq!(registry.spec(SourceId(2)).id, "guardrails");
         let geom = registry.geometry((80, 40));
         // The stacked pane owns the full width; the row splits it: the
         // fixed pane takes 20, the weighted one the rest minus the gap.
