@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::ConfirmArgs;
 use crate::color::ColorProfile;
@@ -44,7 +45,9 @@ impl UiApp for ConfirmApp {
             (inactive, active)
         };
         buf.set_string(2, 1, &yes, yes_style);
-        let no_x = 2 + yes.len() as u16 + 3;
+        // Cells, not bytes: a non-ASCII label spans fewer columns than it
+        // does bytes, and the buffer is addressed in columns.
+        let no_x = 2 + yes.as_str().width() as u16 + 3;
         buf.set_string(no_x, 1, &no, no_style);
     }
 
@@ -101,6 +104,28 @@ mod tests {
         app.render(area, &mut buf);
         let cell = buf.cell((2, 1)).expect("the active button is painted");
         (cell.fg, cell.bg)
+    }
+
+    #[test]
+    fn the_second_button_is_placed_by_cells_not_bytes() {
+        // `yes.len()` is a BYTE count: a non-ASCII affirmative pushed the
+        // negative button right by the difference between its bytes and
+        // its display width.
+        let app = ConfirmApp {
+            state: ConfirmState { affirmative: true },
+            prompt: "Ship it?".into(),
+            affirmative: "はい".into(),
+            negative: "No".into(),
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        // " はい " spans 6 cells from column 2, so the gap runs 8..11 and
+        // the negative button opens at 11.
+        assert_eq!(buf.cell((8, 1)).unwrap().symbol(), " ", "gap after yes");
+        assert_eq!(buf.cell((11, 1)).unwrap().symbol(), " ", "no button pad");
+        assert_eq!(buf.cell((12, 1)).unwrap().symbol(), "N");
     }
 
     fn rendered(palette: Palette) -> Vec<String> {
