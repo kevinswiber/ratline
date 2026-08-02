@@ -2897,6 +2897,54 @@ fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
     grew
 }
 
+/// `pane "logs"` / `panes "logs", "metrics"` — the names a diagnostic
+/// points with, quoted the way the author wrote them.
+fn pane_list(registry: &Registry, waiting: &[SourceId]) -> String {
+    let names = waiting
+        .iter()
+        .map(|id| format!("{:?}", registry.spec(*id).name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if waiting.len() == 1 { "pane" } else { "panes" };
+    format!("{noun} {names}")
+}
+
+/// `5s` / `300ms` — a wait, briefly.
+fn brief_duration(d: Duration) -> String {
+    if d.subsec_millis() == 0 {
+        format!("{}s", d.as_secs())
+    } else {
+        format!("{}ms", d.as_millis())
+    }
+}
+
+/// The one-shot stderr notice for a `--once` run that has gone quiet:
+/// which panes it is waiting on, for how long, and what to WRITE. A
+/// pane that never exits by design must be declared `live=#true` — but
+/// a pane that already declared it is never told to; when every waiting
+/// pane is live, the wait is simply a child that has not spoken yet.
+/// Pure and portable: no clock reads, no cfg, no mutation.
+// Staged: step 3d becomes the caller.
+#[allow(dead_code)]
+fn once_waiting_text(registry: &Registry, waiting: &[SourceId], after: Duration) -> String {
+    let all_live = waiting.iter().all(|id| registry.spec(*id).live);
+    let state = if all_live {
+        if waiting.len() == 1 {
+            "the live child has printed nothing yet. "
+        } else {
+            "the live children have printed nothing yet. "
+        }
+    } else {
+        "no output, no exit. A command that follows instead of exiting \
+         must be declared `live=#true`; "
+    };
+    format!(
+        "rat dashboard: --once is still waiting on {} after {}: {state}`--once-timeout 30s` bounds the wait.",
+        pane_list(registry, waiting),
+        brief_duration(after),
+    )
+}
+
 /// A pane's spawn-error wording: the pane names itself (the default
 /// border draws no title, so the body is the only surface that can),
 /// the OS reason comes next, the path comes last. A pane truncates
@@ -3891,6 +3939,83 @@ mod tests {
             0,
         )
         .expect("a valid two-pane registry")
+    }
+
+    fn once_registry(panes: &[(&str, bool)]) -> Registry {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let sources = panes
+            .iter()
+            .map(|(name, live)| SourceSpec {
+                name: (*name).to_string(),
+                command: vec!["true".to_string()],
+                shell: false,
+                interval: Some(Duration::from_secs(3600)),
+                triggers: Vec::new(),
+                debounce: Duration::from_millis(250),
+                live: *live,
+            })
+            .collect::<Vec<_>>();
+        let boxes = panes
+            .iter()
+            .map(|_| PaneBox {
+                height: 3,
+                width: PaneWidth::Weight(1),
+                overflow: Overflow::KeepTop,
+                border: BorderPreset::None,
+                padding: Sides::default(),
+                title: None,
+                chrome: true,
+            })
+            .collect::<Vec<_>>();
+        let cells = (0..panes.len())
+            .map(|i| LayoutNode::Pane(SourceId(i)))
+            .collect();
+        Registry::panes(sources, boxes, LayoutNode::Column(cells), 0, 0).expect("a valid registry")
+    }
+
+    #[test]
+    fn the_once_notice_names_every_waiting_pane_and_the_declaration_to_write() {
+        let registry = once_registry(&[("logs", false), ("metrics", false)]);
+        assert_eq!(
+            once_waiting_text(&registry, &[SourceId(0)], Duration::from_secs(5)),
+            "rat dashboard: --once is still waiting on pane \"logs\" after 5s: no output, no exit. A command that follows instead of exiting must be declared `live=#true`; `--once-timeout 30s` bounds the wait."
+        );
+        assert_eq!(
+            once_waiting_text(
+                &registry,
+                &[SourceId(0), SourceId(1)],
+                Duration::from_secs(5)
+            ),
+            "rat dashboard: --once is still waiting on panes \"logs\", \"metrics\" after 5s: no output, no exit. A command that follows instead of exiting must be declared `live=#true`; `--once-timeout 30s` bounds the wait."
+        );
+    }
+
+    #[test]
+    fn the_once_notice_drops_the_live_advice_when_every_waiting_pane_declared_it() {
+        let registry = once_registry(&[("logs", true), ("tail", true), ("build", false)]);
+        assert_eq!(
+            once_waiting_text(&registry, &[SourceId(0)], Duration::from_secs(5)),
+            "rat dashboard: --once is still waiting on pane \"logs\" after 5s: the live child has printed nothing yet. `--once-timeout 30s` bounds the wait."
+        );
+        // Plural stays grammatical.
+        assert_eq!(
+            once_waiting_text(
+                &registry,
+                &[SourceId(0), SourceId(1)],
+                Duration::from_secs(5)
+            ),
+            "rat dashboard: --once is still waiting on panes \"logs\", \"tail\" after 5s: the live children have printed nothing yet. `--once-timeout 30s` bounds the wait."
+        );
+        // ANY undeclared waiting pane keeps the teaching advice.
+        assert_eq!(
+            once_waiting_text(
+                &registry,
+                &[SourceId(0), SourceId(2)],
+                Duration::from_secs(5)
+            ),
+            "rat dashboard: --once is still waiting on panes \"logs\", \"build\" after 5s: no output, no exit. A command that follows instead of exiting must be declared `live=#true`; `--once-timeout 30s` bounds the wait."
+        );
     }
 
     #[test]
