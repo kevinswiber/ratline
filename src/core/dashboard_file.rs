@@ -37,6 +37,10 @@ const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// validation path turns it into a [`Registry`].
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct DashboardFile {
+    /// The whole dashboard's name, one bold line above the composed
+    /// panes — a different thing from any pane's own `title`, which
+    /// labels one box's border.
+    pub title: Option<String>,
     pub gap: Option<usize>,
     pub row_gap: Option<usize>,
     pub defaults: PaneDecl,
@@ -123,13 +127,14 @@ impl DashboardFile {
             boxes.push(resolve_box(decl, &self.defaults, name)?);
         }
         let layout = resolve_layout(self.layout.as_deref(), &names)?;
-        Registry::panes(
+        Ok(Registry::panes(
             sources,
             boxes,
             layout,
             self.gap.unwrap_or(0),
             self.row_gap.unwrap_or(0),
-        )
+        )?
+        .with_title(self.title.clone()))
     }
 
     /// Every pane's name, in declaration order. Names are the file's

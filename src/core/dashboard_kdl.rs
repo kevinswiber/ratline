@@ -396,6 +396,10 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
     let mut settings: Vec<&'static str> = Vec::new();
     for node in doc.nodes() {
         match node.name().value() {
+            "title" => {
+                declared_once("title", &mut settings)?;
+                file.title = Some(string_field(node, "title")?);
+            }
             "gap" => {
                 declared_once("gap", &mut settings)?;
                 file.gap = Some(usize_field(node, "gap")?);
@@ -435,7 +439,7 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             other => {
                 bail!(
                     "unknown node {other:?} — a dashboard's top level takes \
-                     gap, row-gap, defaults, pane, row, or column"
+                     title, gap, row-gap, defaults, pane, row, or column"
                 )
             }
         }
@@ -857,6 +861,42 @@ fn one_name(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
 /// Checked, field-named conversion: a negative value must FAIL LOUDLY,
 /// never wrap — `as usize` would turn `gap -1` into a repeat count near
 /// usize::MAX, which `" ".repeat(gap)` would try to allocate.
+/// `usize_field`'s string sibling: same shape checks — no annotation
+/// anywhere, no properties, no block, exactly one positional — with a
+/// string where the integer would be.
+fn string_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<String> {
+    let example = format!("{name} \"Deploy status\"");
+    if let Some(ty) = node.ty() {
+        bail!(
+            "the ({}) type annotation on `{name}` has no meaning here — remove it",
+            ty.value()
+        );
+    }
+    if node.entries().iter().any(|entry| entry.name().is_some()) {
+        bail!("{name} takes no properties — write `{example}`");
+    }
+    if let Some(entry) = node
+        .entries()
+        .iter()
+        .find(|entry| entry.name().is_none() && entry.ty().is_some())
+    {
+        bail!(
+            "the ({}) type annotation on `{name}` has no meaning here — remove it",
+            entry.ty().expect("filtered to annotated").value()
+        );
+    }
+    if node.children().is_some() {
+        bail!("{name} takes one string and holds no block — write `{example}`");
+    }
+    match positional(node).as_slice() {
+        [value] => value
+            .as_string()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("{name} takes one string — write `{example}`")),
+        _ => bail!("{name} takes one string — write `{example}`"),
+    }
+}
+
 fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
     // A document setting's own answers: it is a node, not a key, so it
     // has no property spelling to offer — and like any key it carries
@@ -1465,10 +1505,10 @@ pane "nested" {
     }
 
     #[test]
-    fn an_unknown_top_level_node_names_the_six() {
+    fn an_unknown_top_level_node_names_the_seven() {
         assert_eq!(
             container_err("panes {\n    pane \"log\" {\n        command \"date\"\n    }\n}\n"),
-            "unknown node \"panes\" — a dashboard's top level takes gap, row-gap, defaults, pane, row, or column"
+            "unknown node \"panes\" — a dashboard's top level takes title, gap, row-gap, defaults, pane, row, or column"
         );
     }
 
@@ -1560,6 +1600,60 @@ pane "all" {
                 "#true or #false",
             ),
             ("pane \"log\" {\n    command\n}\n", "one or more strings"),
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn a_dashboard_title_parses_and_both_meanings_coexist() {
+        // The same word at two positions carries two meanings: the
+        // top-level `title` names the whole dashboard, a pane's
+        // `title` labels its own border. Both survive one file.
+        let file = parse(
+            "title \"Deploy status\"\npane \"build\" {\n    height 3\n    command \"date\"\n    title \"Build log\"\n}\n",
+        )
+        .expect("parses");
+        assert_eq!(file.title.as_deref(), Some("Deploy status"));
+        assert_eq!(file.panes[0].title.as_deref(), Some("Build log"));
+        // Undeclared stays absent — the row is not rendered from an
+        // empty string.
+        let bare = parse("pane \"a\" {\n    height 3\n    command \"date\"\n}\n").expect("parses");
+        assert_eq!(bare.title, None);
+    }
+
+    #[test]
+    fn the_dashboard_title_reaches_the_composition() {
+        use crate::core::registry::Composition;
+        let registry =
+            parse("title \"Deploy status\"\npane \"a\" {\n    height 3\n    command \"date\"\n}\n")
+                .expect("parses")
+                .into_registry()
+                .expect("validates");
+        let Composition::Panes { title, .. } = registry.composition() else {
+            panic!("a dashboard registry composes panes");
+        };
+        assert_eq!(title.as_deref(), Some("Deploy status"));
+        let registry = parse("pane \"a\" {\n    height 3\n    command \"date\"\n}\n")
+            .expect("parses")
+            .into_registry()
+            .expect("validates");
+        let Composition::Panes { title, .. } = registry.composition() else {
+            panic!("a dashboard registry composes panes");
+        };
+        assert_eq!(*title, None);
+    }
+
+    #[test]
+    fn title_takes_one_string_and_nothing_else() {
+        for (text, wanted) in [
+            ("title x=\"y\"\n", "no properties"),
+            ("title \"a\" \"b\"\n", "one string"),
+            ("title 3\n", "one string"),
+            ("title \"a\" {\n}\n", "holds no block"),
+            ("(u8)title \"a\"\n", "type annotation"),
+            ("title (u8)\"a\"\n", "type annotation"),
         ] {
             let err = format!("{:#}", parse(text).unwrap_err());
             assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
@@ -1708,6 +1802,10 @@ pane "all" {
             (
                 "defaults { height 3 }\ndefaults { height 9 }\npane \"a\" { command \"date\" }\n",
                 "`defaults` is declared twice — a dashboard declares it once",
+            ),
+            (
+                "title \"a\"\ntitle \"b\"\npane \"a\" { height 3; command \"date\" }\n",
+                "`title` is declared twice — a dashboard declares it once",
             ),
         ] {
             assert_eq!(container_err(text), wanted);
