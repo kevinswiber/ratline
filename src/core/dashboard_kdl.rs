@@ -463,8 +463,21 @@ fn inline_node(
     refuse_container_properties(node, label, container_kind(node))?;
     // A bare name here would be the old spelling leaking in: this row's
     // cells ARE the panes, and accepting a name would put one pane's
-    // declaration back in two places.
-    if !positional(node).is_empty() {
+    // declaration back in two places. A bare token that names a
+    // setting or a pane key gets a teaching answer first — the
+    // setting's, then the key's, since `gap` on a row is the nearer
+    // miss.
+    let values = positional(node);
+    if !values.is_empty() {
+        if let Some(name) = stray_setting(&values) {
+            return Err(stray_setting_err(label, name, &values));
+        }
+        if let Some(k) = stray_key(&values) {
+            bail!(
+                "{label}: `{}` is a pane's key — write it on a `pane` block inside this {kind}",
+                k.name
+            );
+        }
         bail!(
             "{label}: a {kind} holds `pane` blocks, not pane names — \
              declare the pane where it sits, like `{kind} {{ pane \"log\" {{ … }} }}`"
@@ -926,6 +939,28 @@ mod tests {
         assert_eq!(
             container_err("pane \"a\" command \"git\" \"log\" { height 3 }"),
             "pane #1: `command` holds a list, so it must be a child node — write `command \"git\" \"log\"` inside the block"
+        );
+    }
+
+    #[test]
+    fn a_bare_gap_on_a_container_names_the_dashboards_gap() {
+        assert_eq!(
+            container_err("row gap 1 { pane \"a\" height 3 { command \"true\" } }"),
+            "row #1: `gap` is the whole dashboard's, declared once at the top level as `gap 1`"
+        );
+        // The other container, the other setting, the author's own
+        // value — one template, every substitution pinned.
+        assert_eq!(
+            container_err("column row-gap 2 { pane \"a\" height 3 { command \"true\" } }"),
+            "column #1: `row-gap` is the whole dashboard's, declared once at the top level as `row-gap 2`"
+        );
+    }
+
+    #[test]
+    fn a_bare_pane_key_on_a_container_says_where_it_belongs() {
+        assert_eq!(
+            container_err("row shell #true { pane \"a\" height 3 { command \"true\" } }"),
+            "row #1: `shell` is a pane's key — write it on a `pane` block inside this row"
         );
     }
 
