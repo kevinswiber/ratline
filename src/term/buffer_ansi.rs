@@ -148,8 +148,10 @@ mod tests {
 
     #[test]
     fn a_trailing_reversed_blank_survives_the_trim() {
-        // The caret one past the end of the line is a reversed space; it
-        // must reach the terminal, not fall to the trailing-blank trim.
+        // A styled blank is content, not padding: any reversed trailing
+        // space must reach the terminal, not fall to the trailing-blank
+        // trim. (No shipped surface paints one today; the rule holds for
+        // any buffer that does.)
         let area = Rect::new(0, 0, 10, 1);
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "hi", Style::default());

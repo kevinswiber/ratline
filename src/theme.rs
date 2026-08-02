@@ -74,8 +74,9 @@ pub struct Palette {
     // physically appended after the internal log fields.
     pub selection: Color,
     pub r#match: Color,
-    /// `Color::Reset` because the caret carries no color today; a future
-    /// value source (or `reverse` support in `StyleSpec`) gives it one.
+    /// `Color::Reset`, and currently dormant: the `rat input` caret is
+    /// the terminal's own cursor, so no cell reads this token. Kept for
+    /// compatibility and any future painted-cursor surface.
     pub cursor: Color,
     /// `Color::Reset` because placeholder text is faint-only today; the
     /// attribute, not a hue, is what sets it apart.
