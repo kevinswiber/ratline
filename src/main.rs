@@ -74,7 +74,8 @@ fn real_main() -> i32 {
         Err(err) => {
             match &err {
                 AppError::Fail(inner) => eprintln!("rat: {inner:#}"),
-                AppError::Timeout => eprintln!("timed out"),
+                AppError::Timeout(None) => eprintln!("timed out"),
+                AppError::Timeout(Some(detail)) => eprintln!("rat: {detail:#}"),
                 AppError::NoSelection | AppError::Aborted | AppError::Child(_) => {}
             }
             err.code()
@@ -118,7 +119,7 @@ fn dispatch(command: Command, profile: ColorProfile, palette: Palette) -> exit::
             match args.code {
                 0 => Ok(()),
                 1 => Err(AppError::NoSelection),
-                124 => Err(AppError::Timeout),
+                124 => Err(AppError::Timeout(None)),
                 130 => Err(AppError::Aborted),
                 n => Err(AppError::Child(n)),
             }

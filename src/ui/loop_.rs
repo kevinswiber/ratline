@@ -57,7 +57,7 @@ pub fn run_ui<A: UiApp>(
             Some(d) => {
                 let now = Instant::now();
                 if now >= d {
-                    break Err(AppError::Timeout);
+                    break Err(AppError::Timeout(None));
                 }
                 (d - now).min(Duration::from_millis(250))
             }
