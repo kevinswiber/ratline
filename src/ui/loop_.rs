@@ -30,6 +30,19 @@ pub trait UiApp {
     fn cursor_pos(&self) -> Option<(u16, u16)> {
         None
     }
+    /// Learn the terminal size before painting. An app with a scrolling
+    /// field needs the width to place its window, and `render` cannot
+    /// mutate. Called every iteration, so a resize lands here too.
+    fn prepare(&mut self, _term: (u16, u16)) {}
+}
+
+/// Where the hardware cursor may actually be parked. A scrolling field
+/// keeps its caret inside the frame, so this is a guard rather than a
+/// placement: a caret past the last column has no cell of its own, and
+/// clamping it there would park it *on* the final character instead of
+/// after it. Decline the park instead of lying about it.
+fn park_target(cursor: Option<(u16, u16)>, cols: u16, height: u16) -> Option<(u16, u16)> {
+    cursor.filter(|&(col, row)| col < cols && row < height)
 }
 
 /// Drive a UiApp on the UI stream: raw mode, event pump, inline repaint.
@@ -52,15 +65,12 @@ pub fn run_ui<A: UiApp>(
     let deadline = timeout.map(|t| Instant::now() + t);
     let outcome = loop {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        app.prepare((cols, rows));
         let height = app.height((cols, rows)).clamp(1, rows);
         let area = Rect::new(0, 0, cols, height);
         let mut buf = Buffer::empty(area);
         app.render(area, &mut buf);
-        // Clamp the caret to the frame: a value longer than the terminal
-        // clips at the right edge, and the cursor clips with it.
-        let cursor = app
-            .cursor_pos()
-            .map(|(col, row)| (col.min(cols.saturating_sub(1)), row.min(height - 1)));
+        let cursor = park_target(app.cursor_pos(), cols, height);
         renderer
             .draw_with_cursor(&buffer_to_lines(&buf, profile), cols, cursor)
             .context("painting ui")?;
@@ -96,4 +106,33 @@ pub fn run_ui<A: UiApp>(
     renderer.clear().context("clearing ui")?;
     renderer.finish().context("restoring terminal")?;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_caret_inside_the_frame_parks_where_it_asked() {
+        assert_eq!(park_target(Some((0, 0)), 20, 2), Some((0, 0)));
+        assert_eq!(park_target(Some((19, 1)), 20, 2), Some((19, 1)));
+    }
+
+    #[test]
+    fn a_caret_past_the_last_column_declines_rather_than_lying() {
+        // Clamping to cols-1 would park the cursor ON the final
+        // character; there is no honest cell, so no park.
+        assert_eq!(park_target(Some((20, 0)), 20, 2), None);
+        assert_eq!(park_target(Some((99, 0)), 20, 2), None);
+    }
+
+    #[test]
+    fn a_caret_below_the_frame_declines_too() {
+        assert_eq!(park_target(Some((0, 2)), 20, 2), None);
+    }
+
+    #[test]
+    fn no_caret_stays_no_caret() {
+        assert_eq!(park_target(None, 20, 2), None);
+    }
 }

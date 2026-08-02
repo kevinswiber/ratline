@@ -36,7 +36,9 @@ impl UiApp for InputApp {
         // Cell width, not char count: a wide prompt occupies more cells
         // than chars, and the text starts after the cells.
         let x = self.prompt.as_str().width() as u16;
-        let text = self.state.display(&self.placeholder);
+        // The field's own window: a long value scrolls rather than
+        // running off the edge. The buffer clips it at the frame edge.
+        let text = self.state.visible(&self.placeholder);
         let style = if self.state.value.is_empty() {
             Style::default()
                 .add_modifier(Modifier::DIM)
@@ -56,17 +58,16 @@ impl UiApp for InputApp {
     }
 
     fn cursor_pos(&self) -> Option<(u16, u16)> {
-        // Cells, not chars: the renderer consumes the column as terminal
-        // cells, and wide glyphs occupy two. An empty value keeps the
-        // caret at the text start — never inside the placeholder.
+        // Cells, not chars, and measured inside the field's window: the
+        // renderer consumes the column as terminal cells.
         let row = u16::from(self.header.is_some());
-        let mut col = self.prompt.as_str().width();
-        if !self.state.value.is_empty() {
-            let text = self.state.display(&self.placeholder);
-            let before: String = text.chars().take(self.state.cursor).collect();
-            col += before.width();
-        }
+        let col = self.prompt.as_str().width() + self.state.caret_col();
         Some((col as u16, row))
+    }
+
+    fn prepare(&mut self, term: (u16, u16)) {
+        let avail = usize::from(term.0).saturating_sub(self.prompt.as_str().width());
+        self.state.follow(avail);
     }
 }
 

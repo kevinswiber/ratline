@@ -15,6 +15,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Accumulate everything the session writes within `total`.
 fn drain_for(session: &PtySession, total: Duration) -> Vec<u8> {
     let deadline = std::time::Instant::now() + total;
@@ -83,6 +90,48 @@ fn the_hardware_cursor_rests_on_the_caret() {
         !session.kill_if_alive(Duration::from_secs(5)),
         "rat input must exit on its own after Enter"
     );
+}
+
+/// A value that reaches the right edge scrolls the field instead of
+/// pinning the caret on the last character — the reported bug: once the
+/// text filled the row the caret stuck to the final cell forever.
+#[test]
+fn a_full_field_scrolls_and_keeps_the_caret_past_the_text() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["input", "--prompt", "> "],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat input under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // A 20-column terminal leaves an 18-cell field after the prompt.
+    session.set_winsize(10, 20);
+
+    assert!(
+        wait_for(&session, &mut terminal, b"\x1b[2C", Duration::from_secs(5)),
+        "the empty field parks the caret at the prompt edge"
+    );
+    // Type 18 characters: one more than the field can show alongside the
+    // caret, so the window must slide by one.
+    session.write_bytes(b"abcdefghijklmnopqr");
+
+    // The discriminator is the painted line, not the caret column alone:
+    // an unscrolled field passes through column 19 on its way to the
+    // edge, but its text always still starts at 'a'. A frame whose text
+    // begins at 'b' exists only once the window has slid.
+    let scrolled = b"\x1b[0mbcdefghijklmnopqr";
+    let seen = wait_for_bytes(&session, &mut terminal, scrolled, Duration::from_secs(5))
+        .expect("the field must scroll, dropping the leading 'a'");
+    let after_frame = &seen[find(&seen, scrolled).expect("just matched") + scrolled.len()..];
+    assert!(
+        contains(after_frame, b"\x1b[19C"),
+        "the caret must park one past the scrolled text, not on it: {:?}",
+        String::from_utf8_lossy(after_frame)
+    );
+
+    session.write_bytes(b"\r");
+    let _ = drain_for(&session, Duration::from_millis(300));
+    session.kill_if_alive(Duration::from_secs(5));
 }
 
 /// `wait_for`, returning the accumulated bytes once `needle` appears —

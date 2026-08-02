@@ -45,7 +45,8 @@ impl UiApp for FilterApp {
         buf.set_string(0, y, &self.prompt, accent);
         // Cell width, not char count — same rule as the input prompt.
         let qx = self.prompt.as_str().width() as u16;
-        let qtext = self.state.query.display(&self.placeholder);
+        // The query scrolls in its own window, same as `rat input`.
+        let qtext = self.state.query.visible(&self.placeholder);
         let qstyle = if self.state.query.value.is_empty() {
             Style::default()
                 .add_modifier(Modifier::DIM)
@@ -107,21 +108,15 @@ impl UiApp for FilterApp {
     }
 
     fn cursor_pos(&self) -> Option<(u16, u16)> {
-        // Cells, not chars — wide glyphs occupy two; an empty query keeps
-        // the caret at the text start, never inside the placeholder.
+        // Cells, not chars, and measured inside the query's window.
         let row = u16::from(self.header.is_some());
-        let mut col = self.prompt.as_str().width();
-        if !self.state.query.value.is_empty() {
-            let before: String = self
-                .state
-                .query
-                .value
-                .chars()
-                .take(self.state.query.cursor)
-                .collect();
-            col += before.width();
-        }
+        let col = self.prompt.as_str().width() + self.state.query.caret_col();
         Some((col as u16, row))
+    }
+
+    fn prepare(&mut self, term: (u16, u16)) {
+        let avail = usize::from(term.0).saturating_sub(self.prompt.as_str().width());
+        self.state.query.follow(avail);
     }
 }
 
