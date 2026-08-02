@@ -707,7 +707,7 @@ fn a_stable_frame_scrolls_live() {
     session.write_bytes(b"g");
     let noop = drain_for(&session, Duration::from_millis(400));
     assert!(
-        !contains(&noop, "· live".as_bytes()),
+        !contains(&noop, "live ·".as_bytes()),
         "g at the top must not enter live-scroll"
     );
     assert!(
@@ -721,7 +721,7 @@ fn a_stable_frame_scrolls_live() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 46 · live".as_bytes(),
+            "lines 2-23 of 46 · every 50ms · ? help".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -774,7 +774,7 @@ fn the_first_scroll_after_launch_scrolls_live() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 30 · live".as_bytes(),
+            "lines 2-23 of 30 · every 50ms · ? help".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -815,7 +815,7 @@ fn a_jittering_frame_scrolls_live_without_freezing() {
         wait_for_without(
             &session,
             &mut terminal,
-            "· live".as_bytes(),
+            "live · ".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -858,7 +858,7 @@ fn a_shape_change_while_scrolled_stays_live() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 30 · live".as_bytes(),
+            "lines 2-23 of 30 · every 50ms · ? help".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -869,7 +869,7 @@ fn a_shape_change_while_scrolled_stays_live() {
     let seen = wait_for_bytes(
         &session,
         &mut terminal,
-        "of 31 · live".as_bytes(),
+        "of 31 · every".as_bytes(),
         Duration::from_secs(8),
     )
     .expect("expected the scrolled row to pick up the new total, still live");
@@ -929,7 +929,7 @@ fn resuming_from_a_live_window_does_not_rerun_the_child() {
         wait_for_without(
             &session,
             &mut terminal,
-            "· live".as_bytes(),
+            "live · ".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
@@ -984,7 +984,7 @@ fn a_scroll_on_a_frame_that_fits_is_a_noop() {
     session.write_bytes(b"j");
     let noop = drain_for(&session, Duration::from_millis(400));
     assert!(
-        !contains(&noop, "· live".as_bytes()),
+        !contains(&noop, "live ·".as_bytes()),
         "a fitting frame has nowhere to scroll"
     );
     assert!(
@@ -1531,7 +1531,7 @@ fn a_key_repaints_while_a_slow_child_runs() {
         wait_for(
             &session,
             &mut terminal,
-            "· live".as_bytes(),
+            "live · ".as_bytes(),
             Duration::from_millis(1500)
         ),
         "expected a live-scroll repaint inside the child's runtime"
@@ -2709,11 +2709,65 @@ fn a_scrub_forward_exit_keeps_the_scroll_position() {
         wait_for_without(
             &session,
             &mut terminal,
-            "lines 2-23 of 30 · live".as_bytes(),
+            "lines 2-23 of 30 · every 50ms · ? help".as_bytes(),
             b"paused",
             Duration::from_secs(2)
         ),
         "expected the exit to keep the offset in the live view"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn a_scrolled_counting_row_keeps_counting() {
+    // The displayed-age gate regression: with t flipped, the scrolled
+    // row carries the counting form and must keep advancing — a gate
+    // that treats the scrolled row as time-less paints the text once
+    // and stalls, wrong on a running terminal while passing any
+    // single-snapshot test. The counting text leaves its "just now"
+    // plateau at ten seconds; "s ago" on the wire after the scroll is
+    // proof the gate repainted a scrolled frame.
+    let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
+    let rat = rat_bin();
+    let mut args: Vec<&str> = vec!["watch", "-n", "1h", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat, &args, &[]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· ? help".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the live frame"
+    );
+    session.write_bytes(b"t");
+    assert!(
+        wait_for(&session, &mut terminal, b"changed ", Duration::from_secs(2)),
+        "expected the counting live row"
+    );
+    session.write_bytes(b"j");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        "live · changed ".as_bytes(),
+        Duration::from_secs(2),
+    )
+    .expect("expected the scrolled row to carry the counting stamp");
+    assert!(
+        contains(&seen, b"lines 2-23 of 30"),
+        "the range still names the window: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        wait_for(&session, &mut terminal, b"s ago", Duration::from_secs(15)),
+        "expected the scrolled counting age to advance past the plateau"
     );
     session.write_bytes(b"q");
     assert!(

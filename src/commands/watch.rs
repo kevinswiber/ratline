@@ -2144,19 +2144,20 @@ fn age_text(age_secs: u64) -> String {
 }
 
 /// Whole seconds the displayed status row is counting; 0 when it shows
-/// an absolute stamp or no time at all. ONE style at a time: both rows
-/// stamp by default and count only when flipped — a frozen frame must
-/// never read differently from the live one beside it. The
-/// live-scrolled row carries no time in either state.
+/// an absolute stamp or no time at all. ONE style at a time: every row
+/// stamps by default and counts only when flipped — a frozen frame must
+/// never read differently from the live one beside it. The scrolled row
+/// carries the live row's time segment, so it counts with it: a gate
+/// that reads it as time-less paints the counting text once and stalls.
 fn displayed_age(
     pause: Option<&PauseState>,
-    live_scroll: Option<LiveScroll>,
+    _live_scroll: Option<LiveScroll>,
     alt_time: bool,
     changed_at: jiff::Timestamp,
 ) -> u64 {
-    match (alt_time, pause, live_scroll) {
-        (true, Some(p), _) => age_seconds(p.viewed_at),
-        (true, None, None) => age_seconds(changed_at),
+    match (alt_time, pause) {
+        (true, Some(p)) => age_seconds(p.viewed_at),
+        (true, None) => age_seconds(changed_at),
         _ => 0,
     }
 }
@@ -2398,10 +2399,7 @@ fn repaint(
         }
         .render("▌", profile)
     );
-    let time_live = format!(
-        "{}{live_tail}",
-        live_time_segment(view.alt_time, &live.since, age_seconds(live.changed_at))
-    );
+    let time_seg_live = live_time_segment(view.alt_time, &live.since, age_seconds(live.changed_at));
     let time_paused = pause.map_or_else(
         || age_text(0),
         |p| paused_time_segment(view.alt_time, p.viewed_at, age_seconds(p.viewed_at)),
@@ -2417,7 +2415,8 @@ fn repaint(
         max_height,
         faint,
         profile,
-        &time_live,
+        &time_seg_live,
+        live_tail,
         &time_paused,
         marks.as_deref(),
         &mark_cell,
@@ -2473,7 +2472,8 @@ fn paint_frame(
     max_height: Option<u16>,
     faint: &StyleSpec,
     profile: ColorProfile,
-    time_live: &str,
+    time_seg_live: &str,
+    live_tail: &str,
     time_paused: &str,
     marks: Option<&[LineMark]>,
     mark_cell: &str,
@@ -2489,7 +2489,8 @@ fn paint_frame(
         max_height,
         faint,
         profile,
-        time_live,
+        time_seg_live,
+        live_tail,
         time_paused,
         marks,
         mark_cell,
@@ -2513,7 +2514,8 @@ fn frame_rows(
     max_height: Option<u16>,
     faint: &StyleSpec,
     profile: ColorProfile,
-    time_live: &str,
+    time_seg_live: &str,
+    live_tail: &str,
     time_paused: &str,
     marks: Option<&[LineMark]>,
     mark_cell: &str,
@@ -2581,8 +2583,10 @@ fn frame_rows(
     kept = seal_rows(kept);
     let status = match mode {
         FrameMode::Paused => paused_notice(time_paused, offset, kept.len(), lines.len()),
-        FrameMode::LiveScrolled => scrolled_notice(offset, kept.len(), lines.len()),
-        FrameMode::Live => live_notice(hidden, time_live, dropped),
+        FrameMode::LiveScrolled => {
+            scrolled_notice(time_seg_live, live_tail, offset, kept.len(), lines.len())
+        }
+        FrameMode::Live => live_notice(hidden, &format!("{time_seg_live}{live_tail}"), dropped),
     };
     kept.push(faint.render(&status, profile));
     if let Some(text) = notice {
@@ -3996,6 +4000,7 @@ mod tests {
             &faint,
             ColorProfile::TrueColor,
             "since 12:00:00",
+            " · ? help",
             "",
             None,
             "▌ ",
@@ -4035,6 +4040,7 @@ mod tests {
             &faint,
             ColorProfile::TrueColor,
             "since 12:00:00",
+            " · ? help",
             "",
             None,
             "▌ ",
@@ -4166,12 +4172,15 @@ mod tests {
             0,
             "live default is a stamp"
         );
-        assert_eq!(
-            displayed_age(None, Some(ls), true, old),
-            0,
-            "the scrolled row has no time"
+        assert!(
+            displayed_age(None, Some(ls), true, old) >= 100,
+            "the scrolled row carries the live segment: flipped, it counts"
         );
-        assert_eq!(displayed_age(None, Some(ls), false, old), 0);
+        assert_eq!(
+            displayed_age(None, Some(ls), false, old),
+            0,
+            "the scrolled default is a stamp"
+        );
     }
 
     #[test]

@@ -126,9 +126,24 @@ impl LiveScroll {
     }
 }
 
-/// The live-scrolled status row.
-pub fn scrolled_notice(offset: usize, shown: usize, total: usize) -> String {
-    format!("lines {}-{} of {total} · live", offset + 1, offset + shown)
+/// The live-scrolled status row: the same time segment and tail the
+/// live row carries, with the window's range spliced between them —
+/// the three modes read as one family. `time_seg` is pre-formatted
+/// (`since 12:07:45` or its counting form), and `live_tail` starts
+/// with ` · ` by construction, the same trick the live row relies on.
+/// Like the paused row, no retention marker — that stays live-only.
+pub fn scrolled_notice(
+    time_seg: &str,
+    live_tail: &str,
+    offset: usize,
+    shown: usize,
+    total: usize,
+) -> String {
+    format!(
+        "live · {time_seg} · lines {}-{} of {total}{live_tail}",
+        offset + 1,
+        offset + shown
+    )
 }
 
 /// The row that replaces the truncation notice while frozen. `age` is the
@@ -293,8 +308,25 @@ mod tests {
     }
 
     #[test]
-    fn the_scrolled_row_names_the_range() {
-        assert_eq!(scrolled_notice(8, 22, 46), "lines 9-30 of 46 · live");
+    fn the_scrolled_row_names_the_range_between_time_and_cadence() {
+        assert_eq!(
+            scrolled_notice(
+                "since 12:07:45",
+                " · every 60s or on trigger · ? help",
+                29,
+                29,
+                59
+            ),
+            "live · since 12:07:45 · lines 30-58 of 59 · every 60s or on trigger · ? help"
+        );
+        assert_eq!(
+            scrolled_notice("changed 14s ago", " · every 2s · ? help", 8, 22, 46),
+            "live · changed 14s ago · lines 9-30 of 46 · every 2s · ? help"
+        );
+        assert_eq!(
+            scrolled_notice("since 12:07:45", " · 2 sources · ? help", 0, 10, 30),
+            "live · since 12:07:45 · lines 1-10 of 30 · 2 sources · ? help"
+        );
     }
 
     #[test]

@@ -111,7 +111,8 @@ Scroll with less-style keys: `j`/`k` (or the arrows) move one line,
 (or Home/End) jump to the ends. The window moves over the live frame:
 nothing pauses, new output keeps arriving under you, `G` sticks to the
 end, and `g` (or scrolling back to the top) returns to the live view.
-The bottom row names the range: `lines 9-30 of 46 · live`.
+The bottom row keeps the live row's time and cadence around the range:
+`live · since 12:07:45 · lines 9-30 of 46 · every 2s · ? help`.
 Scrolled lines render chopped, like a horizontally shifted view. If the
 output changes shape while you're scrolled, the window rides along —
 the row's total updates, a pinned window keeps tracking the end — and
