@@ -126,7 +126,7 @@ impl DashboardFile {
             bail!("no panes declared: a dashboard needs at least one pane");
         }
         if self.defaults.id.is_some() {
-            bail!("`name` is not a default: give each pane its own name");
+            bail!("an id is not a default: give each pane its own id");
         }
 
         let names = self.pane_names()?;
