@@ -23,7 +23,7 @@ use anyhow::{Context, anyhow, bail};
 use crate::core::box_model::{BorderPreset, Sides, parse_sides};
 use crate::core::duration::parse_interval;
 use crate::core::registry::{
-    LayoutNode, Overflow, PaneBox, PaneWidth, Registry, SourceId, SourceSpec,
+    LayoutNode, Overflow, PaneBox, PaneWidth, Registry, SourceId, SourceSpec, TitleSource,
 };
 use crate::core::trigger::parse_trigger;
 
@@ -33,14 +33,24 @@ const DEFAULT_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(2
 /// The shipped `rat watch` default interval.
 const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The dashboard's declared title: static text, a pane reference
+/// (`ref="#id"`), or both — the text is then the role's fallback while
+/// the referenced pane has not spoken. The parser guarantees at least
+/// one of the two is present.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TitleDecl {
+    pub text: Option<String>,
+    /// The referenced pane id — the fragment with its `#` removed.
+    pub reference: Option<String>,
+}
+
 /// The parsed declaration. The constructor produces exactly this; ONE
 /// validation path turns it into a [`Registry`].
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct DashboardFile {
-    /// The whole dashboard's name, one bold line above the composed
-    /// panes — a different thing from any pane's own `title`, which
-    /// labels one box's border.
-    pub title: Option<String>,
+    /// The whole dashboard's name — a different thing from any pane's
+    /// own `title`, which labels one box's border.
+    pub title: Option<TitleDecl>,
     pub gap: Option<usize>,
     pub row_gap: Option<usize>,
     pub defaults: PaneDecl,
@@ -134,8 +144,41 @@ impl DashboardFile {
             self.gap.unwrap_or(0),
             self.row_gap.unwrap_or(0),
         )?
-        .with_title(self.title.clone())
+        .with_title(self.resolve_title(&names)?)
         .with_diagnostics(Self::collect_diagnostics(&names)))
+    }
+
+    /// The declared title against the declared panes: a `ref` binds
+    /// the FIRST pane with the id (the same first-win rule refs
+    /// follow everywhere); an id nothing declares is a load error
+    /// that lists what exists.
+    fn resolve_title(&self, names: &[String]) -> anyhow::Result<TitleSource> {
+        Ok(match self.title.clone() {
+            None => TitleSource::None,
+            Some(TitleDecl {
+                text,
+                reference: None,
+            }) => TitleSource::Static(text.expect("the parser requires text or ref")),
+            Some(TitleDecl {
+                text,
+                reference: Some(wanted),
+            }) => {
+                let source = names
+                    .iter()
+                    .position(|id| id == &wanted)
+                    .map(SourceId)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "title ref \"#{wanted}\" names no pane — declared ids are {}",
+                            names.join(", ")
+                        )
+                    })?;
+                TitleSource::Pane {
+                    source,
+                    fallback: text,
+                }
+            }
+        })
     }
 
     /// Every pane's name, in declaration order. Names are the file's

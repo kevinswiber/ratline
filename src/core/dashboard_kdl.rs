@@ -398,7 +398,7 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
         match node.name().value() {
             "title" => {
                 declared_once("title", &mut settings)?;
-                file.title = Some(string_field(node, "title")?);
+                file.title = Some(title_field(node)?);
             }
             "gap" => {
                 declared_once("gap", &mut settings)?;
@@ -877,40 +877,63 @@ fn one_id(node: &kdl::KdlNode, label: &str) -> anyhow::Result<String> {
 /// Checked, field-named conversion: a negative value must FAIL LOUDLY,
 /// never wrap — `as usize` would turn `gap -1` into a repeat count near
 /// usize::MAX, which `" ".repeat(gap)` would try to allocate.
-/// `usize_field`'s string sibling: same shape checks — no annotation
-/// anywhere, no properties, no block, exactly one positional — with a
-/// string where the integer would be.
-fn string_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<String> {
-    let example = format!("{name} \"Deploy status\"");
+/// The `title` setting: an optional text, an optional `ref="#id"`,
+/// at least one of the two. Same shape checks as the other document
+/// settings — no annotation anywhere, no block — plus the reference
+/// rules: a ref is a URI FRAGMENT, so a bare string is refused (the
+/// whole non-`#` value space stays reserved for URI-references), and
+/// the empty fragment (the document itself, per RFC 3986) is refused.
+fn title_field(node: &kdl::KdlNode) -> anyhow::Result<crate::core::dashboard_file::TitleDecl> {
     if let Some(ty) = node.ty() {
         bail!(
-            "the ({}) type annotation on `{name}` has no meaning here — remove it",
+            "the ({}) type annotation on `title` has no meaning here — remove it",
             ty.value()
         );
     }
-    if node.entries().iter().any(|entry| entry.name().is_some()) {
-        bail!("{name} takes no properties — write `{example}`");
-    }
-    if let Some(entry) = node
-        .entries()
-        .iter()
-        .find(|entry| entry.name().is_none() && entry.ty().is_some())
-    {
-        bail!(
-            "the ({}) type annotation on `{name}` has no meaning here — remove it",
-            entry.ty().expect("filtered to annotated").value()
-        );
+    let mut reference = None;
+    for entry in node.entries() {
+        if let Some(ty) = entry.ty() {
+            bail!(
+                "the ({}) type annotation on `title` has no meaning here — remove it",
+                ty.value()
+            );
+        }
+        let Some(prop) = entry.name() else { continue };
+        if prop.value() != "ref" {
+            bail!(
+                "title's one property is `ref` — write `title \"Deploy status\"` or `title ref=\"#header\"`"
+            );
+        }
+        let Some(value) = entry.value().as_string() else {
+            bail!("title's ref takes one string — write `ref=\"#header\"`");
+        };
+        let Some(fragment) = value.strip_prefix('#') else {
+            bail!("title's ref is a URI fragment — write `ref=\"#header\"`");
+        };
+        if fragment.is_empty() {
+            bail!("title ref \"#\" is the whole document — name a pane id, like `ref=\"#header\"`");
+        }
+        if reference.replace(fragment.to_string()).is_some() {
+            bail!("`title` is declared twice — a dashboard declares it once");
+        }
     }
     if node.children().is_some() {
-        bail!("{name} takes one string and holds no block — write `{example}`");
+        bail!("title holds no block — write `title \"Deploy status\"` or `title ref=\"#header\"`");
     }
-    match positional(node).as_slice() {
-        [value] => value
-            .as_string()
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("{name} takes one string — write `{example}`")),
-        _ => bail!("{name} takes one string — write `{example}`"),
+    let text =
+        match positional(node).as_slice() {
+            [] => None,
+            [value] => Some(value.as_string().map(str::to_string).ok_or_else(|| {
+                anyhow!("title takes one string — write `title \"Deploy status\"`")
+            })?),
+            _ => bail!("title takes one string — write `title \"Deploy status\"`"),
+        };
+    if text.is_none() && reference.is_none() {
+        bail!(
+            "title takes a text, a ref=\"#id\", or both — write `title \"Deploy status\"` or `title ref=\"#header\"`"
+        );
     }
+    Ok(crate::core::dashboard_file::TitleDecl { text, reference })
 }
 
 fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
@@ -1639,6 +1662,41 @@ pane "all" {
     }
 
     #[test]
+    fn a_title_ref_parses_with_and_without_fallback_text() {
+        let file = parse(
+            "title ref=\"#header\"\npane \"header\" {\n    height 3\n    command \"date\"\n}\n",
+        )
+        .expect("parses");
+        let title = file.title.expect("declared");
+        assert_eq!(title.text, None);
+        assert_eq!(title.reference.as_deref(), Some("header"));
+        let file = parse(
+            "title \"Fallback\" ref=\"#header\"\npane \"header\" {\n    height 3\n    command \"date\"\n}\n",
+        )
+        .expect("parses");
+        let title = file.title.expect("declared");
+        assert_eq!(title.text.as_deref(), Some("Fallback"));
+        assert_eq!(title.reference.as_deref(), Some("header"));
+    }
+
+    #[test]
+    fn a_title_ref_keeps_the_value_space_reserved() {
+        // A bare string is refused so every non-fragment spelling
+        // stays open for URI-references later; the empty fragment is
+        // the whole document and is refused too.
+        for (text, wanted) in [
+            ("title ref=\"header\"\n", "write `ref=\"#header\"`"),
+            ("title ref=\"#\"\n", "name a pane id"),
+            ("title ref=3\n", "one string"),
+            ("title bogus=\"x\"\n", "`ref`"),
+            ("title\n", "a text, a ref"),
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains(wanted), "wanted {wanted:?} in {err}");
+        }
+    }
+
+    #[test]
     fn a_dashboard_title_parses_and_both_meanings_coexist() {
         // The same word at two positions carries two meanings: the
         // top-level `title` names the whole dashboard, a pane's
@@ -1647,7 +1705,9 @@ pane "all" {
             "title \"Deploy status\"\npane \"build\" {\n    height 3\n    command \"date\"\n    title \"Build log\"\n}\n",
         )
         .expect("parses");
-        assert_eq!(file.title.as_deref(), Some("Deploy status"));
+        let declared = file.title.expect("declared");
+        assert_eq!(declared.text.as_deref(), Some("Deploy status"));
+        assert_eq!(declared.reference, None);
         assert_eq!(file.panes[0].title.as_deref(), Some("Build log"));
         // Undeclared stays absent — the row is not rendered from an
         // empty string.
@@ -1666,7 +1726,10 @@ pane "all" {
         let Composition::Panes { title, .. } = registry.composition() else {
             panic!("a dashboard registry composes panes");
         };
-        assert_eq!(title.as_deref(), Some("Deploy status"));
+        assert_eq!(
+            *title,
+            crate::core::registry::TitleSource::Static("Deploy status".to_string())
+        );
         let registry = parse("pane \"a\" {\n    height 3\n    command \"date\"\n}\n")
             .expect("parses")
             .into_registry()
@@ -1674,13 +1737,45 @@ pane "all" {
         let Composition::Panes { title, .. } = registry.composition() else {
             panic!("a dashboard registry composes panes");
         };
-        assert_eq!(*title, None);
+        assert_eq!(*title, crate::core::registry::TitleSource::None);
+    }
+
+    #[test]
+    fn a_title_ref_binds_the_first_declaration_and_an_unknown_ref_teaches() {
+        use crate::core::registry::{Composition, SourceId, TitleSource};
+        // First-win, the same rule duplicates follow everywhere.
+        let registry = parse(
+            "title ref=\"#x\"\npane \"x\" {\n    height 3\n    command \"date\"\n}\npane \"x\" {\n    height 3\n    command \"uptime\"\n}\n",
+        )
+        .expect("parses")
+        .into_registry()
+        .expect("validates");
+        let Composition::Panes { title, .. } = registry.composition() else {
+            panic!("panes")
+        };
+        assert_eq!(
+            *title,
+            TitleSource::Pane {
+                source: SourceId(0),
+                fallback: None
+            }
+        );
+        // An id nothing declares is a load error that lists what exists.
+        let err = format!(
+            "{:#}",
+            parse("title ref=\"#nope\"\npane \"a\" {\n    height 3\n    command \"date\"\n}\n")
+                .expect("parses")
+                .into_registry()
+                .unwrap_err()
+        );
+        assert!(err.contains("names no pane"), "{err}");
+        assert!(err.contains("declared ids are a"), "{err}");
     }
 
     #[test]
     fn title_takes_one_string_and_nothing_else() {
         for (text, wanted) in [
-            ("title x=\"y\"\n", "no properties"),
+            ("title x=\"y\"\n", "`ref`"),
             ("title \"a\" \"b\"\n", "one string"),
             ("title 3\n", "one string"),
             ("title \"a\" {\n}\n", "holds no block"),

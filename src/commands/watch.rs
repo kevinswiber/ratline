@@ -3357,7 +3357,7 @@ fn compose_sources(
     // Truncated to the composed width, never the terminal's: the
     // title belongs to the dashboard it names. The empty mark keeps
     // marks aligned to lines; a title never carries a change mark.
-    if let Some(title) = title {
+    if let crate::core::registry::TitleSource::Static(title) = title {
         let composed = block
             .lines
             .iter()
@@ -4330,6 +4330,7 @@ mod tests {
             title: None,
             chrome: false,
         };
+        use crate::core::registry::TitleSource;
         let build = |title: Option<&str>| {
             Registry::panes(
                 vec![cadence_spec(false, Some(Duration::from_secs(2)), false)],
@@ -4339,7 +4340,11 @@ mod tests {
                 0,
             )
             .expect("a valid one-pane registry")
-            .with_title(title.map(str::to_string))
+            .with_title(
+                title
+                    .map(|t| TitleSource::Static(t.to_string()))
+                    .unwrap_or_default(),
+            )
         };
         let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let mut runtime = vec![SourceRuntime::for_test()];
@@ -4395,6 +4400,25 @@ mod tests {
             bare_block.lines.len() + 1,
             "the title costs exactly one row"
         );
+
+        // A pane-sourced title renders NOTHING extra: the referenced
+        // pane is the visible title, wherever the file placed it.
+        let referred = build(None).with_title(TitleSource::Pane {
+            source: SourceId(0),
+            fallback: Some("Fallback".to_string()),
+        });
+        let referred_block = compose_sources(
+            &referred,
+            &runtime,
+            &geom,
+            false,
+            &palette,
+            ColorProfile::TrueColor,
+        );
+        assert_eq!(
+            referred_block.lines, bare_block.lines,
+            "role donation adds no row and no bytes"
+        );
     }
 
     #[test]
@@ -4418,7 +4442,9 @@ mod tests {
             0,
         )
         .expect("a valid one-pane registry")
-        .with_title(Some("a title much longer than twenty cells".to_string()));
+        .with_title(crate::core::registry::TitleSource::Static(
+            "a title much longer than twenty cells".to_string(),
+        ));
         let mut runtime = vec![SourceRuntime::for_test()];
         runtime[0].output = Some(vec!["seed".to_string()]);
         runtime[0].posted = true;
