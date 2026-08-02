@@ -382,7 +382,19 @@ pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
             "defaults" => {
                 declared_once("defaults", &mut settings)?;
                 refuse_annotation(node.ty(), "defaults", "defaults")?;
-                if !positional(node).is_empty() {
+                let values = positional(node);
+                if !values.is_empty() {
+                    // A bare argument that names a key gets the
+                    // spelling the author was reaching for; one that
+                    // names a document setting gets sent to the top
+                    // level. Only a string naming neither keeps the
+                    // positional refusal.
+                    if let Some(k) = stray_key(&values) {
+                        return Err(stray_key_err("defaults", k, &values));
+                    }
+                    if let Some(name) = stray_setting(&values) {
+                        return Err(stray_setting_err("defaults", name, &values));
+                    }
                     bail!("defaults takes no name — it holds the keys every pane inherits");
                 }
                 file.defaults = pane_block(node, None, false)?;
@@ -650,8 +662,6 @@ fn many_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<Vec<Strin
 /// positional error it has today; a recognised name at ANY position
 /// counts, because `defaults #true shell` still holds the key the
 /// author was reaching for.
-// Staged: the `defaults`, pane-name and container arms become callers.
-#[allow(dead_code)]
 fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Key> {
     values
         .iter()
@@ -660,14 +670,52 @@ fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Key> {
 
 /// The same scan for the document settings, which are not pane keys —
 /// `gap` and `row-gap` are the whole dashboard's.
-// Staged: the `defaults` and container arms become callers.
-#[allow(dead_code)]
 fn stray_setting(values: &[&kdl::KdlValue]) -> Option<&'static str> {
     values.iter().find_map(|value| {
         ["gap", "row-gap"]
             .into_iter()
             .find(|name| value.as_string() == Some(name))
     })
+}
+
+/// The teaching sentence for a pane key written bare in name position:
+/// the property spelling, echoing the author's own value when one
+/// follows the key so the shown fix is the line they meant to write,
+/// the table's example otherwise. A List key has no property spelling,
+/// so it gets the child-node sentence with the table's example — the
+/// same one the property path teaches.
+fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error {
+    if let Set::List(_) = k.set {
+        return anyhow!(
+            "{at}: `{}` holds a list, so it must be a child node — write `{}` inside the block",
+            k.name,
+            k.example
+        );
+    }
+    let spelling = values
+        .iter()
+        .position(|value| value.as_string() == Some(k.name))
+        .and_then(|i| values.get(i + 1))
+        .map(|value| format!("{}={}", k.name, as_written(value)))
+        .unwrap_or_else(|| k.property_example());
+    anyhow!(
+        "{at}: `{}` is a key, not a name — write `{spelling}`",
+        k.name
+    )
+}
+
+/// The teaching sentence for a document setting written on a block,
+/// echoing the author's own value when one follows the name.
+fn stray_setting_err(at: &str, name: &str, values: &[&kdl::KdlValue]) -> anyhow::Error {
+    let example = values
+        .iter()
+        .position(|value| value.as_string() == Some(name))
+        .and_then(|i| values.get(i + 1))
+        .map(|value| format!("{name} {}", as_written(value)))
+        .unwrap_or_else(|| format!("{name} 1"));
+    anyhow!(
+        "{at}: `{name}` is the whole dashboard's, declared once at the top level as `{example}`"
+    )
 }
 
 /// The container's own name — `a row` / `a column` — for the errors that
@@ -824,6 +872,31 @@ mod tests {
         );
         assert_eq!(stray_setting(&[&gap]), Some("gap"));
         assert!(stray_setting(&[&shell]).is_none());
+    }
+
+    #[test]
+    fn a_bare_key_on_defaults_teaches_the_property_spelling() {
+        assert_eq!(
+            container_err("defaults shell #true\npane \"a\" { command \"true\" height 3 }"),
+            "defaults: `shell` is a key, not a name — write `shell=#true`"
+        );
+        assert_eq!(
+            container_err("defaults interval \"5s\"\npane \"a\" { command \"true\" height 3 }"),
+            "defaults: `interval` is a key, not a name — write `interval=\"5s\"`"
+        );
+        // A List key has no property spelling — the child-node
+        // sentence, the same one the property path teaches.
+        assert_eq!(
+            container_err(
+                "defaults command \"git\" \"log\"\npane \"a\" { command \"true\" height 3 }"
+            ),
+            "defaults: `command` holds a list, so it must be a child node — write `command \"git\" \"log\"` inside the block"
+        );
+        // gap is the dashboard's, not a pane key.
+        assert_eq!(
+            container_err("defaults gap 1\npane \"a\" { command \"true\" height 3 }"),
+            "defaults: `gap` is the whole dashboard's, declared once at the top level as `gap 1`"
+        );
     }
 
     #[test]
