@@ -56,17 +56,19 @@ fn the_hardware_cursor_rests_on_the_caret() {
         "the first frame must park a visible cursor on the caret cell"
     );
 
-    // Left arrow moves the caret onto 'c': the repaint re-parks at
-    // column 4 and the cursor is shown again at the new cell.
+    // Left arrow moves the caret onto 'c'. With no painted caret the
+    // frame bytes are identical, so the renderer takes the bare-hop
+    // path: one relative move of the already-visible cursor, no
+    // repaint, no re-show.
     session.write_bytes(b"\x1b[D");
     assert!(
         wait_for(
             &session,
             &mut terminal,
-            b"\r\x1b[4C\x1b[?25h",
+            b"\r\x1b[4C",
             Duration::from_secs(5),
         ),
-        "moving the caret must re-park the visible cursor on it"
+        "moving the caret must hop the visible cursor onto it"
     );
 
     // Enter submits: the UI erases itself and the value reaches stdout.
@@ -83,10 +85,37 @@ fn the_hardware_cursor_rests_on_the_caret() {
     );
 }
 
-/// The reverse-video caret rides the same frame: one past the end of the
-/// value it is a reversed space, which must reach a real terminal.
+/// `wait_for`, returning the accumulated bytes once `needle` appears —
+/// for asserting on what surrounds the needle.
+fn wait_for_bytes(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needle: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let chunk = session.read_available((deadline - now).min(Duration::from_millis(50)));
+        if chunk.is_empty() {
+            continue;
+        }
+        terminal.respond(session, &chunk);
+        seen.extend_from_slice(&chunk);
+        if contains(&seen, needle) {
+            return Some(seen);
+        }
+    }
+}
+
+/// The frame paints no caret cell: the parked hardware cursor is the one
+/// and only caret, so no reverse video reaches the terminal.
 #[test]
-fn the_reverse_video_caret_reaches_a_real_terminal() {
+fn the_input_frame_carries_no_reverse_video() {
     let session = PtySession::spawn(
         &rat_bin(),
         &["input", "--prompt", "> ", "--value", "abc"],
@@ -95,14 +124,18 @@ fn the_reverse_video_caret_reaches_a_real_terminal() {
     .expect("spawn rat input under a pty");
     let mut terminal = FakeTerminal::dark();
 
+    // The park needle proves a full frame painted before we judge it.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"\x1b[1A\r\x1b[5C\x1b[?25h",
+        Duration::from_secs(5),
+    )
+    .expect("the first frame parks the cursor");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            b"\x1b[7m \x1b[0m",
-            Duration::from_secs(5),
-        ),
-        "the end-of-line caret must arrive as a reversed space"
+        !contains(&seen, b"\x1b[7m"),
+        "the frame must not paint a caret cell: {:?}",
+        String::from_utf8_lossy(&seen)
     );
 
     session.write_bytes(b"\r");

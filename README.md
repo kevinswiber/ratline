@@ -648,7 +648,7 @@ literal colors; each name resolves through the selected palette
 | `fatal` | the `FATA` log tag |
 | `selection` | the row under the cursor in `rat choose` and `rat filter` |
 | `match` | the matched characters in `rat filter` |
-| `cursor` | the `rat input` caret cell — the terminal's default foreground |
+| `cursor` | reserved — the `rat input` caret is the terminal's own cursor, so no cell reads this token today |
 | `placeholder` | placeholder text in `rat input` and `rat filter` — the terminal's default foreground, drawn faint |
 
 `cursor` and `placeholder` resolve to the terminal's default foreground in

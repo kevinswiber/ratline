@@ -45,20 +45,10 @@ impl UiApp for InputApp {
             Style::default()
         };
         buf.set_string(x, y, &text, style);
-        // Mark the cursor with reverse video (on the char or one past the end).
-        if !self.state.value.is_empty() || self.state.cursor > 0 {
-            let before: String = text.chars().take(self.state.cursor).collect();
-            let cx = x + before.width() as u16;
-            let under = text.chars().nth(self.state.cursor).unwrap_or(' ');
-            buf.set_string(
-                cx,
-                y,
-                under.to_string(),
-                Style::default()
-                    .add_modifier(Modifier::REVERSED)
-                    .fg(self.palette.cursor),
-            );
-        }
+        // No painted caret: the terminal's own cursor, parked on the edit
+        // point via cursor_pos, is the one and only caret — the doubled
+        // look read as two cursors, and only the real one serves
+        // assistive tech. The `cursor` theme token stays dormant.
     }
 
     fn height(&self, _term: (u16, u16)) -> u16 {
@@ -133,9 +123,10 @@ mod tests {
 
     #[test]
     fn the_rendered_input_frame_is_pinned() {
-        // Byte-identity goldens for the empty frames; the mid-string frames
-        // pin the caret: the cell under the cursor travels as reverse video
-        // (the cursor token is Reset at the default, so SGR 7 alone).
+        // Byte-identity goldens. The frame paints NO caret cell: the caret
+        // is the terminal's own cursor, parked on the edit point by the
+        // renderer — the only caret assistive tech can track, and one
+        // caret is one caret (the doubled look read as two cursors).
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
         let light = Palette::builtin(Appearance::Light, AppearanceSource::Default);
         assert_eq!(
@@ -148,11 +139,11 @@ mod tests {
         );
         assert_eq!(
             rendered(dark, "abc", 1),
-            ["\u{1b}[38;5;212m> \u{1b}[0ma\u{1b}[7mb\u{1b}[0mc", ""]
+            ["\u{1b}[38;5;212m> \u{1b}[0mabc", ""]
         );
         assert_eq!(
             rendered(light, "abc", 1),
-            ["\u{1b}[38;5;129m> \u{1b}[0ma\u{1b}[7mb\u{1b}[0mc", ""]
+            ["\u{1b}[38;5;129m> \u{1b}[0mabc", ""]
         );
     }
 
@@ -187,26 +178,31 @@ mod tests {
     }
 
     #[test]
-    fn the_caret_one_past_the_end_reaches_the_terminal() {
-        // End-of-line caret: cursor sits one past the last char, on a
-        // reversed space that the trailing-blank trim must not eat.
+    fn no_frame_shape_paints_a_caret_cell() {
+        // Past-end, mid-string, start: every cursor position leaves the
+        // frame free of SGR 7 — the hardware cursor is the only caret.
         let dark = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
-        assert_eq!(
-            rendered(dark, "abc", 3),
-            ["\u{1b}[38;5;212m> \u{1b}[0mabc\u{1b}[7m \u{1b}[0m", ""]
-        );
+        for cursor in [0, 1, 3] {
+            for line in rendered(dark, "abc", cursor) {
+                assert!(
+                    !line.contains("\u{1b}[7m"),
+                    "cursor {cursor} painted a caret: {line:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn the_caret_reads_the_cursor_token() {
-        let palette = Palette {
+    fn a_diverging_cursor_token_changes_nothing() {
+        // The cursor token is dormant: the caret is the terminal's own
+        // cursor, so no palette value may reach the frame through it.
+        let default = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let diverging = Palette {
             cursor: Color::Indexed(96),
             ..Palette::builtin(Appearance::Dark, AppearanceSource::Default)
         };
-        let cell = cell_at(palette, "abc", 1, 3);
-        assert_eq!(cell.fg, Color::Indexed(96));
-        // REVERSED is what makes the caret visible; the token colors it.
-        assert!(cell.modifier.contains(Modifier::REVERSED));
+        assert_eq!(rendered(default, "abc", 1), rendered(diverging, "abc", 1));
+        assert_eq!(rendered(default, "abc", 3), rendered(diverging, "abc", 3));
     }
 
     #[test]
@@ -266,9 +262,9 @@ mod tests {
     }
 
     #[test]
-    fn the_painted_caret_lands_on_the_same_cell() {
-        // The reverse-video caret and the hardware cursor must agree: a
-        // wide char before the caret shifts both by two cells.
+    fn a_wide_glyph_paints_no_caret_either() {
+        // Cells-vs-chars coverage lives on in the cursor_pos tests; here
+        // the wide-glyph frame must simply stay caret-free like the rest.
         let mut state = InputState::new("日a".to_string(), false, 1000);
         state.cursor = 1;
         let app = InputApp {
@@ -281,9 +277,9 @@ mod tests {
         let area = Rect::new(0, 0, 40, 2);
         let mut buf = Buffer::empty(area);
         app.render(area, &mut buf);
-        let cell = buf.cell((4, 0)).expect("caret cell is painted");
+        let cell = buf.cell((4, 0)).expect("cell is painted");
         assert_eq!(cell.symbol(), "a");
-        assert!(cell.modifier.contains(Modifier::REVERSED));
+        assert!(!cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
