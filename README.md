@@ -128,7 +128,9 @@ deliberate divergence from `less`: Enter pages rather than scrolling one
 line.
 
 Step back in time with `<` (or `,`): each press parks on the previous
-distinct frame, and `>` (or `.`) steps forward again. The paused row's
+distinct frame, and `>` (or `.`) steps forward again — one more press
+past the newest returns to the live view, keeping your scroll position
+(`Esc` always resumes at the top). The paused row's
 stamp says when the frame on screen was current, and `S` and `v` act on the
 frame being viewed — step back to when it broke, press `S`. History
 lives in memory only while the session runs, bounded to a few MiB of

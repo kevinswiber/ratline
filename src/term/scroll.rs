@@ -81,6 +81,16 @@ impl LiveScroll {
         .step(step, total, window)
     }
 
+    /// Entering live-scroll at a carried offset (the scrub-forward
+    /// exit): clamped like a reanchor, and unpinned — a carried offset
+    /// means HOLD the reader's place, never chase the growing tail.
+    pub fn at(offset: usize, total: usize, window: usize) -> LiveScroll {
+        LiveScroll {
+            offset: offset.min(max_offset(total, window.max(1))),
+            pinned: false,
+        }
+    }
+
     /// pinned = (step == `ScrollStep::Bottom`); any other step unpins.
     pub fn step(self, step: ScrollStep, total: usize, window: usize) -> LiveScroll {
         LiveScroll {
@@ -218,6 +228,25 @@ mod tests {
         assert!(!one.at_top());
         let bottom = LiveScroll::start(ScrollStep::Bottom, 46, 22);
         assert_eq!(bottom.offset(), max_offset(46, 22));
+    }
+
+    #[test]
+    fn entering_at_a_carried_offset_clamps_and_holds() {
+        // A scrub-forward exit carries the pause's offset: clamped like
+        // a reanchor, and unpinned — carried means HOLD, never chase.
+        let deep = LiveScroll::at(100, 30, 10);
+        assert_eq!(deep.offset(), max_offset(30, 10));
+        let carried = LiveScroll::at(9, 46, 22);
+        assert_eq!(carried.offset(), 9);
+        assert_eq!(
+            carried.reanchor(60, 22).offset(),
+            9,
+            "the carried window holds while the tail grows"
+        );
+        assert!(
+            LiveScroll::at(5, 8, 22).at_top(),
+            "a frame that fits the window lands in the plain live view"
+        );
     }
 
     #[test]

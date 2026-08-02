@@ -1579,14 +1579,43 @@ pub(crate) fn run_registry(
                             let entry = if action == WatchAction::ScrubBack {
                                 history.prev(anchor)
                             } else {
-                                // At the newest entry this is a no-op,
-                                // not a resume: > is a step, not a
-                                // homing key.
                                 history.next(anchor)
                             };
-                            let Some(entry) = entry else { continue };
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
                             let window = usize::from(window_rows(session.max_height, size.1));
+                            let Some(entry) = entry else {
+                                // Behind the oldest there is a genuine
+                                // wall. Past the newest the frame on
+                                // screen IS the live frame, so > steps
+                                // out of the freeze at the carried
+                                // offset — the same walk, one key, all
+                                // the way back; Esc and F stay the
+                                // reset-to-top exits.
+                                if action == WatchAction::ScrubBack {
+                                    continue;
+                                }
+                                let Some(p) = pause.take() else { continue };
+                                request_now_all(&mut runtime);
+                                let ls =
+                                    LiveScroll::at(p.scroll.offset(), live.lines.len(), window);
+                                live_scroll = (!ls.at_top()).then_some(ls);
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    live,
+                                    &live_tail,
+                                    &palette,
+                                    view,
+                                    None,
+                                    size,
+                                    session.max_height,
+                                    &faint,
+                                    profile,
+                                    &history,
+                                )?);
+                                continue;
+                            };
                             // The scroll position is held across steps
                             // — a watched line stays under the eye.
                             let scroll = pause
@@ -2195,7 +2224,7 @@ fn help_lines(heading: &str, extra: &[String]) -> Vec<String> {
                 "  p                  freeze the frame in place (the command keeps running)",
                 "  Esc, F             resume the live tail",
                 "  <, ,               step back through distinct frames",
-                "  >, .               step forward again",
+                "  >, .               step forward — past the newest, back to live",
                 "",
                 "  w                  wrap or chop long lines",
                 "  h/l, Left/Right    shift the view horizontally",
@@ -3845,7 +3874,8 @@ mod tests {
             assert_eq!(action_for(Key::Char(','), mode), WatchAction::ScrubBack);
         }
         // Forward only means something while parked on a past frame; from
-        // a live surface there is nothing newer to step to.
+        // a live surface there is nothing newer to step to. (Past the
+        // newest entry the arm exits the freeze — same key table.)
         assert_eq!(
             action_for(Key::Char('>'), FrameMode::Paused),
             WatchAction::ScrubForward

@@ -1086,7 +1086,7 @@ fn scrubbing_shows_an_older_frame_and_s_snapshots_it() {
 }
 
 #[test]
-fn scrub_forward_at_the_newest_is_a_no_op() {
+fn scrub_forward_past_the_newest_returns_to_live() {
     // The counter caps at 3: after three distinct frames the child goes
     // static, so history settles at exactly three entries.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1120,12 +1120,13 @@ fn scrub_forward_at_the_newest_is_a_no_op() {
         "expected > to step back to the newest entry"
     );
     let _ = drain_for(&session, Duration::from_millis(200));
+    // Past the newest there is nothing left to step to: the frame on
+    // screen IS the live frame, so > leaves the freeze — the same walk,
+    // one key, all the way back to the live view.
     session.write_bytes(b">");
-    let leaked = session.read_available(Duration::from_millis(400));
     assert!(
-        leaked.is_empty(),
-        "> at the newest entry must be a no-op: {:?}",
-        String::from_utf8_lossy(&leaked)
+        wait_for(&session, &mut terminal, b"since ", Duration::from_secs(2)),
+        "expected > past the newest to return to the live view"
     );
     session.write_bytes(b"q");
     assert!(
@@ -2653,6 +2654,66 @@ fn the_status_row_never_wears_the_childs_open_color() {
     assert!(
         !text.contains("\x1b[31mred\r\n"),
         "no row may hand its open color to the next: {text:?}"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn a_scrub_forward_exit_keeps_the_scroll_position() {
+    // 30 static lines on a 24-row pty: a 22-row window. Freeze, scroll a
+    // line down, then step past the newest: the exit must land in the
+    // scrolled LIVE view at the same offset — a step keeps your place,
+    // only the homing keys (Esc/F) reset to the top.
+    let lines: Vec<String> = (1..=30).map(|i| format!("l{i}")).collect();
+    let rat = rat_bin();
+    let mut args: Vec<&str> = vec!["watch", "-n", "50ms", "--", &rat, "style"];
+    args.extend(lines.iter().map(String::as_str));
+    let session = PtySession::spawn(&rat_bin(), &args, &[]).expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· ? help".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the live truncation notice"
+    );
+    session.write_bytes(b"p");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· lines 1-22 of 30 · Esc resumes".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the frozen window at the top"
+    );
+    session.write_bytes(b"j");
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            "· lines 2-23 of 30 · Esc resumes".as_bytes(),
+            Duration::from_secs(2)
+        ),
+        "expected the paused row one line down"
+    );
+    session.write_bytes(b">");
+    assert!(
+        wait_for_without(
+            &session,
+            &mut terminal,
+            "lines 2-23 of 30 · live".as_bytes(),
+            b"paused",
+            Duration::from_secs(2)
+        ),
+        "expected the exit to keep the offset in the live view"
     );
     session.write_bytes(b"q");
     assert!(
