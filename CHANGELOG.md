@@ -2,6 +2,47 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.9.0](https://github.com/kevinswiber/ratto/compare/5213b013acd128b5ce39ab5a9c410be2d76b73eb..v0.9.0) - 2026-08-02
+#### Features
+- a dashboard-level title, one bold line above the panes - ([56dc5f5](https://github.com/kevinswiber/ratto/commit/56dc5f5cacb07e88d65e10c94aa463c3a8330c8a)) - [@kevinswiber](https://github.com/kevinswiber)
+- color the syntax-error snippet when the terminal can take it - ([70c1725](https://github.com/kevinswiber/ratto/commit/70c1725a6c6ed77ff3cee6b88c23904073976898)) - [@kevinswiber](https://github.com/kevinswiber)
+- point a KDL syntax error into the source, rustc-style - ([6e88883](https://github.com/kevinswiber/ratto/commit/6e88883923f35f7656d553316852532f2428e13a)) - [@kevinswiber](https://github.com/kevinswiber)
+- an opt-in --once-timeout bounds the wait with exit 124 - ([9823aed](https://github.com/kevinswiber/ratto/commit/9823aede5e69c8627c1fc9f9158e371b6c8b018f)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a timeout carry what it waited on - ([2c81847](https://github.com/kevinswiber/ratto/commit/2c8184760c9d58c032aad00d40aaa2e125b0bd4c)) - [@kevinswiber](https://github.com/kevinswiber)
+- a quiet --once dashboard says which pane it is waiting on - ([3b156e7](https://github.com/kevinswiber/ratto/commit/3b156e7a2bfd167159936917ffa9b0a3d15828cf)) - [@kevinswiber](https://github.com/kevinswiber)
+- compose the notice for a --once run that has gone quiet - ([562baac](https://github.com/kevinswiber/ratto/commit/562baacf31efbfa5446f09b196f3902aa04365d9)) - [@kevinswiber](https://github.com/kevinswiber)
+- a bare setting or pane key on a container gets a real answer - ([e9f3e52](https://github.com/kevinswiber/ratto/commit/e9f3e520aff59043662baca81e3096c30a7d3c1b)) - [@kevinswiber](https://github.com/kevinswiber)
+- a bare key after a pane's name teaches the property spelling - ([327351b](https://github.com/kevinswiber/ratto/commit/327351bbc7358431e5d6a8ec5fdaa561504f7fa8)) - [@kevinswiber](https://github.com/kevinswiber)
+- a bare key on defaults teaches the property spelling - ([f59263c](https://github.com/kevinswiber/ratto/commit/f59263cf84829ae4beee3a212206b953b17672cb)) - [@kevinswiber](https://github.com/kevinswiber)
+- find the pane key or setting a bare argument names - ([a479b18](https://github.com/kevinswiber/ratto/commit/a479b18ed0cba44af263b3d6d96e61b73cdaa287)) - [@kevinswiber](https://github.com/kevinswiber)
+- a KDL syntax error names its line and column - ([41c8043](https://github.com/kevinswiber/ratto/commit/41c8043c882e647116013d2a9fd6c5e73c397f3a)) - [@kevinswiber](https://github.com/kevinswiber)
+- frame a placed syntax error as one line - ([4b87be6](https://github.com/kevinswiber/ratto/commit/4b87be62fe731b432d5b3a2176a9572c08d06a8a)) - [@kevinswiber](https://github.com/kevinswiber)
+- place a byte offset into 1-based line and column - ([bb03093](https://github.com/kevinswiber/ratto/commit/bb030939262fc1c02a8f374ab868daef7526b6bf)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a trigger restart a live child through a revocable kill - ([b84875b](https://github.com/kevinswiber/ratto/commit/b84875ba7b4aa11b3c3752e7be3dd23a383d3d37)) - [@kevinswiber](https://github.com/kevinswiber)
+- stop a live pane's chrome claiming a cadence - ([f6f1174](https://github.com/kevinswiber/ratto/commit/f6f11742810b70e182eaa4edfac7dfaba7b51562)) - [@kevinswiber](https://github.com/kevinswiber)
+- paint a pane when its long-lived child emits, not when it exits - ([e113baf](https://github.com/kevinswiber/ratto/commit/e113bafd8d1e15787ffeaf4f11ed480fbf9d3081)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a long-lived source offer its output before it exits - ([33a269e](https://github.com/kevinswiber/ratto/commit/33a269e999bb50c8cd377e5b9ae058af996813ea)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a pane declare that its child is long-lived - ([c8301c8](https://github.com/kevinswiber/ratto/commit/c8301c8a68df467b41eb8b9fca9dcaf36bdfeb46)) - [@kevinswiber](https://github.com/kevinswiber)
+- give a live source bounded buffers and a one-slot outbox - ([323d9b0](https://github.com/kevinswiber/ratto/commit/323d9b0296a6c5a1434f578a91208377150c7af2)) - [@kevinswiber](https://github.com/kevinswiber)
+- let a line cap be read without being consumed - ([619cbfd](https://github.com/kevinswiber/ratto/commit/619cbfdf9a17c0e5a3b99407c3b75d1fdf96a977)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- never echo an unwritable value into a taught spelling - ([aea434e](https://github.com/kevinswiber/ratto/commit/aea434ef6d147b14c0ca1e108bff011c4bd09755)) - [@kevinswiber](https://github.com/kevinswiber)
+- lead a pane's spawn error with the reason, path last - ([b20a581](https://github.com/kevinswiber/ratto/commit/b20a581d1a8da2313886b4ed8b5f315b10543445)) - [@kevinswiber](https://github.com/kevinswiber)
+- recognise a CRLF terminator whole, so Windows panes paint - ([1bea77a](https://github.com/kevinswiber/ratto/commit/1bea77a50141ca040fce6170fa5bb6d045a92d09)) - [@kevinswiber](https://github.com/kevinswiber)
+- bound what spin retains from its child - ([1075070](https://github.com/kevinswiber/ratto/commit/1075070234bd858e9c8e7d55abc4a45ee9be5a39)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- keep a comment's rationale without its private reference - ([3d94124](https://github.com/kevinswiber/ratto/commit/3d9412436bcdf764c605f8d8c942a90feb1746a8)) - [@kevinswiber](https://github.com/kevinswiber)
+- the head-line comment describes the head, not the old rule - ([de2463e](https://github.com/kevinswiber/ratto/commit/de2463eacca96ab9f5d78098f4a8024e00176bf7)) - [@kevinswiber](https://github.com/kevinswiber)
+- the --once diagnostic and --once-timeout, where users read - ([c6df825](https://github.com/kevinswiber/ratto/commit/c6df825ced6c4753e48fa3f31b51c1ecfeb3682b)) - [@kevinswiber](https://github.com/kevinswiber)
+- add a self-feeding tail example, and its cmd.exe spelling - ([033489f](https://github.com/kevinswiber/ratto/commit/033489f738c3a8d67cd3be33c45ce275b903c46f)) - [@kevinswiber](https://github.com/kevinswiber)
+- document the live pane, and stop teaching TOML - ([55291e7](https://github.com/kevinswiber/ratto/commit/55291e715002dea11d860270e7af1502c65cf834)) - [@kevinswiber](https://github.com/kevinswiber)
+- say what a line bound costs in bytes - ([e0c9346](https://github.com/kevinswiber/ratto/commit/e0c934630f301a13dfff8ed53ecb76b9655a5e9e)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- keep an exit status off anything but a completion - ([093dfb9](https://github.com/kevinswiber/ratto/commit/093dfb9be0b4752ea84e966e7e5848e5233ede30)) - [@kevinswiber](https://github.com/kevinswiber)
+- give the retention bound its own home - ([6c448e9](https://github.com/kevinswiber/ratto/commit/6c448e970d337e6e96c0717cdf50314a4640dd8c)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.8.0](https://github.com/kevinswiber/ratto/compare/cecb3f54647e0b5005a9e73b3744ba877df2a08c..v0.8.0) - 2026-08-01
 #### Features
 - fence either side of a bracket, so an interval can be placed inside it - ([2c201e9](https://github.com/kevinswiber/ratto/commit/2c201e9a0ec190d107dd37e1e4dbcb66a05394ac)) - [@kevinswiber](https://github.com/kevinswiber)
