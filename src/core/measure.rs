@@ -170,6 +170,26 @@ pub fn truncate_display(s: &str, max: usize, marker: &str) -> String {
     out
 }
 
+/// Stripped chars of `truncate_display(s, max, marker)`'s result — the
+/// coordinate space `LineMark.cells` live in, which the cell-based cut
+/// does not answer directly (the cut is display cells, marks are chars,
+/// and a wide rune makes them disagree). Mirrors `truncate_display`'s
+/// branches; the agreement is pinned by a property test. The count
+/// includes the marker's own chars, so a clip against it lets a run
+/// that reaches the cut mark the ellipsis — "continues past the edge".
+pub fn kept_chars(s: &str, max: usize, marker: &str) -> usize {
+    if display_width(s) <= max {
+        return strip_escapes(s).chars().count();
+    }
+    let marker_width = display_width(marker);
+    if marker_width >= max {
+        let (head, _) = split_at_width(s, max);
+        return strip_escapes(head).chars().count();
+    }
+    let (head, _) = split_at_width(s, max - marker_width);
+    strip_escapes(head).chars().count() + strip_escapes(marker).chars().count()
+}
+
 /// The SGR sequences a prefix of a string leaves open.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SgrState {
@@ -541,6 +561,35 @@ mod tests {
     fn a_wide_rune_cut_on_either_edge_is_dropped_whole() {
         assert_eq!(shift_chop("你好", 1, 3), "好");
         assert_eq!(shift_chop("a你", 0, 2), "a");
+    }
+
+    #[test]
+    fn kept_chars_agrees_with_what_truncation_leaves() {
+        // The property that makes the clip safe: kept_chars IS the
+        // stripped char count of the truncated line, over every branch
+        // truncate_display's own tests exercise.
+        for (s, max) in [
+            ("abcdef", 4usize),
+            ("abc", 4),
+            ("abcdef", 1),
+            ("abcdef", 0),
+            ("\x1b[31mabcdef\x1b[0m", 4),
+            ("日本語abc", 4),
+            ("a日本語", 3),
+            ("日本語", 6),
+            ("日本語abcd", 6),
+            ("", 3),
+        ] {
+            for marker in ["…", ""] {
+                assert_eq!(
+                    kept_chars(s, max, marker),
+                    strip_escapes(&truncate_display(s, max, marker))
+                        .chars()
+                        .count(),
+                    "s={s:?} max={max} marker={marker:?}"
+                );
+            }
+        }
     }
 
     #[test]

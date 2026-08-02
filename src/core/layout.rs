@@ -7,7 +7,7 @@
 use crate::color::ColorProfile;
 use crate::core::box_model::{BoxSpec, render_box};
 use crate::core::measure::{
-    Align, Chunk, ELLIPSIS, chunks, display_width, pad_display, truncate_display,
+    Align, Chunk, ELLIPSIS, chunks, display_width, kept_chars, pad_display, truncate_display,
 };
 use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneGeometry};
 use crate::style_spec::StyleSpec;
@@ -106,9 +106,23 @@ pub fn render_pane(
             continue;
         };
         slot.changed = true;
+        // Marks are computed against the pane's own untruncated output;
+        // the box cut them to `cols` cells. Clip each run to the chars
+        // that survived — via the same rule the cut used, never
+        // re-derived — or a run past the cut addresses the border, the
+        // gap, and the neighbour once the panes are joined. The clip
+        // limit includes the ellipsis, so a run reaching the cut marks
+        // `…` ("continues past the edge" — a decision, pinned by test).
+        // `changed` stays true even when every run clips away: the
+        // line DID change, and the gutter must still say so.
+        let limit = output
+            .get(i)
+            .map_or(0, |line| kept_chars(line, cols, ELLIPSIS));
         slot.cells = mark
             .cells
             .iter()
+            .map(|run| run.start.min(limit)..run.end.min(limit))
+            .filter(|run| !run.is_empty())
             .map(|run| run.start + char_shift..run.end + char_shift)
             .collect();
     }
@@ -716,6 +730,117 @@ mod tests {
             .chars()
             .collect();
         assert_eq!(&stripped[3..6], &['a', 'b', 'c']);
+    }
+
+    #[test]
+    fn marks_past_the_truncation_cut_never_leave_the_pane() {
+        // Normal border, no padding, inner 20 cells: a 30-char line
+        // keeps 19 chars + the ellipsis. A run wholly past the cut
+        // vanishes (the gutter bit still says the line changed); a
+        // straddling run clips at the cut and marks the ellipsis —
+        // "continues past the edge", a decision, not an accident.
+        let pane = pane(4, BorderPreset::Normal, sides(0, 0, 0, 0), false);
+        let source = "abcdefghijklmnopqrstuvwxyz0123";
+        let hidden = vec![marked(20..25), LineMark::default()];
+        let block = render_pane(
+            &lines(&[source, "x"]),
+            &hidden,
+            &pane,
+            geom(&pane, 22),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert!(
+            block.marks[1].changed,
+            "the line DID change — the gutter must still say so"
+        );
+        assert!(
+            block.marks[1].cells.is_empty(),
+            "a change hidden in the tail paints no highlight: {:?}",
+            block.marks[1].cells
+        );
+
+        let straddling = vec![marked(15..25), LineMark::default()];
+        let block = render_pane(
+            &lines(&[source, "x"]),
+            &straddling,
+            &pane,
+            geom(&pane, 22),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.marks[1].cells, vec![16..21]);
+        let stripped: Vec<char> = crate::core::measure::strip_escapes(&block.lines[1])
+            .chars()
+            .collect();
+        assert_eq!(
+            stripped[20], '…',
+            "a run reaching the cut marks the ellipsis"
+        );
+    }
+
+    #[test]
+    fn a_wide_rune_cut_clips_marks_in_chars_not_cells() {
+        // "日本語abcd" is 10 cells over 7 chars; an inner width of 6
+        // cells keeps 日本 (4 cells, the straddling 語 drops whole)
+        // plus the ellipsis: 3 CHARS survive. The clip must count
+        // chars, not cells, or wide runes shift every boundary.
+        let pane = pane(3, BorderPreset::Normal, sides(0, 0, 0, 0), false);
+        let source = "日本語abcd";
+        let marks = vec![marked(1..5)];
+        let block = render_pane(
+            &lines(&[source]),
+            &marks,
+            &pane,
+            geom(&pane, 8),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        // char_shift 1 (border); clip at 3 kept chars → 2..4, inside
+        // the box, ending on the ellipsis.
+        assert_eq!(block.marks[1].cells, vec![2..4]);
+    }
+
+    #[test]
+    fn a_truncated_panes_highlight_never_reaches_its_neighbour() {
+        // The composed regression: a change past the left pane's cut
+        // must not mark the gap or the right pane — composed marks
+        // never index at or past the left block's own chars.
+        let pane_box = pane(3, BorderPreset::Normal, sides(0, 0, 0, 0), false);
+        let long = "abcdefghijklmnopqrstuvwxyz0123";
+        let left = render_pane(
+            &lines(&[long]),
+            &[marked(20..25)],
+            &pane_box,
+            geom(&pane_box, 22),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let right = render_pane(
+            &lines(&["quiet"]),
+            &[LineMark::default()],
+            &pane_box,
+            geom(&pane_box, 22),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let left_chars = crate::core::measure::strip_escapes(&left.lines[1])
+            .chars()
+            .count();
+        let composed = compose_panes(&row(2), &[left, right], 1, 0);
+        for (i, mark) in composed.marks.iter().enumerate() {
+            for run in &mark.cells {
+                assert!(
+                    run.end <= left_chars,
+                    "row {i}: run {run:?} leaks past the left pane ({left_chars} chars)"
+                );
+            }
+        }
     }
 
     #[test]

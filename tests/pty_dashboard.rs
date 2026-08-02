@@ -1940,3 +1940,78 @@ fn a_pane_sourced_tab_title_follows_the_panes_output() {
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(3));
 }
+
+#[test]
+fn a_hidden_tail_change_never_highlights_the_neighbour() {
+    // The left pane's line is wider than its 14-cell box: chars 15..18
+    // change while only chars 0..13 (+ ellipsis) are visible. With
+    // highlights on, the change past the cut must not paint reverse
+    // video into the gap or the right pane — pre-clip, the leaked run
+    // landed exactly on the neighbour's first characters.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let value = dir.path().join("value");
+    std::fs::write(&value, "0-abcdefghijk-AAA").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+row-gap 0
+
+defaults {{
+    height 1
+    border "none"
+    chrome #false
+    shell #true
+}}
+
+row {{
+    pane "wide" {{
+        interval "250ms"
+        width "14"
+        command "printf 'v%s' \"$(cat {value})\""
+    }}
+    pane "quiet" {{
+        interval "10s"
+        command "printf 'zebra-static'"
+    }}
+}}
+"#,
+            value = value.display(),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"zebra-static",
+            Duration::from_secs(5)
+        ),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"c");
+    std::fs::write(&value, "1-abcdefghijk-BBB").expect("the change");
+    // The digit flip is the positive control: highlights were live on
+    // the very repaint that carried the hidden-tail change.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"\x1b[7m1\x1b[0m",
+        Duration::from_secs(5),
+    )
+    .expect("the visible change never got its highlight");
+    assert!(
+        !contains(&seen, b"\x1b[7mzeb"),
+        "the hidden tail's run leaked onto the neighbour: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
