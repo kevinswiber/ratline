@@ -35,6 +35,10 @@ shell-words = "1.1"
 terminal-colorsaurus = "1.0"
 xterm-color = "1.0"
 kdl = "6.7.1"
+# The renderer only: `fancy-no-syscall` gates GraphicalReportHandler +
+# themes without env sniffing or backtraces — rat owns its own color
+# and width decisions, so miette must not detect them independently.
+miette = { version = "7.6.0", default-features = false, features = ["fancy-no-syscall"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"

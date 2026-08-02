@@ -210,7 +210,10 @@ fn a_file_that_is_not_kdl_names_the_path() {
         .code(1)
         .stderr(predicates::str::contains("board.conf"))
         .stderr(predicates::str::contains("line "))
-        .stderr(predicates::str::contains("column "));
+        .stderr(predicates::str::contains("column "))
+        // The rustc-style snippet reaches the user: the offending
+        // source line is echoed on stderr, pointed at by the span.
+        .stderr(predicates::str::contains("gap = 0"));
 }
 
 /// The failure lives in the failing pane's own box — its text, its
