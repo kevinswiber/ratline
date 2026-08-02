@@ -92,6 +92,36 @@ fn the_hardware_cursor_rests_on_the_caret() {
     );
 }
 
+/// A wide prompt glyph must not push the value one cell right. ratatui
+/// pads a wide glyph with a reset continuation cell, and emitting that
+/// space shifted the whole line while the caret — measured in cells —
+/// stayed put, landing it on the last character instead of after it.
+#[test]
+fn a_wide_prompt_glyph_does_not_shift_the_value() {
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["input", "--prompt", "日", "--value", "abc"],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat input under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    // The value follows the prompt's reset with no padding between.
+    let adjacent = "日\x1b[0mabc".as_bytes();
+    let seen = wait_for_bytes(&session, &mut terminal, adjacent, Duration::from_secs(5))
+        .expect("the value must sit immediately after the wide prompt");
+    // 日 spans columns 0-1 and abc columns 2-4, so the caret belongs at 5.
+    assert!(
+        contains(&seen, b"\x1b[5C"),
+        "the caret must park after the value, not on its last cell: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"\r");
+    let _ = drain_for(&session, Duration::from_millis(300));
+    session.kill_if_alive(Duration::from_secs(5));
+}
+
 /// A value that reaches the right edge scrolls the field instead of
 /// pinning the caret on the last character — the reported bug: once the
 /// text filled the row the caret stuck to the final cell forever.

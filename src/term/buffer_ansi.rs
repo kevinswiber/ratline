@@ -1,5 +1,6 @@
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
+use unicode_width::UnicodeWidthStr;
 
 use crate::color::ColorProfile;
 use crate::style_spec::StyleSpec;
@@ -20,6 +21,12 @@ fn cell_spec(cell: &ratatui::buffer::Cell) -> StyleSpec {
 /// Convert a rendered ratatui buffer into ANSI lines for the inline
 /// renderer: SGR emitted only on style change, reset closed per line,
 /// trailing unstyled blanks trimmed.
+///
+/// A wide glyph occupies one cell plus the reset continuation cells
+/// ratatui lays beside it. Those continuation cells hold spaces, so
+/// emitting them would render the glyph's own second half as padding and
+/// push the rest of the line right — the same skip every ratatui backend
+/// performs when it writes a buffer to a terminal.
 pub fn buffer_to_lines(buf: &Buffer, profile: ColorProfile) -> Vec<String> {
     let area = buf.area;
     let mut lines = Vec::with_capacity(usize::from(area.height));
@@ -27,10 +34,16 @@ pub fn buffer_to_lines(buf: &Buffer, profile: ColorProfile) -> Vec<String> {
         let mut line = String::new();
         let mut open_prefix: Option<String> = None;
         let mut pending_blanks = String::new();
+        let mut skip = 0usize;
         for x in area.left()..area.right() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
             let Some(cell) = buf.cell((x, y)) else {
                 continue;
             };
+            skip = cell.symbol().width().saturating_sub(1);
             let spec = cell_spec(cell);
             let prefix = spec.sgr_prefix(profile);
             let prefix = (!prefix.is_empty()).then_some(prefix);
@@ -136,6 +149,53 @@ mod tests {
         buf.set_string(0, 0, "hi", ratatui::style::Style::default());
         let lines = buffer_to_lines(&buf, ColorProfile::Ascii);
         assert_eq!(lines, vec!["hi"]);
+    }
+
+    #[test]
+    fn a_wide_glyph_does_not_shift_the_rest_of_the_line() {
+        // ratatui stores a wide glyph as its symbol plus a reset
+        // continuation cell — and a reset cell holds a space. Emitting
+        // that space renders the glyph's own second half as padding and
+        // pushes everything after it one cell right, while every
+        // cell-based measurement (the caret's included) says otherwise.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "日", Style::default());
+        buf.set_string(2, 0, "ab", Style::default());
+        let lines = buffer_to_lines(&buf, ColorProfile::Ascii);
+        assert_eq!(lines, vec!["日ab"]);
+    }
+
+    #[test]
+    fn a_styled_wide_glyph_closes_its_style_once() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "日", Style::default().fg(Color::Red));
+        buf.set_string(2, 0, "ab", Style::default());
+        let lines = buffer_to_lines(&buf, ColorProfile::Ansi256);
+        assert_eq!(lines, vec!["\x1b[31m日\x1b[0mab"]);
+    }
+
+    #[test]
+    fn consecutive_wide_glyphs_stay_adjacent() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "日本", Style::default());
+        buf.set_string(4, 0, "x", Style::default());
+        let lines = buffer_to_lines(&buf, ColorProfile::Ascii);
+        assert_eq!(lines, vec!["日本x"]);
+    }
+
+    #[test]
+    fn a_gap_after_a_wide_glyph_is_still_a_gap() {
+        // Only the glyph's own continuation cell is swallowed; a real
+        // blank the caller painted after it must survive.
+        let area = Rect::new(0, 0, 10, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "日", Style::default());
+        buf.set_string(3, 0, "x", Style::default());
+        let lines = buffer_to_lines(&buf, ColorProfile::Ascii);
+        assert_eq!(lines, vec!["日 x"]);
     }
 
     #[test]
