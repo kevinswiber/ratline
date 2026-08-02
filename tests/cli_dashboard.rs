@@ -489,6 +489,49 @@ pane "slow" {{
     assert!(stdout.contains("two"), "the slow pane arrived: {stdout:?}");
 }
 
+#[test]
+fn a_pane_that_cannot_start_shows_the_reason_before_the_path() {
+    // A declared width no terminal can widen truncates from the
+    // right, so whatever sits last is what no reader sees. The
+    // missing command is a LONG absolute path: the OS reason must
+    // survive the budget, and the path's tail is what pays. The
+    // reason is matched by `os error`, never an OS-specific sentence.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = format!("{}-definitely-missing", rat_bin());
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            r#"
+pane "plan" {{
+    command "{cmd}"
+    width "72"
+    height 3
+    chrome #false
+    border "none"
+    padding "0"
+}}
+"#,
+            cmd = missing.replace('\\', "\\\\")
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .env("RAT_WIDTH", "100")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("os error"),
+        "the reason survives the width: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("definitely-missing"),
+        "the path's tail is what overflows: {stdout:?}"
+    );
+}
+
 /// Piped mode honors the handed-down geometry: a nested one-shot
 /// dashboard sizes itself to its pane instead of a hardcoded 80
 /// columns.
