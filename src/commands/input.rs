@@ -1,6 +1,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::InputArgs;
 use crate::color::ColorProfile;
@@ -32,7 +33,9 @@ impl UiApp for InputApp {
         }
         let accent = Style::default().fg(self.palette.accent);
         buf.set_string(0, y, &self.prompt, accent);
-        let x = self.prompt.chars().count() as u16;
+        // Cell width, not char count: a wide prompt occupies more cells
+        // than chars, and the text starts after the cells.
+        let x = self.prompt.as_str().width() as u16;
         let text = self.state.display(&self.placeholder);
         let style = if self.state.value.is_empty() {
             Style::default()
@@ -44,7 +47,8 @@ impl UiApp for InputApp {
         buf.set_string(x, y, &text, style);
         // Mark the cursor with reverse video (on the char or one past the end).
         if !self.state.value.is_empty() || self.state.cursor > 0 {
-            let cx = x + self.state.cursor as u16;
+            let before: String = text.chars().take(self.state.cursor).collect();
+            let cx = x + before.width() as u16;
             let under = text.chars().nth(self.state.cursor).unwrap_or(' ');
             buf.set_string(
                 cx,
@@ -62,9 +66,17 @@ impl UiApp for InputApp {
     }
 
     fn cursor_pos(&self) -> Option<(u16, u16)> {
+        // Cells, not chars: the renderer consumes the column as terminal
+        // cells, and wide glyphs occupy two. An empty value keeps the
+        // caret at the text start — never inside the placeholder.
         let row = u16::from(self.header.is_some());
-        let col = (self.prompt.chars().count() + self.state.cursor) as u16;
-        Some((col, row))
+        let mut col = self.prompt.as_str().width();
+        if !self.state.value.is_empty() {
+            let text = self.state.display(&self.placeholder);
+            let before: String = text.chars().take(self.state.cursor).collect();
+            col += before.width();
+        }
+        Some((col as u16, row))
     }
 }
 
@@ -224,6 +236,54 @@ mod tests {
             palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
         };
         assert_eq!(app.cursor_pos(), Some((2, 1)));
+    }
+
+    #[test]
+    fn the_cursor_pos_counts_display_cells_not_chars() {
+        // "日" is one char but two terminal cells; the renderer consumes
+        // the column as cells. Wide prompt + wide value both count.
+        let mut state = InputState::new("日本".to_string(), false, 1000);
+        state.cursor = 1;
+        let app = InputApp {
+            state,
+            prompt: "日 ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        // Prompt "日 " is 3 cells; the char before the caret is 2 cells.
+        assert_eq!(app.cursor_pos(), Some((5, 0)));
+        // Empty value: the caret sits at the prompt's cell width, not its
+        // char count, and never reaches into the placeholder.
+        let app = InputApp {
+            state: InputState::new(String::new(), false, 1000),
+            prompt: "日 ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        assert_eq!(app.cursor_pos(), Some((3, 0)));
+    }
+
+    #[test]
+    fn the_painted_caret_lands_on_the_same_cell() {
+        // The reverse-video caret and the hardware cursor must agree: a
+        // wide char before the caret shifts both by two cells.
+        let mut state = InputState::new("日a".to_string(), false, 1000);
+        state.cursor = 1;
+        let app = InputApp {
+            state,
+            prompt: "> ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = Buffer::empty(area);
+        app.render(area, &mut buf);
+        let cell = buf.cell((4, 0)).expect("caret cell is painted");
+        assert_eq!(cell.symbol(), "a");
+        assert!(cell.modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

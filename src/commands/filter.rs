@@ -4,6 +4,7 @@ use anyhow::Context;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::FilterArgs;
 use crate::color::ColorProfile;
@@ -42,7 +43,8 @@ impl UiApp for FilterApp {
             y += 1;
         }
         buf.set_string(0, y, &self.prompt, accent);
-        let qx = self.prompt.chars().count() as u16;
+        // Cell width, not char count — same rule as the input prompt.
+        let qx = self.prompt.as_str().width() as u16;
         let qtext = self.state.query.display(&self.placeholder);
         let qstyle = if self.state.query.value.is_empty() {
             Style::default()
@@ -105,9 +107,21 @@ impl UiApp for FilterApp {
     }
 
     fn cursor_pos(&self) -> Option<(u16, u16)> {
+        // Cells, not chars — wide glyphs occupy two; an empty query keeps
+        // the caret at the text start, never inside the placeholder.
         let row = u16::from(self.header.is_some());
-        let col = (self.prompt.chars().count() + self.state.query.cursor) as u16;
-        Some((col, row))
+        let mut col = self.prompt.as_str().width();
+        if !self.state.query.value.is_empty() {
+            let before: String = self
+                .state
+                .query
+                .value
+                .chars()
+                .take(self.state.query.cursor)
+                .collect();
+            col += before.width();
+        }
+        Some((col as u16, row))
     }
 }
 
@@ -341,6 +355,19 @@ mod tests {
             AppearanceSource::Default,
         ));
         assert_eq!(app.cursor_pos(), Some((3, 0)));
+    }
+
+    #[test]
+    fn the_cursor_pos_counts_display_cells_not_chars() {
+        // A wide query char occupies two cells; the parked column follows
+        // the cells, not the char count.
+        let mut app = app(Palette::builtin(
+            Appearance::Dark,
+            AppearanceSource::Default,
+        ));
+        app.state.query.value = "日".to_string();
+        app.state.query.cursor = 1;
+        assert_eq!(app.cursor_pos(), Some((4, 0)));
     }
 
     #[test]
