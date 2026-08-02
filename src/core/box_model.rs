@@ -1,7 +1,9 @@
 use ratatui::symbols::border::Set;
 
 use crate::color::ColorProfile;
-use crate::core::measure::{Align, ELLIPSIS, display_width, pad_display, truncate_display};
+use crate::core::measure::{
+    Align, ELLIPSIS, display_width, pad_display, seal_rows, truncate_display,
+};
 use crate::style_spec::StyleSpec;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
@@ -122,6 +124,14 @@ impl Default for BoxSpec<'_> {
 
 /// Style, align, pad, border, and margin a block of content lines.
 pub fn render_box(lines: &[String], spec: &BoxSpec<'_>, profile: ColorProfile) -> Vec<String> {
+    // Sealed first: a line that fits is pinned in verbatim below, so an
+    // SGR the content leaves open would paint the right padding, the
+    // border cell, and (border #none) the rows after the box. Sealing
+    // closes each line and replays the open state on the next, keeping
+    // a deliberate multi-line span while the box's own chrome stays in
+    // rat's colors. Plain content is untouched (escapes are zero cells,
+    // so width math is too).
+    let lines = seal_rows(lines.to_vec());
     let inner = spec
         .width
         .unwrap_or_else(|| lines.iter().map(|l| display_width(l)).max().unwrap_or(0));
@@ -135,7 +145,7 @@ pub fn render_box(lines: &[String], spec: &BoxSpec<'_>, profile: ColorProfile) -
     for _ in 0..spec.padding.top {
         interior.push(blank.clone());
     }
-    for line in lines {
+    for line in &lines {
         let cut = truncate_display(line, inner, spec.ellipsis);
         let aligned = if need_right_pad {
             pad_display(&cut, inner, spec.align)
@@ -259,6 +269,48 @@ fn align_without_trailing(line: &str, width: usize, align: Align) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_that_fits_still_closes_its_open_styling() {
+        // truncate_display closes only when it cuts; a line that fits
+        // used to keep its open color, painting the right padding and
+        // the border cell in the child's leftover state.
+        let spec = BoxSpec {
+            border: BorderPreset::Normal,
+            padding: Sides {
+                right: 1,
+                ..Sides::default()
+            },
+            ..BoxSpec::default()
+        };
+        let out = render_box(&["\x1b[31mred".to_string()], &spec, ColorProfile::TrueColor);
+        let body = &out[1];
+        assert!(
+            body.contains("\x1b[31mred\x1b[0m"),
+            "the content must close before padding and border: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_replays_across_a_boxes_lines() {
+        let spec = BoxSpec::default();
+        let out = render_box(
+            &["\x1b[31ma".to_string(), "b\x1b[0m".to_string()],
+            &spec,
+            ColorProfile::TrueColor,
+        );
+        assert_eq!(out, vec!["\x1b[31ma\x1b[0m", "\x1b[31mb\x1b[0m"]);
+    }
+
+    #[test]
+    fn plain_content_passes_through_byte_identical() {
+        let out = render_box(
+            &["plain".to_string(), "rows".to_string()],
+            &BoxSpec::default(),
+            ColorProfile::TrueColor,
+        );
+        assert_eq!(out, vec!["plain", "rows"]);
+    }
 
     #[test]
     fn presets_have_distinct_corners() {
