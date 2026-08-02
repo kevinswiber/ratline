@@ -220,6 +220,11 @@ impl<W: Write> InlineRenderer<W> {
             if self.clear_screen {
                 self.screen_cleared = false;
             }
+            // Reflow moved a parked cursor unpredictably: the recorded
+            // (rows_up, col) is fiction, so forget it rather than emit a
+            // stale un-park move. The repaint below starts from wherever
+            // the cursor is — the same trust level as the legacy resize.
+            self.parked = None;
         }
         self.last_width = Some(term_width);
         let next_rows = rendered_rows(lines, term_width);
@@ -825,6 +830,30 @@ mod park_tests {
             "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[1A\r\x1b[5C\x1b[?25h",
             "\x1b[?25l\x1b[1B\r",
             "\x1b[?25h", // drop restores the cursor
+        );
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn a_resize_drops_the_park_instead_of_trusting_it() {
+        // Terminal reflow moves a parked cursor unpredictably; the old
+        // (rows_up, col) is fiction. The resize repaint must not emit the
+        // stale un-park move — it paints from wherever the cursor is,
+        // exactly like the legacy resize path, then parks fresh.
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc"]), 20, Some((5, 0)))
+                .unwrap();
+            r.draw_with_cursor(&lines(&["> abc"]), 8, Some((3, 0)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        let expected = concat!(
+            "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[1A\r\x1b[5C\x1b[?25h",
+            "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[1A\r\x1b[3C\x1b[?25h",
         );
         assert_eq!(s, expected);
     }
