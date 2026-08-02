@@ -1,0 +1,43 @@
+// `tail.kdl` for Windows, where `shell #true` means `cmd.exe /C`. Run it:
+//
+//   rat dashboard examples/tail-windows.kdl
+//
+// and delete %TEMP%\rat-tail-demo.log when you are done.
+//
+// Two rules govern every script below, and neither has an equivalent on
+// the unix side:
+//
+//   1. No double quotes. rat hands the script to cmd as a single
+//      argument, and Rust's argument quoting escapes an inner `"` as
+//      `\"` — a convention cmd.exe does not have, so the backslashes
+//      arrive literally. `echo "hi"` prints `\"hi\"`. Single quotes
+//      survive intact, and PowerShell is happy with them.
+//   2. No `|`. cmd claims the pipe before the process on the far side of
+//      it ever sees it. `>>`, `&`, `;`, `(`, `)` and `!` are all fine.
+//
+// A script that IS fully quoted fails in a quieter way than it looks:
+// `powershell -Command "Get-Content ..."` hands PowerShell a string
+// literal, which it evaluates and echoes back. The pane fills with its
+// own source text — expanded, which is the tell — and exits 0.
+
+defaults height=5 border="none" shell=#true interval="never"
+
+// `Get-Content -Wait` is the streaming tail. It is not `tail -F`: it
+// exits when the file is missing rather than waiting for it, and this
+// pane's `interval "never"` means nothing would replace it. So create
+// the log first. The `-ErrorAction` covers the race where the writer
+// below wins by a hair.
+pane "a" live=#true {
+    command #"powershell -NoProfile -Command $p=$env:TEMP+'\rat-tail-demo.log'; if (!(Test-Path $p)) {[void](New-Item -ItemType File $p -ErrorAction SilentlyContinue)}; Get-Content -Path $p -Tail 5 -Wait"#
+}
+
+// cmd's own `%TIME%`, not PowerShell, because this pane respawns ten
+// times a second: powershell.exe costs ~220ms per launch and pwsh ~270ms,
+// so neither could hold the cadence. `cmd` echo costs ~20ms. The live
+// pane above pays that startup once and does not care.
+//
+// No space before `>>` — cmd would append it to the line.
+pane "b" {
+    command #"echo %TIME%>>%TEMP%\rat-tail-demo.log"#
+    interval "100ms"
+}

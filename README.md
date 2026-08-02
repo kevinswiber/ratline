@@ -405,7 +405,12 @@ A runnable declaration lives at
 [`examples/panes-nested.kdl`](examples/panes-nested.kdl) shows nested
 rows and columns and a dashboard-in-a-dashboard pane together, and
 [`examples/follow.kdl`](examples/follow.kdl) is a live log follower
-beside a batch pane.
+beside a batch pane. [`examples/tail.kdl`](examples/tail.kdl) is that
+follower made self-feeding — the batch pane writes the log the live
+pane tails, so it needs no second terminal — and
+[`examples/tail-windows.kdl`](examples/tail-windows.kdl) is the same
+dashboard for `cmd.exe`, where a `shell #true` script may contain
+neither a double quote nor a pipe.
 
 ### `rat frame` — flicker-free repaint for script-owned loops
 

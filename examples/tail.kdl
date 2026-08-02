@@ -1,0 +1,31 @@
+// A self-feeding tail: the bottom pane appends a timestamp to a log ten
+// times a second, the live pane above follows it. Unlike `follow.kdl`
+// this needs no second terminal — the dashboard is its own writer, so
+// the follower has something to show the moment it starts. Run it:
+//
+//   rat dashboard examples/tail.kdl
+//
+// and delete /tmp/rat-tail-demo.log when you are done; nothing here
+// truncates it. `tail-windows.kdl` is the same dashboard for cmd.
+//
+// Both panes are `shell #true`, so each command is one script string
+// rather than an argv: the follower has no shell syntax in it, but the
+// writer's `>>` is a redirect and needs a shell to mean anything.
+
+defaults height=5 border="none" shell=#true interval="never"
+
+// `-F` rather than `-f`, because the log does not exist until the pane
+// below writes it and `-F` waits instead of exiting. That is worth more
+// than it looks: `interval "never"` on a live pane means no replacement
+// child, so a follower that exits at startup stays dead.
+pane "a" live=#true {
+    command #"tail -n 5 -F /tmp/rat-tail-demo.log"#
+}
+
+// Whole seconds, because `%N` is a GNU date extension — BSD date, and so
+// macOS, prints a literal `N` for it. On GNU coreutils `+%H:%M:%S.%N`
+// makes the 100ms cadence much easier to see.
+pane "b" {
+    command #"date +%H:%M:%S >> /tmp/rat-tail-demo.log"#
+    interval "100ms"
+}
