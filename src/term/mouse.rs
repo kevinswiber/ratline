@@ -8,25 +8,52 @@
 
 use std::io::Write;
 
+#[cfg(unix)]
 const ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+#[cfg(unix)]
 const DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1000l";
 
-/// Owns the mouse-reporting modes: enables on construction, disables
-/// on drop, best-effort. `suspend`/`resume` bracket a foreign reader
-/// (the pager) and back the `m` hand-the-mouse-back toggle; both are
-/// idempotent so callers never track state themselves. On Windows the
-/// pump is crossterm's, and capture is a console mode rather than a
-/// DEC sequence — these writes ride the same VT path the frames use
-/// on Windows Terminal, and legacy conhost simply ignores them.
+/// Owns mouse capture: enables on construction, disables on drop,
+/// best-effort. `suspend`/`resume` bracket a foreign reader (the
+/// pager) and back the `m` hand-the-mouse-back toggle; both are
+/// idempotent so callers never track state themselves. On unix the
+/// modes are DEC sequences on the frames' own stream; on Windows the
+/// pump is crossterm's and capture is a console mode
+/// (`ENABLE_MOUSE_INPUT`, which also clears quick-edit — the same
+/// selection hijack by a different mechanism), so the guard goes
+/// through crossterm's capture commands there.
 pub struct MouseGuard<W: Write> {
     out: W,
     active: bool,
 }
 
 impl<W: Write> MouseGuard<W> {
+    fn write_enable(out: &mut W) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            out.write_all(ENABLE)?;
+            out.flush()
+        }
+        #[cfg(windows)]
+        {
+            crossterm::execute!(out, crossterm::event::EnableMouseCapture)
+        }
+    }
+
+    fn write_disable(out: &mut W) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            out.write_all(DISABLE)?;
+            out.flush()
+        }
+        #[cfg(windows)]
+        {
+            crossterm::execute!(out, crossterm::event::DisableMouseCapture)
+        }
+    }
+
     pub fn enable(mut out: W) -> std::io::Result<Self> {
-        out.write_all(ENABLE)?;
-        out.flush()?;
+        Self::write_enable(&mut out)?;
         Ok(MouseGuard { out, active: true })
     }
 
@@ -39,8 +66,7 @@ impl<W: Write> MouseGuard<W> {
         if !self.active {
             return Ok(());
         }
-        self.out.write_all(DISABLE)?;
-        self.out.flush()?;
+        Self::write_disable(&mut self.out)?;
         self.active = false;
         Ok(())
     }
@@ -50,8 +76,7 @@ impl<W: Write> MouseGuard<W> {
         if self.active {
             return Ok(());
         }
-        self.out.write_all(ENABLE)?;
-        self.out.flush()?;
+        Self::write_enable(&mut self.out)?;
         self.active = true;
         Ok(())
     }
@@ -63,7 +88,10 @@ impl<W: Write> Drop for MouseGuard<W> {
     }
 }
 
-#[cfg(test)]
+// The byte-shape expectations are the unix wire form; on Windows the
+// guard goes through crossterm's console-mode commands, which have no
+// byte contract to pin against a plain buffer.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
