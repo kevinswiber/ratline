@@ -103,6 +103,22 @@ pub enum LayoutNode {
     Column(Vec<LayoutNode>),
 }
 
+/// Where the dashboard's title comes from. `Static` renders the one
+/// bold line; `Pane` donates the ROLE to the referenced pane — the
+/// pane is the visible title wherever the file placed it, and no
+/// extra line is rendered.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub enum TitleSource {
+    #[default]
+    None,
+    Static(String),
+    Pane {
+        source: SourceId,
+        /// What the role reads while the pane has not spoken.
+        fallback: Option<String>,
+    },
+}
+
 /// How drained outputs become one frame.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Composition {
@@ -114,10 +130,9 @@ pub enum Composition {
         layout: LayoutNode,
         gap: usize,
         row_gap: usize,
-        /// The whole dashboard's name — one bold line above the
-        /// composed panes, the same treatment `rat watch --title`
-        /// gives a plain frame. Never a pane's border label.
-        title: Option<String>,
+        /// The whole dashboard's name and where it comes from.
+        /// Never a pane's border label.
+        title: TitleSource,
     },
 }
 
@@ -210,7 +225,7 @@ impl Registry {
                 layout,
                 gap,
                 row_gap,
-                title: None,
+                title: TitleSource::None,
             },
             diagnostics: Vec::new(),
         })
@@ -220,7 +235,7 @@ impl Registry {
     /// `panes` constructor has a dozen call sites that do not care,
     /// and a builder keeps them unchanged. A no-op under `Plain`,
     /// whose title arrives through its own constructor.
-    pub fn with_title(mut self, title: Option<String>) -> Registry {
+    pub fn with_title(mut self, title: TitleSource) -> Registry {
         if let Composition::Panes { title: slot, .. } = &mut self.composition {
             *slot = title;
         }

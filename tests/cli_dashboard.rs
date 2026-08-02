@@ -704,6 +704,53 @@ pane "build" {{
 }
 
 #[test]
+fn a_ref_sourced_title_renders_the_pane_not_the_fallback() {
+    // Role donation end to end: the referenced pane is the visible
+    // title, and the fallback text never reaches the frame — it is
+    // the ROLE's fallback, not a rendered line.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "reffed.kdl",
+        &format!(
+            r##"
+title "Fallback" ref="#header"
+
+pane "header" {{
+    height 1
+    chrome #false
+    border "none"
+    command "{bin}" "style" "CUSTOM-HEADER"
+}}
+
+pane "body" {{
+    height 3
+    chrome #false
+    border "none"
+    command "{bin}" "style" "body-line"
+}}
+"##,
+            bin = rat_bin().replace('\\', "\\\\")
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let first = stdout.lines().next().expect("a frame");
+    assert!(
+        first.contains("CUSTOM-HEADER"),
+        "the pane heads the frame: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("Fallback"),
+        "the fallback is role text, never a rendered line: {stdout:?}"
+    );
+}
+
+#[test]
 fn a_pane_that_cannot_start_shows_the_reason_before_the_path() {
     // A declared width no terminal can widen truncates from the
     // right, so whatever sits last is what no reader sees. The
