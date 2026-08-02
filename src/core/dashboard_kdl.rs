@@ -304,6 +304,36 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
+/// One line: `line N, column M: <message>[ — <help>][ (and K more)]`.
+/// Upstream's message ships verbatim — rewriting it is string surgery
+/// against a crate that can reword on a patch bump — and its `help` is
+/// upstream's only teaching payload, so it rides along. Deliberately
+/// NO source echo, caret, or snippet: echoing the offending line needs
+/// a truncation policy, and an unbudgeted echo is exactly the class of
+/// defect where a fixed width eats the part that matters.
+// Staged: `parse`'s syntax-error adapter becomes the caller.
+#[allow(dead_code)]
+fn syntax_error_text(
+    line: usize,
+    column: usize,
+    message: Option<&str>,
+    help: Option<&str>,
+    more: usize,
+) -> String {
+    use std::fmt::Write;
+    let mut text = format!(
+        "line {line}, column {column}: {}",
+        message.unwrap_or("invalid KDL")
+    );
+    if let Some(help) = help {
+        let _ = write!(text, " — {help}");
+    }
+    if more > 0 {
+        let _ = write!(text, " (and {more} more)");
+    }
+    text
+}
+
 /// The document: settings, then the tree. A pane is declared inside the
 /// `row`/`column` that places it.
 ///
@@ -730,6 +760,34 @@ mod tests {
         assert_eq!(line_column("ab\r\ncd", 4), (2, 1));
         // Past the end: clamp to one past the last content.
         assert_eq!(line_column("ab\n", 99), (2, 1));
+    }
+
+    #[test]
+    fn a_placed_syntax_error_reads_as_one_line() {
+        // OUR frame is pinned whole; upstream's message text is a
+        // plain value here, never byte-pinned at the route.
+        assert_eq!(
+            syntax_error_text(1, 20, Some("Expected valid value"), None, 0),
+            "line 1, column 20: Expected valid value"
+        );
+        assert_eq!(
+            syntax_error_text(3, 1, Some("No closing '}' for child block"), None, 1),
+            "line 3, column 1: No closing '}' for child block (and 1 more)"
+        );
+        assert_eq!(
+            syntax_error_text(
+                2,
+                14,
+                Some("bad float"),
+                Some("numbers after the decimal point"),
+                0
+            ),
+            "line 2, column 14: bad float — numbers after the decimal point"
+        );
+        assert_eq!(
+            syntax_error_text(1, 1, None, None, 0),
+            "line 1, column 1: invalid KDL"
+        );
     }
 
     const KDL_FIXTURE: &str = r#"
