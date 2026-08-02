@@ -77,7 +77,7 @@ impl LayoutDecl {
     }
 }
 
-/// One pane's declaration (or the `[defaults]` block), tokens unparsed.
+/// One pane's declaration (or the `defaults` block), tokens unparsed.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct PaneDecl {
     pub name: Option<String>,
@@ -166,7 +166,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
     // execute a wrongly-shaped argv — fail with the fix instead.
     if decl.command.is_none() && shell != defaults.shell.unwrap_or(false) {
         bail!(
-            "{}: inherits `command` from [defaults] but overrides `shell` — \
+            "{}: inherits `command` from `defaults` but overrides `shell` — \
              the inherited command was read under the defaults' shell mode; \
              declare the pane's own `command`",
             at(name)
@@ -221,7 +221,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::R
 fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, name: &str) -> anyhow::Result<PaneBox> {
     let height = decl.height.or(defaults.height).ok_or_else(|| {
         anyhow!(
-            "{}: needs a `height` — declare one on the pane or in [defaults]",
+            "{}: needs a `height` — declare one on the pane or in `defaults`",
             at(name)
         )
     })?;
@@ -426,6 +426,47 @@ mod tests {
     }
 
     #[test]
+    fn teaching_errors_name_the_kdl_spelling_not_a_toml_section() {
+        // `[defaults]` is TOML section syntax, and TOML is gone. The
+        // one job of a teaching error is to say what to WRITE; both of
+        // these must name the bare `defaults` node.
+        let mut heightless = pane("a", &["true"]);
+        heightless.height = None;
+        let missing_height = err_of(file(vec![heightless]));
+        assert!(
+            missing_height.contains("`defaults`"),
+            "got {missing_height}"
+        );
+        assert!(
+            !missing_height.contains("[defaults]"),
+            "got {missing_height}"
+        );
+
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                command: Some(vec!["true".to_string()]),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                name: Some("b".to_string()),
+                shell: Some(true),
+                height: Some(3),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let shell_override = format!("{:#}", decl.into_registry().unwrap_err());
+        assert!(
+            shell_override.contains("`defaults`"),
+            "got {shell_override}"
+        );
+        assert!(
+            !shell_override.contains("[defaults]"),
+            "got {shell_override}"
+        );
+    }
+
+    #[test]
     fn defaults_fall_through_to_every_pane() {
         let decl = DashboardFile {
             defaults: PaneDecl {
@@ -449,7 +490,7 @@ mod tests {
         };
         // Both panes declare their own height (4 — the smallest a
         // rounded border plus the chrome row admits), so only the
-        // fields the panes leave open come from [defaults].
+        // fields the panes leave open come from `defaults`.
         let registry = decl.into_registry().expect("registry");
         assert_eq!(registry.len(), 2);
         for id in registry.ids() {

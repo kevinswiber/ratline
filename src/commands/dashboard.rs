@@ -97,7 +97,9 @@ const LIVE_HELP: &[&str] = &[
     "    and painted as it prints — it is not on a cadence. Its",
     "    `interval` is how soon a replacement spawns if the child exits,",
     "    not how often it runs. `interval \"never\"` means no replacement:",
-    "    the pane keeps its exit badge.",
+    "    the pane keeps its exit badge. A `trigger` on a live pane",
+    "    restarts the child: the running one is killed and a replacement",
+    "    spawned in its place.",
 ];
 
 /// What `· looping` means, and what to do about it.
@@ -264,6 +266,9 @@ mod tests {
         // And the opt-out, which is the same contract's other half:
         // `interval "never"` on a live pane means no replacement.
         assert!(text.contains("no replacement"), "got {text}");
+        // And the trigger contract: a fire restarts the child. The
+        // README points at `?` for this, so `?` must actually say it.
+        assert!(text.contains("restarts the child"), "got {text}");
     }
 
     #[test]
