@@ -82,6 +82,22 @@ fn pane_help(registry: &Registry) -> Vec<String> {
     {
         lines.extend(LOOPING_HELP.iter().map(|l| (*l).to_string()));
     }
+    // The diagnostics channel: load-time facts worth telling but not
+    // worth failing over. Absent diagnostics add NOTHING — the plain
+    // help stays byte-identical.
+    if !registry.diagnostics().is_empty() {
+        lines.push(String::new());
+        lines.push("  diagnostics:".to_string());
+        for diagnostic in registry.diagnostics() {
+            // The pager has no wrapping engine; the key table's width
+            // is the budget every help line keeps.
+            lines.push(crate::core::measure::truncate_display(
+                &format!("    {diagnostic}"),
+                74,
+                crate::core::measure::ELLIPSIS,
+            ));
+        }
+    }
     lines
 }
 
@@ -331,6 +347,33 @@ mod tests {
                 line.chars().count()
             );
         }
+    }
+
+    #[test]
+    fn load_diagnostics_get_their_own_help_section_only_when_present() {
+        // The `?` reference is the diagnostics channel: load-time
+        // facts worth telling but not worth failing over. Absent
+        // diagnostics add NOTHING — the byte-identity pin below stays
+        // the proof for the common case.
+        let noisy = registry(false).with_diagnostics(vec![
+            "duplicate id \"a\" — refs bind to the first declaration".to_string(),
+        ]);
+        let lines = pane_help(&noisy);
+        assert!(
+            lines.contains(&"  diagnostics:".to_string()),
+            "the section header appears: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("duplicate id \"a\"") && l.starts_with("    ")),
+            "the diagnostic is listed, indented: {lines:?}"
+        );
+        let quiet = pane_help(&registry(false));
+        assert!(
+            !quiet.iter().any(|l| l.contains("diagnostics")),
+            "no section when there is nothing to say: {quiet:?}"
+        );
     }
 
     #[test]
