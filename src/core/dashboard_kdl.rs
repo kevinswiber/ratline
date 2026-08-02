@@ -276,6 +276,34 @@ fn record(seen: &mut Vec<&'static str>, k: &'static Key, at: &str) -> anyhow::Re
     Ok(())
 }
 
+/// Place a byte offset into 1-based (line, column). The offset WALKS
+/// bytes while the column COUNTS chars: kdl 6.7.1's diagnostic spans
+/// are byte-indexed despite their doc comment saying chars — winnow's
+/// `LocatingSlice` measures `offset_from` in bytes. A `\r` is not a
+/// column (CRLF turns the line at its `\n`), a mid-char offset lands
+/// after that char, and an offset past the end clamps to wherever the
+/// walk stops — nothing here can panic or index out of bounds.
+// Staged: `parse`'s syntax-error adapter becomes the caller.
+#[allow(dead_code)]
+fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    for (i, ch) in text.char_indices() {
+        if i >= offset {
+            break;
+        }
+        match ch {
+            '\n' => {
+                line += 1;
+                column = 1;
+            }
+            '\r' => {}
+            _ => column += 1,
+        }
+    }
+    (line, column)
+}
+
 /// The document: settings, then the tree. A pane is declared inside the
 /// `row`/`column` that places it.
 ///
@@ -683,6 +711,26 @@ fn usize_field(node: &kdl::KdlNode, name: &str) -> anyhow::Result<usize> {
 mod tests {
     use super::*;
     use crate::core::registry::Registry;
+
+    #[test]
+    fn line_column_counts_from_one_over_bytes_not_chars() {
+        assert_eq!(line_column("a\nbb\n", 0), (1, 1));
+        assert_eq!(line_column("a\nbb\n", 2), (2, 1));
+        assert_eq!(line_column("a\nbb\n", 4), (2, 3));
+        // Multi-byte: 'é' is two bytes, one column. Offset 6 is the
+        // space — the sixth CHAR — reached by walking BYTES. This is
+        // the case that proves the convention (and that a mid-char
+        // offset cannot panic the walk).
+        assert_eq!(line_column("héllo x", 6), (1, 6));
+        // A mid-char byte offset lands after the char it is inside,
+        // and never panics: byte 2 is é's second byte, and é is
+        // consumed whole, so the walk stops at column 3.
+        assert_eq!(line_column("héllo x", 2), (1, 3));
+        // CRLF: the \r is not a column.
+        assert_eq!(line_column("ab\r\ncd", 4), (2, 1));
+        // Past the end: clamp to one past the last content.
+        assert_eq!(line_column("ab\n", 99), (2, 1));
+    }
 
     const KDL_FIXTURE: &str = r#"
 gap 1
