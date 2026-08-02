@@ -751,6 +751,29 @@ pane "body" {{
 }
 
 #[test]
+fn a_piped_once_dashboard_never_touches_the_tab_title() {
+    use predicates::boolean::PredicateBooleanExt;
+    // The tab title is interactive chrome: a pipe gets frame bytes
+    // and nothing else — no stack push, no OSC.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "titled.kdl",
+        &format!(
+            "title \"Deploy\"\n\npane \"a\" {{\n    height 3\n    chrome #false\n    border \"none\"\n    command \"{bin}\" \"style\" \"one\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\")
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\u{1b}]2;").not())
+        .stdout(predicates::str::contains("\u{1b}[22;2t").not());
+}
+
+#[test]
 fn a_pane_that_cannot_start_shows_the_reason_before_the_path() {
     // A declared width no terminal can widen truncates from the
     // right, so whatever sits last is what no reader sees. The

@@ -4,7 +4,7 @@ mod common;
 use std::time::Duration;
 
 use common::pty::{
-    FakeTerminal, PtySession, assert_counter_settled_at, wait_for, wait_for_counter,
+    FakeTerminal, PtySession, assert_counter_settled_at, counter_cmd, wait_for, wait_for_counter,
 };
 
 /// Path to the rat binary — duplicated from the watch suite's local
@@ -1801,4 +1801,142 @@ fn a_syntax_error_on_a_tty_paints_its_snippet() {
         "the snippet is colored on a tty: {:?}",
         String::from_utf8_lossy(&bytes)
     );
+}
+
+/// The session owns the tab title: stack pushed and the marker title
+/// set before the first frame, stack popped on quit. A plain `rat
+/// watch` session in the same harness never says `]2;` at all — the
+/// dashboard-only scoping, pinned from the outside.
+#[test]
+fn an_interactive_dashboard_owns_the_tab_title_and_restores_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let steady = dir.path().join("steady");
+    std::fs::write(&steady, "steady-content").expect("seed");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "pane \"deploy\" {{\n    height 3\n    chrome #false\n    border \"none\"\n    command \"{}\" \"__cat\" \"{}\"\n}}\n",
+            rat_bin().escape_default(),
+            steady.display().to_string().escape_default(),
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"steady-content",
+        Duration::from_secs(5),
+    )
+    .expect("the first frame painted");
+    let push = find(&bytes, b"\x1b[22;2t").expect("the title stack is pushed");
+    let set = find(&bytes, b"\x1b]2;\xe2\x96\x9e ").expect("the marker title is set");
+    assert!(push < set, "push before set");
+
+    session.write_bytes(b"q");
+    let mut rest = bytes;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.exited() && std::time::Instant::now() < deadline {
+        let chunk = session.read_available(Duration::from_millis(50));
+        terminal.respond(&session, &chunk);
+        rest.extend_from_slice(&chunk);
+    }
+    let chunk = session.read_available(Duration::from_millis(200));
+    rest.extend_from_slice(&chunk);
+    let pop = find(&rest, b"\x1b[23;2t").expect("the title stack is popped on quit");
+    assert!(pop > set, "pop after set");
+}
+
+/// The scoping's other half: an interactive plain watch never touches
+/// the tab title.
+#[test]
+fn a_plain_watch_session_never_touches_the_tab_title() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let steady = dir.path().join("steady");
+    std::fs::write(&steady, "watch-content").expect("seed");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "1s",
+            "--",
+            &rat_bin(),
+            "__cat",
+            &steady.display().to_string(),
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat watch under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let bytes = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"watch-content",
+        Duration::from_secs(5),
+    )
+    .expect("the first frame painted");
+    assert!(
+        find(&bytes, b"\x1b]2;").is_none(),
+        "watch never sets a tab title"
+    );
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(3));
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// A pane-sourced title follows the pane: as the referenced pane's
+/// first line changes, the tab title is re-emitted with the new role
+/// text — and only then; the emitter is idempotent per text.
+#[test]
+fn a_pane_sourced_tab_title_follows_the_panes_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "title \"warming up\" ref=\"#c\"\n\npane \"c\" {{\n    height 3\n    chrome #false\n    border \"none\"\n    shell #true\n    interval \"1s\"\n    command \"{}\"\n}}\n",
+            counter_cmd(&counter),
+        ),
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let mut collected: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline
+        && find(&collected, b"\x1b]2;\xe2\x96\x9e count-1\x07").is_none()
+    {
+        let chunk = session.read_available(Duration::from_millis(50));
+        terminal.respond(&session, &chunk);
+        collected.extend_from_slice(&chunk);
+    }
+    assert!(
+        find(&collected, b"\x1b]2;\xe2\x96\x9e count-1\x07").is_some(),
+        "the tab follows the pane's first output: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    let second = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"\x1b]2;\xe2\x96\x9e count-2\x07",
+        Duration::from_secs(5),
+    );
+    assert!(second.is_some(), "the tab follows the change");
+    session.write_bytes(b"q");
+    session.kill_if_alive(Duration::from_secs(3));
 }

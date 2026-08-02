@@ -253,6 +253,15 @@ impl Registry {
         &self.diagnostics
     }
 
+    /// The dashboard's title source; `None` under `Plain`, whose
+    /// title is a rendering detail of its own compose.
+    pub fn title_source(&self) -> Option<&TitleSource> {
+        match &self.composition {
+            Composition::Panes { title, .. } => Some(title),
+            Composition::Plain { .. } => None,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.sources.len()
     }

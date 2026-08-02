@@ -99,6 +99,11 @@ struct PaneLive {
 /// flags, and the pre-built chrome strings each constructor owns.
 pub(crate) struct SessionArgs {
     pub once: bool,
+    /// The tab title's fallback identity — the declaration file's
+    /// stem. `Some` makes an interactive session own the terminal tab
+    /// title (dashboard-only: watch always passes `None`); the text
+    /// composes with the title role at emit time.
+    pub tab_title: Option<String>,
     /// `--once` gives up after this long: exit 124, stdout EMPTY, the
     /// waiting panes named on stderr. `None` (the default, and the
     /// only value plain watch can carry — its once tick runs inline
@@ -166,6 +171,9 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
     );
     let session = SessionArgs {
         once: args.once,
+        // The tab title is the dashboard's: a watch session is one
+        // command, already named by the shell that launched it.
+        tab_title: None,
         // Plain watch --once runs its tick inline on the loop thread,
         // so a bound is unenforceable here; the flag lives on
         // `rat dashboard` only.
@@ -400,6 +408,29 @@ pub(crate) fn run_registry(
             }
         })
         .collect();
+
+    // The terminal tab is the session's while it runs: stack pushed,
+    // the marker title set, stack popped on every exit path via the
+    // guard's Drop. Interactive dashboards only — a piped or --once
+    // run never emits a byte of it, and watch passes no stem at all.
+    // Declared after the raw-mode guard so the pop still writes while
+    // echo is suppressed.
+    let mut tab_title = match (&session.tab_title, interactive) {
+        (Some(stem), true) => {
+            let role = registry
+                .title_source()
+                .and_then(|source| title_role_text(source, &runtime));
+            Some(
+                crate::term::tab_title::TabTitleGuard::set_over_stack(
+                    std::io::stdout(),
+                    &crate::term::tab_title::tab_title_text(role.as_deref(), stem),
+                )
+                .context("setting the tab title")?,
+            )
+        }
+        _ => None,
+    };
+
     // Every exit from run_registry — return, `?`, panic — kills every
     // in-flight child through these guards' Drop. A NAMED binding:
     // `let _ =` would drop them here and now. One guard per slot, and
@@ -1220,6 +1251,19 @@ pub(crate) fn run_registry(
                     once_timeout_text(&registry, &waiting, bound)
                 ))));
             }
+        }
+        // 3e. A pane-sourced tab title follows the role: recomputed
+        // per pass, re-emitted only when the text changes (the guard
+        // is idempotent per text), so a calm dashboard writes nothing.
+        if let Some(guard) = tab_title.as_mut()
+            && let Some(stem) = session.tab_title.as_deref()
+            && let Some(source) = registry.title_source()
+        {
+            let text = crate::term::tab_title::tab_title_text(
+                title_role_text(source, &runtime).as_deref(),
+                stem,
+            );
+            let _ = guard.set(&text);
         }
         // 4. How long we may sleep: never past the SOONEST deadline,
         // never past one slice, so a signal, a key, and a completing
@@ -2955,8 +2999,6 @@ fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
 /// output — escapes stripped, first non-empty line, trimmed — with
 /// the declared fallback while the pane has not spoken. Silence is
 /// not a title: all-blank output keeps the fallback too.
-// Staged: the tab-title emitter becomes the caller.
-#[allow(dead_code)]
 fn title_role_text(
     title: &crate::core::registry::TitleSource,
     runtime: &[SourceRuntime],

@@ -23,6 +23,15 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         .map_err(|err| anyhow::anyhow!("--once-timeout: {err:#}"))?;
     let session = SessionArgs {
         once: args.once,
+        // The declaration file's stem is the tab's fallback identity;
+        // the declared title (static or pane-sourced) outranks it at
+        // emit time.
+        tab_title: Some(
+            args.file
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "dashboard".to_string()),
+        ),
         once_timeout,
         clear: args.clear,
         no_hide_cursor: args.no_hide_cursor,
