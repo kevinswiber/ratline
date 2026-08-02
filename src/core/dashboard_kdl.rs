@@ -705,10 +705,20 @@ fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error 
             k.example
         );
     }
+    // A taught spelling must be WRITABLE: the author's value is echoed
+    // only when it fits the key's shape — `pane "a" shell height` must
+    // not teach `shell="height"`.
+    let fits = |value: &kdl::KdlValue| match k.set {
+        Set::Flag(_) => value.as_bool().is_some(),
+        Set::Count(_) => value.as_integer().is_some(),
+        Set::Text(_) => value.as_string().is_some(),
+        Set::List(_) => false,
+    };
     let spelling = values
         .iter()
         .position(|value| value.as_string() == Some(k.name))
         .and_then(|i| values.get(i + 1))
+        .filter(|value| fits(value))
         .map(|value| format!("{}={}", k.name, as_written(value)))
         .unwrap_or_else(|| k.property_example());
     anyhow!(
@@ -720,10 +730,13 @@ fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error 
 /// The teaching sentence for a document setting written on a block,
 /// echoing the author's own value when one follows the name.
 fn stray_setting_err(at: &str, name: &str, values: &[&kdl::KdlValue]) -> anyhow::Error {
+    // Same writability rule as the key spelling: a setting takes an
+    // integer, so anything else is never echoed into the example.
     let example = values
         .iter()
         .position(|value| value.as_string() == Some(name))
         .and_then(|i| values.get(i + 1))
+        .filter(|value| value.as_integer().is_some())
         .map(|value| format!("{name} {}", as_written(value)))
         .unwrap_or_else(|| format!("{name} 1"));
     anyhow!(
@@ -939,6 +952,29 @@ mod tests {
         assert_eq!(
             container_err("pane \"a\" command \"git\" \"log\" { height 3 }"),
             "pane #1: `command` holds a list, so it must be a child node — write `command \"git\" \"log\"` inside the block"
+        );
+    }
+
+    #[test]
+    fn an_echoed_value_that_does_not_fit_the_key_falls_back_to_the_example() {
+        // A taught spelling must be WRITABLE. When the value after the
+        // stray key does not fit the key's shape — here a second key
+        // name where a boolean belongs — echoing it would teach
+        // `shell="height"`, an error of its own. The table's example
+        // is the fallback.
+        assert_eq!(
+            container_err("pane \"a\" shell height 3 { command \"true\" }"),
+            "pane #1: `shell` is a key, not a name — write `shell=#true`"
+        );
+        assert_eq!(
+            container_err("defaults height #true\npane \"a\" { command \"true\" height 3 }"),
+            "defaults: `height` is a key, not a name — write `height=7`"
+        );
+        // The same rule for a document setting: `gap` takes an
+        // integer, so a non-integer is never echoed into the example.
+        assert_eq!(
+            container_err("row gap #true { pane \"a\" height 3 { command \"true\" } }"),
+            "row #1: `gap` is the whole dashboard's, declared once at the top level as `gap 1`"
         );
     }
 
