@@ -12,8 +12,15 @@ use crate::theme::Palette;
 
 pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppResult {
     let registry = load(&args.file)?;
+    let once_timeout = args
+        .once_timeout
+        .as_deref()
+        .map(crate::core::duration::parse_interval)
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("--once-timeout: {err:#}"))?;
     let session = SessionArgs {
         once: args.once,
+        once_timeout,
         clear: args.clear,
         no_hide_cursor: args.no_hide_cursor,
         no_sync: args.no_sync,

@@ -484,6 +484,9 @@ pub struct DashboardArgs {
     /// Run every pane once and exit
     #[arg(long)]
     pub once: bool,
+    /// Give up when --once is still waiting after this long (exit 124)
+    #[arg(long, value_name = "DURATION", requires = "once")]
+    pub once_timeout: Option<String>,
     /// Clear the screen before the first frame (atomically, inside it)
     #[arg(long)]
     pub clear: bool,
