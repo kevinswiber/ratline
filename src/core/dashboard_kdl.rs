@@ -645,6 +645,31 @@ fn many_text(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<Vec<Strin
         .collect()
 }
 
+/// A bare positional that names a pane key — found only when a STRING
+/// names one. A bare `#true` or `3` names nothing and keeps the
+/// positional error it has today; a recognised name at ANY position
+/// counts, because `defaults #true shell` still holds the key the
+/// author was reaching for.
+// Staged: the `defaults`, pane-name and container arms become callers.
+#[allow(dead_code)]
+fn stray_key(values: &[&kdl::KdlValue]) -> Option<&'static Key> {
+    values
+        .iter()
+        .find_map(|value| value.as_string().and_then(key))
+}
+
+/// The same scan for the document settings, which are not pane keys —
+/// `gap` and `row-gap` are the whole dashboard's.
+// Staged: the `defaults` and container arms become callers.
+#[allow(dead_code)]
+fn stray_setting(values: &[&kdl::KdlValue]) -> Option<&'static str> {
+    values.iter().find_map(|value| {
+        ["gap", "row-gap"]
+            .into_iter()
+            .find(|name| value.as_string() == Some(name))
+    })
+}
+
 /// The container's own name — `a row` / `a column` — for the errors that
 /// say what it holds.
 fn container_kind(node: &kdl::KdlNode) -> &'static str {
@@ -779,6 +804,26 @@ mod tests {
         assert_eq!(line_column("ab\r\ncd", 4), (2, 1));
         // Past the end: clamp to one past the last content.
         assert_eq!(line_column("ab\n", 99), (2, 1));
+    }
+
+    #[test]
+    fn a_bare_key_is_found_only_when_it_names_one() {
+        use kdl::KdlValue;
+        let shell = KdlValue::String("shell".into());
+        let nothing = KdlValue::String("frobnicate".into());
+        let not_a_string = KdlValue::Bool(true);
+        let gap = KdlValue::String("gap".into());
+        assert_eq!(stray_key(&[&shell]).map(|k| k.name), Some("shell"));
+        assert!(stray_key(&[&nothing]).is_none());
+        assert!(stray_key(&[&not_a_string]).is_none());
+        // The SECOND positional counts too: `defaults #true shell`
+        // still holds a recognisable key.
+        assert_eq!(
+            stray_key(&[&not_a_string, &shell]).map(|k| k.name),
+            Some("shell")
+        );
+        assert_eq!(stray_setting(&[&gap]), Some("gap"));
+        assert!(stray_setting(&[&shell]).is_none());
     }
 
     #[test]
