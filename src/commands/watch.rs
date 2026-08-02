@@ -56,6 +56,11 @@ use crate::ui::key::{Key, from_crossterm};
 /// channel, and the schedule — one wait slice.
 const SLICE: Duration = Duration::from_millis(50);
 
+/// How long a `--once` dashboard may sit with no output and no exit
+/// before it says on stderr which pane it is waiting on. A false
+/// positive costs one stderr line and nothing else.
+const ONCE_QUIET: Duration = Duration::from_secs(5);
+
 /// The resize arm's settle window: reflow is immediate, but the
 /// respawn-all waits for the drag to go quiet. ANCHORED like every
 /// ratto debounce, so a sustained drag respawns once per window rather
@@ -427,6 +432,10 @@ pub(crate) fn run_registry(
     let mut size = measure_size(is_tty, (80, 24));
     let mut geom = registry.geometry(size);
     let mut resize_gate = DebounceGate::new(RESIZE_DEBOUNCE);
+    // The once-notice clock starts when the loop does — the panes'
+    // first spawns are due immediately, so loop age IS wait age.
+    let once_started = Instant::now();
+    let mut once_notice_sent = false;
     let mut previous_key: Option<PaintKey> = None;
     let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
@@ -1168,6 +1177,20 @@ pub(crate) fn run_registry(
                 // theme arm's argument. A respawn, not a plain request.
                 request_respawn_all(&mut runtime);
             }
+        }
+        // 3d. A quiet `--once` says what it is waiting on: one batched
+        // stderr line, once, and nothing else moves — no exit change,
+        // no stdout byte, no timing (the nap below is computed the
+        // same either way). Gated on panes: plain `rat watch --once`
+        // runs its tick inline and never reaches this loop, and the
+        // `rat dashboard: ` prefix would lie there anyway.
+        if session.once && !plain && !once_notice_sent && once_started.elapsed() >= ONCE_QUIET {
+            let waiting: Vec<SourceId> =
+                registry.ids().filter(|id| !runtime[id.0].posted).collect();
+            if !waiting.is_empty() {
+                eprintln!("{}", once_waiting_text(&registry, &waiting, ONCE_QUIET));
+            }
+            once_notice_sent = true;
         }
         // 4. How long we may sleep: never past the SOONEST deadline,
         // never past one slice, so a signal, a key, and a completing
@@ -2924,8 +2947,6 @@ fn brief_duration(d: Duration) -> String {
 /// a pane that already declared it is never told to; when every waiting
 /// pane is live, the wait is simply a child that has not spoken yet.
 /// Pure and portable: no clock reads, no cfg, no mutation.
-// Staged: step 3d becomes the caller.
-#[allow(dead_code)]
 fn once_waiting_text(registry: &Registry, waiting: &[SourceId], after: Duration) -> String {
     let all_live = waiting.iter().all(|id| registry.spec(*id).live);
     let state = if all_live {
