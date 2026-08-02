@@ -2949,6 +2949,35 @@ fn rising_edge(latch: &mut Vec<SourceId>, verdict: &Verdict) -> bool {
     grew
 }
 
+/// What the dashboard's title READS AS — the plain text a consumer
+/// (the terminal tab title) gets, never a rendered line. Static text
+/// is itself; a pane-sourced title is the referenced pane's latest
+/// output — escapes stripped, first non-empty line, trimmed — with
+/// the declared fallback while the pane has not spoken. Silence is
+/// not a title: all-blank output keeps the fallback too.
+// Staged: the tab-title emitter becomes the caller.
+#[allow(dead_code)]
+fn title_role_text(
+    title: &crate::core::registry::TitleSource,
+    runtime: &[SourceRuntime],
+) -> Option<String> {
+    use crate::core::registry::TitleSource;
+    match title {
+        TitleSource::None => None,
+        TitleSource::Static(text) => Some(text.clone()),
+        TitleSource::Pane { source, fallback } => runtime[source.0]
+            .output
+            .as_deref()
+            .and_then(|lines| {
+                lines
+                    .iter()
+                    .map(|line| crate::core::measure::strip_escapes(line).trim().to_string())
+                    .find(|line| !line.is_empty())
+            })
+            .or_else(|| fallback.clone()),
+    }
+}
+
 /// `pane "logs"` / `panes "logs", "metrics"` — the names a diagnostic
 /// points with, quoted the way the author wrote them.
 fn pane_list(registry: &Registry, waiting: &[SourceId]) -> String {
@@ -4418,6 +4447,47 @@ mod tests {
         assert_eq!(
             referred_block.lines, bare_block.lines,
             "role donation adds no row and no bytes"
+        );
+    }
+
+    #[test]
+    fn the_title_role_reads_static_pane_or_fallback_in_that_order() {
+        use crate::core::registry::TitleSource;
+        let mut runtime = vec![SourceRuntime::for_test()];
+        assert_eq!(
+            title_role_text(&TitleSource::None, &runtime),
+            None,
+            "no declaration, no role text"
+        );
+        assert_eq!(
+            title_role_text(&TitleSource::Static("Deploy".to_string()), &runtime).as_deref(),
+            Some("Deploy")
+        );
+        let pane = TitleSource::Pane {
+            source: SourceId(0),
+            fallback: Some("Fallback".to_string()),
+        };
+        assert_eq!(
+            title_role_text(&pane, &runtime).as_deref(),
+            Some("Fallback"),
+            "the fallback speaks while the pane has not"
+        );
+        // The pane's first NON-EMPTY line, escapes stripped, trimmed —
+        // plain text is the role's contract (a tab title takes no SGR).
+        runtime[0].output = Some(vec![
+            String::new(),
+            "  \u{1b}[1mBig \u{1b}[31mnews\u{1b}[0m  ".to_string(),
+            "second".to_string(),
+        ]);
+        assert_eq!(
+            title_role_text(&pane, &runtime).as_deref(),
+            Some("Big news")
+        );
+        // All-blank output keeps the fallback: silence is not a title.
+        runtime[0].output = Some(vec!["   ".to_string(), String::new()]);
+        assert_eq!(
+            title_role_text(&pane, &runtime).as_deref(),
+            Some("Fallback")
         );
     }
 
