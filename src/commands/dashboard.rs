@@ -66,7 +66,7 @@ fn pane_help(registry: &Registry) -> Vec<String> {
         let spec = registry.spec(id);
         lines.push(format!(
             "    {}  {}",
-            spec.name,
+            spec.id,
             crate::commands::watch::cadence_label(spec)
         ));
         for trigger in &spec.triggers {
@@ -179,8 +179,8 @@ mod tests {
     use crate::core::trigger::TriggerSpec;
 
     fn registry(triggers: bool) -> Registry {
-        let spec = |name: &str, path: &str| SourceSpec {
-            name: name.to_string(),
+        let spec = |id: &str, path: &str| SourceSpec {
+            id: id.to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: (!triggers).then(|| Duration::from_secs(5)),
@@ -219,7 +219,7 @@ mod tests {
     /// would have enforced.
     fn live_registry() -> Registry {
         let batch = SourceSpec {
-            name: "a".to_string(),
+            id: "a".to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: Some(Duration::from_secs(5)),
@@ -228,7 +228,7 @@ mod tests {
             live: false,
         };
         let follow = SourceSpec {
-            name: "follow".to_string(),
+            id: "follow".to_string(),
             command: vec!["true".to_string()],
             shell: false,
             interval: Some(Duration::from_secs(2)),
