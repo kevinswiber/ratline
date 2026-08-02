@@ -2,6 +2,20 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.10.0](https://github.com/kevinswiber/ratto/compare/744c209062259b108dd40ce5971513dee68e7beb..v0.10.0) - 2026-08-02
+#### Features
+- the terminal tab carries the dashboard's title - ([6d53659](https://github.com/kevinswiber/ratto/commit/6d5365938c401d99302d1761d3df3bcdfe2aadcc)) - [@kevinswiber](https://github.com/kevinswiber)
+- the title role reads as plain text - ([f65955f](https://github.com/kevinswiber/ratto/commit/f65955f323a548f18044c3a84979199630a6c130)) - [@kevinswiber](https://github.com/kevinswiber)
+- a title may come from a pane, by fragment reference - ([7404c7a](https://github.com/kevinswiber/ratto/commit/7404c7ae3609d7c7a89493aa958da4fe728ea7e4)) - [@kevinswiber](https://github.com/kevinswiber)
+- the ? reference grows a diagnostics section - ([f4c93b9](https://github.com/kevinswiber/ratto/commit/f4c93b988c9683b3e5e2cd651b7b01b6d16b1733)) - [@kevinswiber](https://github.com/kevinswiber)
+- duplicate ids are first-win diagnostics, never load failures - ([7907adf](https://github.com/kevinswiber/ratto/commit/7907adf76e46b77d0a9a634f96a84e9053135973)) - [@kevinswiber](https://github.com/kevinswiber)
+- a pane's identity is an id, and an id is a URI fragment - ([744c209](https://github.com/kevinswiber/ratto/commit/744c209062259b108dd40ce5971513dee68e7beb)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the last invariant guard speaks id, not name - ([3324fde](https://github.com/kevinswiber/ratto/commit/3324fde02ca9de3ab66e3e9192e3fca9ed5c9232)) - [@kevinswiber](https://github.com/kevinswiber)
+- ids, fragment refs, the pane-sourced title, and the tab - ([3bb6b3b](https://github.com/kevinswiber/ratto/commit/3bb6b3bf486ed5d1b60c5373559eb16a0f74df28)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.9.0](https://github.com/kevinswiber/ratto/compare/5213b013acd128b5ce39ab5a9c410be2d76b73eb..v0.9.0) - 2026-08-02
 #### Features
 - a dashboard-level title, one bold line above the panes - ([56dc5f5](https://github.com/kevinswiber/ratto/commit/56dc5f5cacb07e88d65e10c94aa463c3a8330c8a)) - [@kevinswiber](https://github.com/kevinswiber)
