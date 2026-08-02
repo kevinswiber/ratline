@@ -2015,3 +2015,80 @@ row {{
         "dashboard should have exited on q"
     );
 }
+
+#[test]
+fn the_gutter_reflows_the_panes_instead_of_cutting_them() {
+    // The gutter is a region of the frame, not an overlay: turning it
+    // on must reserve its two columns from the allocation budget, so
+    // the rightmost pane keeps its border. And the reflow must never
+    // read as a resize — a view toggle that respawned every child
+    // (including live ones) 250ms later would be a real cost, so the
+    // counter file is the negative pin: no extra tick after the
+    // debounce window has passed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+row-gap 0
+
+defaults {{
+    height 3
+    border "rounded"
+    chrome #false
+    shell #true
+}}
+
+row {{
+    pane "a" {{
+        interval "10s"
+        command "{counter}"
+    }}
+    pane "b" {{
+        interval "10s"
+        command "printf 'zzz'"
+    }}
+}}
+"#,
+            counter = labeled_counter_cmd(&count, "a"),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let first = wait_for_bytes(&session, &mut terminal, b"zzz", Duration::from_secs(5))
+        .expect("the first composition never painted");
+    let top = row_containing(&first, "╭".as_bytes()).expect("the first top-border row");
+    let corners = |row: &[u8]| String::from_utf8_lossy(row).matches('╮').count();
+    assert_eq!(corners(top), 2, "both panes start with their corners");
+
+    session.write_bytes(b"D");
+    // The gutter margin lands before the border's SGR escape, so the
+    // contiguous needle is the row separator plus the two-space margin.
+    let seen = wait_for_bytes(&session, &mut terminal, b"\r\n  ", Duration::from_secs(3))
+        .expect("the gutter repaint never arrived");
+    let top = row_containing(&seen, "╭".as_bytes()).expect("the reflowed top-border row");
+    assert_eq!(
+        corners(top),
+        2,
+        "the rightmost pane's corner must survive the gutter: {:?}",
+        String::from_utf8_lossy(top)
+    );
+
+    // Past the resize debounce: a geometry drift would have respawned
+    // every child and the counter would read 2.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    let runs = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert_eq!(runs, 1, "a view toggle must never restart children");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}

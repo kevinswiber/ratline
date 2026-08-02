@@ -294,6 +294,16 @@ impl Registry {
     /// Per-pane geometry for one terminal size, resolved BEFORE the
     /// spawn step so a child can be told its pane's inner size.
     pub fn geometry(&self, size: (u16, u16)) -> Vec<PaneGeometry> {
+        self.geometry_reserving(size, 0)
+    }
+
+    /// [`Registry::geometry`] with `reserved` columns held back from
+    /// the width budget — the change gutter is a REGION of the frame,
+    /// not an overlay, so its columns come out of the allocation, not
+    /// off the rightmost pane's border at paint time. Every
+    /// geometry-deriving site must apply the same reservation, or a
+    /// view toggle reads as a resize and respawns every child.
+    pub fn geometry_reserving(&self, size: (u16, u16), reserved: u16) -> Vec<PaneGeometry> {
         let mut out = vec![
             PaneGeometry {
                 cells: 0,
@@ -305,7 +315,9 @@ impl Registry {
         ];
         match &self.composition {
             // Watch's shipped contract: the child is told the terminal
-            // size verbatim (RAT_WIDTH/RAT_HEIGHT must not move). Do
+            // size verbatim (RAT_WIDTH/RAT_HEIGHT must not move) and
+            // the gutter stays a paint-time chop there — no border to
+            // lose, no resize arm to make an env change coherent. Do
             // not "simplify" this arm into the pane path.
             Composition::Plain { .. } => {
                 out.fill(PaneGeometry {
@@ -316,7 +328,7 @@ impl Registry {
                 });
             }
             Composition::Panes { layout, gap, .. } => {
-                self.allocate(layout, size.0, *gap, &mut out);
+                self.allocate(layout, size.0.saturating_sub(reserved), *gap, &mut out);
             }
         }
         out
@@ -595,6 +607,37 @@ mod tests {
                 inner_cols: 100,
                 inner_rows: 30,
             }]
+        );
+        // A reservation never reaches the plain contract either.
+        assert_eq!(
+            registry.geometry_reserving((100, 30), 2),
+            registry.geometry((100, 30)),
+            "plain ignores the gutter reservation"
+        );
+    }
+
+    #[test]
+    fn a_reservation_comes_out_of_the_panes_width_budget() {
+        // Reserving N columns equals allocating for a terminal N
+        // narrower — the gutter is a region, not an overlay.
+        let registry = Registry::panes(
+            vec![spec("a"), spec("b")],
+            vec![pane(7, PaneWidth::Weight(1)), pane(7, PaneWidth::Weight(1))],
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            1,
+            1,
+        )
+        .expect("a valid two-pane registry");
+        assert_eq!(
+            registry.geometry_reserving((80, 24), 2),
+            registry.geometry((78, 24)),
+        );
+        assert_eq!(
+            registry.geometry_reserving((80, 24), 0),
+            registry.geometry((80, 24))
         );
     }
 

@@ -516,6 +516,7 @@ pub(crate) fn run_registry(
             refresh_geometry_for_spawn(
                 session.resize_respawn,
                 measure_size(is_tty, size),
+                gutter_reserve(view.gutter),
                 &mut size,
                 &mut geom,
                 &registry,
@@ -854,6 +855,7 @@ pub(crate) fn run_registry(
             refresh_geometry_for_spawn(
                 session.resize_respawn,
                 measure_size(is_tty, size),
+                gutter_reserve(view.gutter),
                 &mut size,
                 &mut geom,
                 &registry,
@@ -1153,7 +1155,13 @@ pub(crate) fn run_registry(
         // before the non-interactive branch, like the triggers.
         if session.resize_respawn {
             let measured = measure_size(is_tty, size);
-            let step = detect_resize(measured, &mut size, &mut geom, &registry);
+            let step = detect_resize(
+                measured,
+                gutter_reserve(view.gutter),
+                &mut size,
+                &mut geom,
+                &registry,
+            );
             if step.geom_moved {
                 resize_gate.fire(Instant::now());
             }
@@ -1676,6 +1684,35 @@ pub(crate) fn run_registry(
                                     view.hshift = view.hshift.saturating_sub(HSHIFT_STEP);
                                 }
                                 _ => view.hshift += HSHIFT_STEP,
+                            }
+                            if action == WatchAction::ToggleGutter {
+                                // The gutter's columns come out of the
+                                // allocation budget: recompute geom
+                                // under the new reservation and reflow
+                                // NOW from retained outputs (the
+                                // ToggleTime pathway). geom only —
+                                // `size` stays the resize arm's, so a
+                                // coinciding real resize keeps its
+                                // respawn; detect_resize applies the
+                                // same reservation, so the next
+                                // iteration compares equal and the
+                                // gate stays unarmed. Stale until the
+                                // next tick by design: interval and
+                                // trigger panes re-read geom at their
+                                // next spawn, and a live pane keeps
+                                // its two-column ellipsis rather than
+                                // being killed by a view toggle.
+                                geom =
+                                    registry.geometry_reserving(size, gutter_reserve(view.gutter));
+                                recompose_live(
+                                    &mut live,
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    view.alt_time,
+                                    &palette,
+                                    profile,
+                                );
                             }
                             if action == WatchAction::ToggleTime {
                                 // One style across the whole surface:
@@ -2443,6 +2480,12 @@ fn repaint(
     Ok(key)
 }
 
+/// Columns the change gutter takes from the width budget while it is
+/// on; zero otherwise. One spelling, used by every geometry site.
+fn gutter_reserve(gutter: bool) -> u16 {
+    if gutter { GUTTER_COLS as u16 } else { 0 }
+}
+
 /// The painted body: `max_height`, else terminal rows − 2 (one row for the
 /// notice line, one for the cursor row below the frame).
 fn window_rows(max_height: Option<u16>, rows: u16) -> u16 {
@@ -2938,6 +2981,7 @@ fn measure_size(is_tty: bool, fallback: (u16, u16)) -> (u16, u16) {
 fn refresh_geometry_for_spawn(
     resize_respawn: bool,
     measured: (u16, u16),
+    reserved: u16,
     size: &mut (u16, u16),
     geom: &mut Vec<PaneGeometry>,
     registry: &Registry,
@@ -2946,7 +2990,7 @@ fn refresh_geometry_for_spawn(
         return;
     }
     *size = measured;
-    *geom = registry.geometry(measured);
+    *geom = registry.geometry_reserving(measured, reserved);
 }
 
 /// What one resize detection observed.
@@ -2962,13 +3006,18 @@ struct ResizeStep {
 /// grew rows changes the window, not any child's world.
 fn detect_resize(
     measured: (u16, u16),
+    reserved: u16,
     size: &mut (u16, u16),
     geom: &mut Vec<PaneGeometry>,
     registry: &Registry,
 ) -> ResizeStep {
     let size_moved = measured != *size;
     *size = measured;
-    let next = registry.geometry(measured);
+    // The same reservation every other geometry site applies: a view
+    // toggle that narrowed the stored geom must compare EQUAL here,
+    // or the very next iteration arms the debounce gate and every
+    // child — live ones included — restarts 250ms after a keypress.
+    let next = registry.geometry_reserving(measured, reserved);
     let geom_moved = next != *geom;
     if geom_moved {
         *geom = next;
@@ -5323,10 +5372,10 @@ mod tests {
         let mut size = (80, 24);
         let mut geom = registry.geometry(size);
         let before = geom.clone();
-        refresh_geometry_for_spawn(true, (120, 24), &mut size, &mut geom, &registry);
+        refresh_geometry_for_spawn(true, (120, 24), 0, &mut size, &mut geom, &registry);
         assert_eq!(size, (80, 24), "the spawn step wrote nothing under panes");
         assert_eq!(geom, before);
-        let step = detect_resize((120, 24), &mut size, &mut geom, &registry);
+        let step = detect_resize((120, 24), 0, &mut size, &mut geom, &registry);
         assert!(step.size_moved, "detection survived the coincident spawn");
         assert!(
             step.geom_moved,
@@ -5342,9 +5391,42 @@ mod tests {
         let registry = two_weighted_panes();
         let mut size = (80, 24);
         let mut geom = registry.geometry(size);
-        refresh_geometry_for_spawn(false, (120, 24), &mut size, &mut geom, &registry);
+        refresh_geometry_for_spawn(false, (120, 24), 0, &mut size, &mut geom, &registry);
         assert_eq!(size, (120, 24), "plain re-measures when something spawns");
         assert_eq!(geom, registry.geometry((120, 24)));
+    }
+
+    #[test]
+    fn a_gutter_toggle_never_reads_as_a_resize() {
+        // The respawn trap, as an assertion: the toggle narrows the
+        // stored geom under the reservation, and detect_resize applies
+        // the SAME reservation — so at an unchanged terminal size the
+        // comparison is equal, the debounce gate stays unarmed, and no
+        // child restarts 250ms after a keypress.
+        let registry = two_weighted_panes();
+        let mut size = (80, 24);
+        let mut geom = registry.geometry_reserving(size, gutter_reserve(true));
+        assert_ne!(
+            geom,
+            registry.geometry(size),
+            "the reservation must actually narrow a panes layout"
+        );
+        let step = detect_resize(
+            (80, 24),
+            gutter_reserve(true),
+            &mut size,
+            &mut geom,
+            &registry,
+        );
+        assert!(!step.size_moved, "the terminal did not move");
+        assert!(
+            !step.geom_moved,
+            "a view toggle must never arm the respawn gate"
+        );
+        // Toggling back off under the zero reservation is symmetric.
+        geom = registry.geometry_reserving(size, gutter_reserve(false));
+        let step = detect_resize((80, 24), 0, &mut size, &mut geom, &registry);
+        assert!(!step.geom_moved);
     }
 
     /// A timestamp `secs` in the past, without timestamp arithmetic.
