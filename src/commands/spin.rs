@@ -110,7 +110,7 @@ pub fn run(args: SpinArgs, profile: ColorProfile, _palette: Palette) -> AppResul
     let (stderr_lines, stderr_dropped) = stderr_thread.join().unwrap_or_default();
 
     if timed_out {
-        return Err(AppError::Timeout);
+        return Err(AppError::Timeout(None));
     }
     let code = status.code().unwrap_or(1); // signal death becomes 1, like gum
     let failed = code != 0;

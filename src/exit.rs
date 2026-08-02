@@ -13,8 +13,9 @@ pub enum AppError {
     NoSelection,
     /// Silent, exit 130 (Ctrl-C).
     Aborted,
-    /// "timed out" printed to stderr, exit 124.
-    Timeout,
+    /// Exit 124. `None` prints the shipped "timed out"; `Some` names
+    /// what was waited on instead — the code never changes with it.
+    Timeout(Option<anyhow::Error>),
     /// Silent, exit with the child's code (`rat spin`).
     Child(i32),
 }
@@ -24,7 +25,7 @@ impl AppError {
         match self {
             AppError::Fail(_) | AppError::NoSelection => FAILURE,
             AppError::Aborted => ABORTED,
-            AppError::Timeout => TIMEOUT,
+            AppError::Timeout(_) => TIMEOUT,
             AppError::Child(code) => *code,
         }
     }
@@ -47,7 +48,10 @@ mod tests {
         assert_eq!(AppError::Fail(anyhow::anyhow!("boom")).code(), 1);
         assert_eq!(AppError::NoSelection.code(), 1);
         assert_eq!(AppError::Aborted.code(), 130);
-        assert_eq!(AppError::Timeout.code(), 124);
+        // With or without a detail, a timeout is 124 — the payload
+        // changes what stderr says, never the exit code.
+        assert_eq!(AppError::Timeout(None).code(), 124);
+        assert_eq!(AppError::Timeout(Some(anyhow::anyhow!("x"))).code(), 124);
         assert_eq!(AppError::Child(7).code(), 7);
     }
 
