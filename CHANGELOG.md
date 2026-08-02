@@ -2,6 +2,24 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.11.0](https://github.com/kevinswiber/ratto/compare/7ba9007d68f818278c54a73bf1867a134a6733df..v0.11.0) - 2026-08-02
+#### Features
+- the caret is the terminal's own cursor - ([738fef3](https://github.com/kevinswiber/ratto/commit/738fef3897ff2c5d1f86f15ea07afb0bb5ea4a64)) - [@kevinswiber](https://github.com/kevinswiber)
+- the hardware cursor rests on the caret - ([6eef28f](https://github.com/kevinswiber/ratto/commit/6eef28f3e5507df1c9f7c0c2d41c1c3b66e38e8d)) - [@kevinswiber](https://github.com/kevinswiber)
+- rat style learns --reverse - ([54bfb42](https://github.com/kevinswiber/ratto/commit/54bfb42f6a1f3c3d3a48e6cfd449b1009da2c8c9)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- the confirm buttons are spaced in cells, not bytes - ([192b879](https://github.com/kevinswiber/ratto/commit/192b8792c387b5645aa133749c5cb86107370791)) - [@kevinswiber](https://github.com/kevinswiber)
+- filter highlights land on the cell they mean - ([1fe5729](https://github.com/kevinswiber/ratto/commit/1fe57297a64511aecca1281eb89656c42bad6ccc)) - [@kevinswiber](https://github.com/kevinswiber)
+- a wide glyph no longer shifts the line it sits in - ([446bb5f](https://github.com/kevinswiber/ratto/commit/446bb5f6e2d3d5903e21f723f6ff0b5e4f03c5fb)) - [@kevinswiber](https://github.com/kevinswiber)
+- the input field scrolls instead of pinning the caret - ([4065a65](https://github.com/kevinswiber/ratto/commit/4065a65862bbffd97d718654e8c7a58281c78a75)) - [@kevinswiber](https://github.com/kevinswiber)
+- caret columns count terminal cells, not chars - ([3098c8b](https://github.com/kevinswiber/ratto/commit/3098c8b6ea2591a16d87eb553a651fc984fbb070)) - [@kevinswiber](https://github.com/kevinswiber)
+- a resize drops the park instead of trusting it - ([85cdbaf](https://github.com/kevinswiber/ratto/commit/85cdbaf2345cc4e7685b48e9c22032c87be20071)) - [@kevinswiber](https://github.com/kevinswiber)
+- the input caret reaches the terminal - ([7ba9007](https://github.com/kevinswiber/ratto/commit/7ba9007d68f818278c54a73bf1867a134a6733df)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the caret comments catch up with the bare cursor - ([fc49b9f](https://github.com/kevinswiber/ratto/commit/fc49b9f7d8ce2716f46d9dd3cb8dc5ad86bf3d7a)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.10.0](https://github.com/kevinswiber/ratto/compare/744c209062259b108dd40ce5971513dee68e7beb..v0.10.0) - 2026-08-02
 #### Features
 - the terminal tab carries the dashboard's title - ([6d53659](https://github.com/kevinswiber/ratto/commit/6d5365938c401d99302d1761d3df3bcdfe2aadcc)) - [@kevinswiber](https://github.com/kevinswiber)
