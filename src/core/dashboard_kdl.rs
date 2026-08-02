@@ -17,7 +17,7 @@
 //! arbitrary to someone who has only ever met it as an error message
 //! (zellij shipped this exact seam undocumented — their #3629).
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail};
 
 use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
 
@@ -283,8 +283,6 @@ fn record(seen: &mut Vec<&'static str>, k: &'static Key, at: &str) -> anyhow::Re
 /// column (CRLF turns the line at its `\n`), a mid-char offset lands
 /// after that char, and an offset past the end clamps to wherever the
 /// walk stops — nothing here can panic or index out of bounds.
-// Staged: `parse`'s syntax-error adapter becomes the caller.
-#[allow(dead_code)]
 fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let mut line = 1;
     let mut column = 1;
@@ -311,8 +309,6 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
 /// NO source echo, caret, or snippet: echoing the offending line needs
 /// a truncation policy, and an unbudgeted echo is exactly the class of
 /// defect where a fixed width eats the part that matters.
-// Staged: `parse`'s syntax-error adapter becomes the caller.
-#[allow(dead_code)]
 fn syntax_error_text(
     line: usize,
     column: usize,
@@ -334,6 +330,29 @@ fn syntax_error_text(
     text
 }
 
+/// The placed error for a document that failed to parse: the earliest
+/// diagnostic by span offset names the line and column, the rest are
+/// only counted — the first failure is the one the author can act on,
+/// and recovery errors downstream of it are usually its echoes. An
+/// error with no diagnostics keeps the crate's own sentence verbatim;
+/// fabricating a position would point at nothing.
+fn syntax_error(text: &str, err: &kdl::KdlError) -> anyhow::Error {
+    let Some(first) = err.diagnostics.iter().min_by_key(|d| d.span.offset()) else {
+        return anyhow!("{err}");
+    };
+    let (line, column) = line_column(text, first.span.offset());
+    anyhow!(
+        "{}",
+        syntax_error_text(
+            line,
+            column,
+            first.message.as_deref(),
+            first.help.as_deref(),
+            err.diagnostics.len() - 1,
+        )
+    )
+}
+
 /// The document: settings, then the tree. A pane is declared inside the
 /// `row`/`column` that places it.
 ///
@@ -343,7 +362,7 @@ fn syntax_error_text(
 /// `DashboardFile` never learns where the panes were written, so
 /// `into_registry` stays the one validation path.
 pub fn parse(text: &str) -> anyhow::Result<DashboardFile> {
-    let doc: kdl::KdlDocument = text.parse().context("reading the dashboard KDL")?;
+    let doc: kdl::KdlDocument = text.parse().map_err(|err| syntax_error(text, &err))?;
     let mut file = DashboardFile::default();
     // The tree is walked AFTER the whole first pass, so a `defaults`
     // node anywhere in the document still supplies the `shell` the
@@ -760,6 +779,40 @@ mod tests {
         assert_eq!(line_column("ab\r\ncd", 4), (2, 1));
         // Past the end: clamp to one past the last content.
         assert_eq!(line_column("ab\n", 99), (2, 1));
+    }
+
+    #[test]
+    fn a_kdl_syntax_error_carries_its_line_and_column() {
+        // The reported repro: a bare token in property position is
+        // not a KDL value, and the answer must say where.
+        let err = parse("pane \"log\" interval=5s {\n    command \"date\"\n}\n")
+            .expect_err("5s is not a valid KDL value");
+        let text = format!("{err:#}");
+        assert!(text.starts_with("line 1, column "), "got {text}");
+        assert!(!text.contains("Failed to parse KDL document"), "got {text}");
+    }
+
+    #[test]
+    fn an_error_with_no_diagnostics_keeps_the_crates_own_sentence() {
+        // The fallback is the crate's Display, compared at runtime —
+        // upstream's bytes are not ours to freeze.
+        let err = kdl::KdlError {
+            input: std::sync::Arc::new(String::new()),
+            diagnostics: Vec::new(),
+        };
+        assert_eq!(format!("{}", syntax_error("", &err)), format!("{err}"));
+    }
+
+    #[test]
+    fn the_earliest_diagnostic_is_the_one_placed() {
+        // Two bad values on two lines: the first failure is the one
+        // the author can act on, the rest are counted, not shown.
+        // Shape-only assertions; the message text is upstream's.
+        let err = parse("a 1.\nb 2.\n").expect_err("both floats are invalid");
+        let text = format!("{err:#}");
+        assert!(text.starts_with("line 1, column "), "got {text}");
+        assert!(text.ends_with("more)"), "got {text}");
+        assert!(!text.contains("line 2"), "got {text}");
     }
 
     #[test]
