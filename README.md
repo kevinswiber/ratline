@@ -274,7 +274,11 @@ as in `rat watch` — freeze, scrub, snapshot, pager, scroll, and the
 view toggles all work on the composed frame, and `?` pages the key
 reference with each pane's cadence listed. `--once` runs every pane
 once in parallel, prints one frame, and exits; piped output degrades to
-plain text with each pane's stderr folded into its own box.
+plain text with each pane's stderr folded into its own box. If a pane
+follows instead of exiting, `--once` says so on stderr after five quiet
+seconds — naming the pane and the `live=#true` declaration to write —
+and `--once-timeout 30s` bounds the wait: on expiry the run exits 124
+with an empty stdout rather than printing a partial frame.
 
 **Panes are for watching, not for doing.** A pane's command runs again
 and again, and its declared interval is a floor rather than the whole
@@ -673,8 +677,9 @@ rat spin --title 'Building...' -- cargo build    # child exit code passes throug
 ```
 
 Exit codes everywhere: `0` success, `1` no selection / negative / error,
-`2` usage error, `124` timeout (`--timeout 30s`), `130` ctrl-c, and
-`rat spin` forwards the child's code.
+`2` usage error, `124` timeout (`--timeout 30s`, dashboard
+`--once-timeout 30s`), `130` ctrl-c, and `rat spin` forwards the
+child's code.
 
 `rat spin` holds its child's output so it can replay it after the
 spinner stops, and that is bounded too: **the newest 10,000 lines of
@@ -772,5 +777,5 @@ notes:
 | Esc / nothing selected / `confirm` no / error | 1 |
 | Usage error | 2 |
 | `spin` child exited N | N |
-| `--timeout` expired | 124 |
+| `--timeout` / `--once-timeout` expired | 124 |
 | Ctrl-C | 130 |
