@@ -668,6 +668,42 @@ pane "slow" {{
 }
 
 #[test]
+fn a_dashboard_title_heads_the_once_frame() {
+    // The declared title is the frame's first line, piped and --once
+    // alike — the same contract watch --title has always had.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "titled.kdl",
+        &format!(
+            r#"
+title "Deploy status"
+
+pane "build" {{
+    height 3
+    chrome #false
+    border "none"
+    command "{bin}" "style" "one"
+}}
+"#,
+            bin = rat_bin().replace('\\', "\\\\")
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let first = stdout.lines().next().expect("a frame");
+    assert!(
+        first.contains("Deploy status"),
+        "the title heads the frame: {stdout:?}"
+    );
+    assert!(stdout.contains("one"), "the pane still renders: {stdout:?}");
+}
+
+#[test]
 fn a_pane_that_cannot_start_shows_the_reason_before_the_path() {
     // A declared width no terminal can widen truncates from the
     // right, so whatever sits last is what no reader sees. The

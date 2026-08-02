@@ -243,8 +243,13 @@ row {
 ```
 
 `gap` is the columns between panes in a row, `row-gap` the blank rows
-between rows; both belong to the whole dashboard and are written once
-at the top level.
+between rows, and `title` is the dashboard's own name — one bold line
+above the composed panes, the same treatment `rat watch --title`
+gives a plain frame. All three belong to the whole dashboard and are
+written once at the top level. (`title` also exists as a pane key,
+where it labels that one box's border — the file position keeps the
+two meanings apart.) A declared title costs one row of the frame's
+height budget, exactly like a pane row.
 
 A pane may even run `rat dashboard … --once` as its child: the inner
 one-shot sizes itself to the pane through the handed-down `RAT_WIDTH`/

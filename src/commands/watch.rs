@@ -3304,6 +3304,7 @@ fn compose_sources(
         layout,
         gap,
         row_gap,
+        title,
     } = registry.composition()
     else {
         return PaneBlock::default();
@@ -3348,7 +3349,34 @@ fn compose_sources(
             )
         })
         .collect();
-    compose_panes(layout, &blocks, *gap, *row_gap)
+    let mut block = compose_panes(layout, &blocks, *gap, *row_gap);
+    // The dashboard's own name: one bold line above the composed
+    // panes, the same treatment `rat watch --title` gives a plain
+    // frame — and prepended HERE so the collect step, the resize
+    // reflow, and the counting refresh all carry it by construction.
+    // Truncated to the composed width, never the terminal's: the
+    // title belongs to the dashboard it names. The empty mark keeps
+    // marks aligned to lines; a title never carries a change mark.
+    if let Some(title) = title {
+        let composed = block
+            .lines
+            .iter()
+            .map(|line| crate::core::measure::display_width(line))
+            .max()
+            .unwrap_or(0);
+        let text =
+            crate::core::measure::truncate_display(title, composed, crate::core::measure::ELLIPSIS);
+        block.lines.insert(
+            0,
+            StyleSpec {
+                bold: true,
+                ..StyleSpec::default()
+            }
+            .render(&text, profile),
+        );
+        block.marks.insert(0, LineMark::default());
+    }
+    block
 }
 
 /// The pane chrome's cadence phrase. Unlike watch's footer, which
@@ -4284,6 +4312,141 @@ mod tests {
             "on trigger"
         );
         assert_eq!(cadence_label(&cadence_spec(false, None, false)), "once");
+    }
+
+    #[test]
+    fn the_dashboard_title_rides_row_zero_bold_and_only_when_declared() {
+        // Through the same compose path every re-entrant repaints
+        // with, so the collect step, the resize reflow, and the
+        // counting refresh stay in sync by construction.
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let pane = || PaneBox {
+            height: 4,
+            width: PaneWidth::Weight(1),
+            overflow: Overflow::KeepTop,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: false,
+        };
+        let build = |title: Option<&str>| {
+            Registry::panes(
+                vec![cadence_spec(false, Some(Duration::from_secs(2)), false)],
+                vec![pane()],
+                LayoutNode::Pane(SourceId(0)),
+                0,
+                0,
+            )
+            .expect("a valid one-pane registry")
+            .with_title(title.map(str::to_string))
+        };
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let mut runtime = vec![SourceRuntime::for_test()];
+        runtime[0].output = Some(vec!["seed".to_string()]);
+        runtime[0].posted = true;
+
+        let registry = build(Some("Deploy status"));
+        let geom = registry.geometry((40, 10));
+        let block = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            false,
+            &palette,
+            ColorProfile::TrueColor,
+        );
+        assert!(
+            block.lines[0].contains("Deploy status"),
+            "the title heads the frame: {:?}",
+            block.lines[0]
+        );
+        assert!(
+            block.lines[0].contains("\u{1b}[1m"),
+            "the title is bold, exactly as watch --title: {:?}",
+            block.lines[0]
+        );
+        assert_eq!(
+            block.lines.len(),
+            block.marks.len(),
+            "marks stay aligned to lines"
+        );
+        assert!(
+            !block.marks[0].changed && block.marks[0].cells.is_empty(),
+            "the title row carries no change mark"
+        );
+
+        let bare = build(None);
+        let bare_block = compose_sources(
+            &bare,
+            &runtime,
+            &geom,
+            false,
+            &palette,
+            ColorProfile::TrueColor,
+        );
+        assert!(
+            !bare_block.lines[0].contains("Deploy status"),
+            "undeclared means absent: {:?}",
+            bare_block.lines[0]
+        );
+        assert_eq!(
+            block.lines.len(),
+            bare_block.lines.len() + 1,
+            "the title costs exactly one row"
+        );
+    }
+
+    #[test]
+    fn a_long_dashboard_title_truncates_to_the_composed_width() {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::measure::display_width;
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let registry = Registry::panes(
+            vec![cadence_spec(false, Some(Duration::from_secs(2)), false)],
+            vec![PaneBox {
+                height: 4,
+                width: PaneWidth::Cells(20),
+                overflow: Overflow::KeepTop,
+                border: BorderPreset::Rounded,
+                padding: Sides::default(),
+                title: None,
+                chrome: false,
+            }],
+            LayoutNode::Pane(SourceId(0)),
+            0,
+            0,
+        )
+        .expect("a valid one-pane registry")
+        .with_title(Some("a title much longer than twenty cells".to_string()));
+        let mut runtime = vec![SourceRuntime::for_test()];
+        runtime[0].output = Some(vec!["seed".to_string()]);
+        runtime[0].posted = true;
+        let geom = registry.geometry((60, 10));
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let block = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        let composed = block.lines[1..]
+            .iter()
+            .map(|line| display_width(line))
+            .max()
+            .expect("composed rows");
+        assert!(
+            display_width(&block.lines[0]) <= composed,
+            "the title never outgrows the composed frame: {:?}",
+            block.lines[0]
+        );
+        assert!(
+            block.lines[0].contains('…'),
+            "the cut is marked: {:?}",
+            block.lines[0]
+        );
     }
 
     #[test]

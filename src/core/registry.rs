@@ -114,6 +114,10 @@ pub enum Composition {
         layout: LayoutNode,
         gap: usize,
         row_gap: usize,
+        /// The whole dashboard's name — one bold line above the
+        /// composed panes, the same treatment `rat watch --title`
+        /// gives a plain frame. Never a pane's border label.
+        title: Option<String>,
     },
 }
 
@@ -202,8 +206,20 @@ impl Registry {
                 layout,
                 gap,
                 row_gap,
+                title: None,
             },
         })
+    }
+
+    /// The dashboard-level title, applied after construction: the
+    /// `panes` constructor has a dozen call sites that do not care,
+    /// and a builder keeps them unchanged. A no-op under `Plain`,
+    /// whose title arrives through its own constructor.
+    pub fn with_title(mut self, title: Option<String>) -> Registry {
+        if let Composition::Panes { title: slot, .. } = &mut self.composition {
+            *slot = title;
+        }
+        self
     }
 
     pub fn len(&self) -> usize {
