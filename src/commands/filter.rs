@@ -103,6 +103,12 @@ impl UiApp for FilterApp {
         let rows = (self.state.matches.len() as u16).min(self.state.height);
         1 + rows + u16::from(self.header.is_some())
     }
+
+    fn cursor_pos(&self) -> Option<(u16, u16)> {
+        let row = u16::from(self.header.is_some());
+        let col = (self.prompt.chars().count() + self.state.query.cursor) as u16;
+        Some((col, row))
+    }
 }
 
 pub fn run(args: FilterArgs, profile: ColorProfile, palette: Palette) -> AppResult {
@@ -324,6 +330,17 @@ mod tests {
         assert_eq!(cell.fg, Color::Indexed(97));
         // DIM is what keeps the default byte-identical (Reset emits nothing).
         assert!(cell.modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn the_cursor_pos_tracks_the_query_caret() {
+        // Initial query "a" leaves the caret at its end: prompt width 2
+        // plus 1, on the query row.
+        let app = app(Palette::builtin(
+            Appearance::Dark,
+            AppearanceSource::Default,
+        ));
+        assert_eq!(app.cursor_pos(), Some((3, 0)));
     }
 
     #[test]

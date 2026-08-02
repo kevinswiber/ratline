@@ -149,6 +149,12 @@ pub struct InlineRenderer<W: Write> {
     cursor_hidden: bool,
     finished: bool,
     last_width: Option<u16>,
+    /// Where the visible cursor currently sits, as (rows above the
+    /// resting line, column) — `None` when it rests below the frame.
+    /// Parking serves assistive tech: screen readers and braille
+    /// displays track only the hardware cursor, so a caret-bearing UI
+    /// must put the real cursor on its edit point, not just paint one.
+    parked: Option<(u16, u16)>,
 }
 
 impl<W: Write> InlineRenderer<W> {
@@ -166,6 +172,7 @@ impl<W: Write> InlineRenderer<W> {
             cursor_hidden: false,
             finished: false,
             last_width: None,
+            parked: None,
         }
     }
 
@@ -188,6 +195,21 @@ impl<W: Write> InlineRenderer<W> {
     /// Repaint: one assembled string, one write, one flush (I8 — the
     /// synchronized frame never spans a blocking operation).
     pub fn draw(&mut self, lines: &[String], term_width: u16) -> std::io::Result<()> {
+        self.draw_with_cursor(lines, term_width, None)
+    }
+
+    /// `draw`, plus a request to park the visible hardware cursor on a
+    /// frame cell — `cursor` is (column, row), 0-based. Screen readers
+    /// and braille displays track only the real cursor, so caret-bearing
+    /// UIs pass their edit point here. The park is purely relative (no
+    /// position queries); it is declined when any line wraps or the row
+    /// is outside the frame, falling back to the hidden-cursor behavior.
+    pub fn draw_with_cursor(
+        &mut self,
+        lines: &[String],
+        term_width: u16,
+        cursor: Option<(u16, u16)>,
+    ) -> std::io::Result<()> {
         let width_unchanged = self.last_width == Some(term_width);
         // A resize invalidates the wrap-derived row count (reflowing
         // terminals change how many rows the old frame occupies), so a
@@ -200,11 +222,13 @@ impl<W: Write> InlineRenderer<W> {
             }
         }
         self.last_width = Some(term_width);
-        let mut bytes = String::new();
-        if self.hide_cursor && !self.cursor_hidden {
-            bytes.push_str("\x1b[?25l");
-            self.cursor_hidden = true;
-        }
+        let next_rows = rendered_rows(lines, term_width);
+        // The park walk counts frame rows, which only equals line indexes
+        // when every line is exactly one row.
+        let park = cursor.and_then(|(col, row)| {
+            (usize::from(next_rows) == lines.len() && row < next_rows)
+                .then(|| (next_rows - row, col))
+        });
         let wipe = self.clear_screen && !self.screen_cleared;
         self.screen_cleared = true;
         self.draws_since_full += 1;
@@ -218,23 +242,74 @@ impl<W: Write> InlineRenderer<W> {
         } else {
             None
         };
-        match diff {
-            Some(rewrite) => bytes.push_str(&rewrite),
-            None => {
-                bytes.push_str(&frame_bytes(
-                    self.prev_rows,
-                    lines,
-                    term_width,
-                    self.sync,
-                    wipe,
-                ));
-                self.diff_invalid = false;
-                self.draws_since_full = 0;
+        let repaint = !matches!(&diff, Some(rewrite) if rewrite.is_empty());
+        let mut bytes = String::new();
+        if self.hide_cursor && !self.cursor_hidden && (repaint || park.is_none()) {
+            bytes.push_str("\x1b[?25l");
+            self.cursor_hidden = true;
+        }
+        if repaint {
+            if let Some((up, _)) = self.parked.take() {
+                // The paint math assumes the resting line; return there
+                // before any frame bytes go out.
+                bytes.push_str(&format!("\x1b[{up}B\r"));
+            }
+            match diff {
+                Some(rewrite) => bytes.push_str(&rewrite),
+                None => {
+                    bytes.push_str(&frame_bytes(
+                        self.prev_rows,
+                        lines,
+                        term_width,
+                        self.sync,
+                        wipe,
+                    ));
+                    self.diff_invalid = false;
+                    self.draws_since_full = 0;
+                }
             }
         }
+        match (self.parked, park) {
+            (old, new) if old == new => {}
+            (Some((up_old, _)), Some((up_new, col))) => {
+                // Same frame, new caret cell: a bare visible hop.
+                if up_new > up_old {
+                    bytes.push_str(&format!("\x1b[{}A", up_new - up_old));
+                } else if up_old > up_new {
+                    bytes.push_str(&format!("\x1b[{}B", up_old - up_new));
+                }
+                bytes.push('\r');
+                if col > 0 {
+                    bytes.push_str(&format!("\x1b[{col}C"));
+                }
+            }
+            (Some((up, _)), None) => {
+                // The target vanished without a repaint: tuck the cursor
+                // back at the resting line, hidden again if configured.
+                if self.hide_cursor && !self.cursor_hidden {
+                    bytes.push_str("\x1b[?25l");
+                    self.cursor_hidden = true;
+                }
+                bytes.push_str(&format!("\x1b[{up}B\r"));
+            }
+            (None, Some((up, col))) => {
+                // The cursor sits on the resting line (freshly painted or
+                // never parked): climb to the caret cell and show it.
+                bytes.push_str(&format!("\x1b[{up}A\r"));
+                if col > 0 {
+                    bytes.push_str(&format!("\x1b[{col}C"));
+                }
+                if self.cursor_hidden {
+                    bytes.push_str("\x1b[?25h");
+                    self.cursor_hidden = false;
+                }
+            }
+            (None, None) => {}
+        }
+        self.parked = park;
         self.out.write_all(bytes.as_bytes())?;
         self.out.flush()?;
-        self.prev_rows = rendered_rows(lines, term_width);
+        self.prev_rows = next_rows;
         self.prev_lines = lines.to_vec();
         self.finished = false;
         Ok(())
@@ -250,6 +325,11 @@ impl<W: Write> InlineRenderer<W> {
     #[allow(dead_code)]
     pub fn clear(&mut self) -> std::io::Result<()> {
         let mut bytes = String::new();
+        if let Some((up, _)) = self.parked.take() {
+            // Return to the resting line first: the erase below counts
+            // its rows from there.
+            bytes.push_str(&format!("\x1b[{up}B\r"));
+        }
         if self.prev_rows > 0 {
             bytes.push_str(&format!("\x1b[{}A", self.prev_rows));
         }
@@ -271,6 +351,9 @@ impl<W: Write> InlineRenderer<W> {
         self.screen_cleared = false;
         self.cursor_hidden = false;
         self.finished = false;
+        // The foreign program moved the cursor; whatever park we tracked
+        // is fiction now, and the full repaint below re-establishes it.
+        self.parked = None;
         // The pager may have left anything on the frame's rows, so a
         // changed-rows rewrite cannot be trusted until a full repaint
         // reclaims them.
@@ -618,6 +701,163 @@ mod tests {
         }
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b[3A"), "second frame must move up 3: {s:?}");
+    }
+}
+
+#[cfg(test)]
+mod park_tests {
+    use super::*;
+
+    fn lines(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// hide, paint, climb to the caret cell, show: the bytes of the first
+    /// frame of any caret-bearing UI.
+    #[test]
+    fn the_first_draw_parks_the_cursor_on_the_target_cell() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc", "list"]), 80, Some((5, 0)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(
+            s,
+            "\x1b[?25l\r\x1b[0J> abc\r\nlist\r\n\x1b[2A\r\x1b[5C\x1b[?25h"
+        );
+    }
+
+    #[test]
+    fn an_identical_frame_with_an_unmoved_cursor_writes_nothing() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((5, 0)))
+                .unwrap();
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((5, 0)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        // Only the first draw's bytes: the second is fully silent.
+        assert_eq!(s, "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[1A\r\x1b[5C\x1b[?25h");
+    }
+
+    #[test]
+    fn a_cursor_hop_moves_without_repainting() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((5, 0)))
+                .unwrap();
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((4, 0)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        // Identical frame, new column: a bare horizontal move, cursor
+        // visible throughout — no hide, no repaint.
+        assert_eq!(
+            s,
+            "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[1A\r\x1b[5C\x1b[?25h\r\x1b[4C"
+        );
+    }
+
+    #[test]
+    fn a_repaint_hides_unparks_and_reparks() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> a"]), 80, Some((3, 0)))
+                .unwrap();
+            r.draw_with_cursor(&lines(&["> ab"]), 80, Some((4, 0)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        let expected = concat!(
+            "\x1b[?25l\r\x1b[0J> a\r\n\x1b[1A\r\x1b[3C\x1b[?25h",
+            // hide, return to the resting line, rewrite, re-park, show.
+            "\x1b[?25l\x1b[1B\r",
+            "\x1b[1A\r\x1b[2K> ab\r\x1b[1B",
+            "\x1b[1A\r\x1b[4C\x1b[?25h",
+        );
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn clear_returns_from_the_park_before_erasing() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((5, 0)))
+                .unwrap();
+            r.clear().unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        // Down to the resting line first, or the erase math is off by the
+        // park height.
+        assert!(s.ends_with("\x1b[1B\r\x1b[1A\r\x1b[0J"), "got: {s:?}");
+    }
+
+    #[test]
+    fn a_vanished_target_tucks_the_cursor_back() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((5, 0)))
+                .unwrap();
+            r.draw_with_cursor(&lines(&["> abc"]), 80, None).unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        let expected = concat!(
+            "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[1A\r\x1b[5C\x1b[?25h",
+            "\x1b[?25l\x1b[1B\r",
+            "\x1b[?25h", // drop restores the cursor
+        );
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn a_wrapped_frame_declines_to_park() {
+        // The relative row walk only holds when every line is one row;
+        // a wrapped frame keeps the legacy hidden-cursor behavior.
+        let wide = "a".repeat(200);
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&[&wide]), 80, Some((0, 0)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, format!("\x1b[?25l\r\x1b[0J{wide}\r\n\x1b[?25h"));
+    }
+
+    #[test]
+    fn an_out_of_frame_row_declines_to_park() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut r = InlineRenderer::new(&mut out)
+                .with_cursor_hidden(true)
+                .with_sync_output(false);
+            r.draw_with_cursor(&lines(&["> abc"]), 80, Some((0, 7)))
+                .unwrap();
+        }
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s, "\x1b[?25l\r\x1b[0J> abc\r\n\x1b[?25h");
     }
 }
 

@@ -23,6 +23,13 @@ pub trait UiApp {
     fn on_key(&mut self, key: Key) -> Outcome;
     fn render(&self, area: Rect, buf: &mut Buffer);
     fn height(&self, term: (u16, u16)) -> u16;
+    /// The frame cell (column, row) where the hardware cursor should
+    /// rest after painting. Screen readers and braille displays track
+    /// only the real cursor, so any app with an edit point must return
+    /// it here; `None` keeps the cursor hidden (right for list UIs).
+    fn cursor_pos(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// Drive a UiApp on the UI stream: raw mode, event pump, inline repaint.
@@ -49,8 +56,13 @@ pub fn run_ui<A: UiApp>(
         let area = Rect::new(0, 0, cols, height);
         let mut buf = Buffer::empty(area);
         app.render(area, &mut buf);
+        // Clamp the caret to the frame: a value longer than the terminal
+        // clips at the right edge, and the cursor clips with it.
+        let cursor = app
+            .cursor_pos()
+            .map(|(col, row)| (col.min(cols.saturating_sub(1)), row.min(height - 1)));
         renderer
-            .draw(&buffer_to_lines(&buf, profile), cols)
+            .draw_with_cursor(&buffer_to_lines(&buf, profile), cols, cursor)
             .context("painting ui")?;
 
         let wait = match deadline {

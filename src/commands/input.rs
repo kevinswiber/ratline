@@ -60,6 +60,12 @@ impl UiApp for InputApp {
     fn height(&self, _term: (u16, u16)) -> u16 {
         1 + u16::from(self.header.is_some())
     }
+
+    fn cursor_pos(&self) -> Option<(u16, u16)> {
+        let row = u16::from(self.header.is_some());
+        let col = (self.prompt.chars().count() + self.state.cursor) as u16;
+        Some((col, row))
+    }
 }
 
 pub fn run(args: InputArgs, profile: ColorProfile, palette: Palette) -> AppResult {
@@ -189,6 +195,35 @@ mod tests {
         assert_eq!(cell.fg, Color::Indexed(96));
         // REVERSED is what makes the caret visible; the token colors it.
         assert!(cell.modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn the_cursor_pos_tracks_the_caret_cell() {
+        let mut state = InputState::new("abc".to_string(), false, 1000);
+        state.cursor = 1;
+        let app = InputApp {
+            state,
+            prompt: "> ".into(),
+            placeholder: "type".into(),
+            header: None,
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        // Prompt is 2 wide, caret at char 1: column 3, row 0.
+        assert_eq!(app.cursor_pos(), Some((3, 0)));
+    }
+
+    #[test]
+    fn the_cursor_pos_starts_at_the_text_column_and_clears_a_header() {
+        // Empty value: the edit point is still real — column = prompt
+        // width — and a header pushes the input row down by one.
+        let app = InputApp {
+            state: InputState::new(String::new(), false, 1000),
+            prompt: "> ".into(),
+            placeholder: "type".into(),
+            header: Some("H".into()),
+            palette: Palette::builtin(Appearance::Dark, AppearanceSource::Default),
+        };
+        assert_eq!(app.cursor_pos(), Some((2, 1)));
     }
 
     #[test]
