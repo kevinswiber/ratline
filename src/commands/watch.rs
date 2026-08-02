@@ -99,6 +99,12 @@ struct PaneLive {
 /// flags, and the pre-built chrome strings each constructor owns.
 pub(crate) struct SessionArgs {
     pub once: bool,
+    /// `--once` gives up after this long: exit 124, stdout EMPTY, the
+    /// waiting panes named on stderr. `None` (the default, and the
+    /// only value plain watch can carry — its once tick runs inline
+    /// on the loop thread, where a bound is unenforceable) waits
+    /// forever.
+    pub once_timeout: Option<Duration>,
     pub clear: bool,
     pub no_hide_cursor: bool,
     pub no_sync: bool,
@@ -160,6 +166,10 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
     );
     let session = SessionArgs {
         once: args.once,
+        // Plain watch --once runs its tick inline on the loop thread,
+        // so a bound is unenforceable here; the flag lives on
+        // `rat dashboard` only.
+        once_timeout: None,
         clear: args.clear,
         no_hide_cursor: args.no_hide_cursor,
         no_sync: args.no_sync,
@@ -1191,6 +1201,25 @@ pub(crate) fn run_registry(
                 eprintln!("{}", once_waiting_text(&registry, &waiting, ONCE_QUIET));
             }
             once_notice_sent = true;
+        }
+        // The opt-in bound: exit 124 with the wait named, stdout EMPTY
+        // — a partial frame is a lie in the mode whose stdout is the
+        // frame, and the once paint gate has written nothing yet.
+        // Children die via the shutdown guards on the way out.
+        if let Some(bound) = session.once_timeout
+            && session.once
+            && !plain
+            && once_started.elapsed() >= bound
+        {
+            let waiting: Vec<SourceId> =
+                registry.ids().filter(|id| !runtime[id.0].posted).collect();
+            if !waiting.is_empty() {
+                renderer.finish().context("restoring terminal")?;
+                return Err(AppError::Timeout(Some(anyhow!(
+                    "{}",
+                    once_timeout_text(&registry, &waiting, bound)
+                ))));
+            }
         }
         // 4. How long we may sleep: never past the SOONEST deadline,
         // never past one slice, so a signal, a key, and a completing
@@ -2966,6 +2995,30 @@ fn once_waiting_text(registry: &Registry, waiting: &[SourceId], after: Duration)
     )
 }
 
+/// What `--once-timeout` says when it gives up: the same
+/// declared/undeclared split as the notice, past tense. An undeclared
+/// pane never FINISHED — finishing was its contract — and is taught
+/// the declaration; a declared-live pane never produced its first
+/// output, and there is nothing to teach.
+fn once_timeout_text(registry: &Registry, waiting: &[SourceId], after: Duration) -> String {
+    let all_live = waiting.iter().all(|id| registry.spec(*id).live);
+    let tail = if all_live {
+        if waiting.len() == 1 {
+            "never produced its first output."
+        } else {
+            "never produced their first output."
+        }
+    } else {
+        "never finished. A command that follows instead of exiting must \
+         be declared `live=#true`."
+    };
+    format!(
+        "--once gave up after {}: {} {tail}",
+        brief_duration(after),
+        pane_list(registry, waiting),
+    )
+}
+
 /// A pane's spawn-error wording: the pane names itself (the default
 /// border draws no title, so the body is the only surface that can),
 /// the OS reason comes next, the path comes last. A pane truncates
@@ -4036,6 +4089,52 @@ mod tests {
                 Duration::from_secs(5)
             ),
             "rat dashboard: --once is still waiting on panes \"logs\", \"build\" after 5s: no output, no exit. A command that follows instead of exiting must be declared `live=#true`; `--once-timeout 30s` bounds the wait."
+        );
+    }
+
+    #[test]
+    fn the_bound_names_the_pane_it_gave_up_on() {
+        let registry = once_registry(&[("logs", false), ("metrics", false)]);
+        assert_eq!(
+            once_timeout_text(&registry, &[SourceId(0)], Duration::from_secs(30)),
+            "--once gave up after 30s: pane \"logs\" never finished. A command that follows instead of exiting must be declared `live=#true`."
+        );
+        assert_eq!(
+            once_timeout_text(
+                &registry,
+                &[SourceId(0), SourceId(1)],
+                Duration::from_secs(30)
+            ),
+            "--once gave up after 30s: panes \"logs\", \"metrics\" never finished. A command that follows instead of exiting must be declared `live=#true`."
+        );
+    }
+
+    #[test]
+    fn the_bound_drops_the_live_advice_when_every_waiting_pane_declared_it() {
+        // A declared-live pane must not be told to declare live, and
+        // the verb changes with the state: it never produced output,
+        // rather than never finished. Same rule as the notice: the
+        // advice is dropped only when EVERY waiting pane is live.
+        let registry = once_registry(&[("logs", true), ("tail", true), ("build", false)]);
+        assert_eq!(
+            once_timeout_text(&registry, &[SourceId(0)], Duration::from_secs(30)),
+            "--once gave up after 30s: pane \"logs\" never produced its first output."
+        );
+        assert_eq!(
+            once_timeout_text(
+                &registry,
+                &[SourceId(0), SourceId(1)],
+                Duration::from_secs(30)
+            ),
+            "--once gave up after 30s: panes \"logs\", \"tail\" never produced their first output."
+        );
+        assert_eq!(
+            once_timeout_text(
+                &registry,
+                &[SourceId(0), SourceId(2)],
+                Duration::from_secs(30)
+            ),
+            "--once gave up after 30s: panes \"logs\", \"build\" never finished. A command that follows instead of exiting must be declared `live=#true`."
         );
     }
 

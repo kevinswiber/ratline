@@ -585,6 +585,83 @@ pane "logs" {{
 }
 
 #[test]
+fn once_timeout_exits_124_and_writes_no_frame() {
+    // An undeclared follower under a short bound: exit 124, stderr
+    // names the pane, and stdout is EMPTY — a partial frame is a lie
+    // in the mode whose stdout is the frame.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("empty.log");
+    std::fs::write(&log, "").expect("seed");
+    let file = fixture(
+        dir.path(),
+        "bounded.kdl",
+        &format!(
+            r#"
+pane "logs" {{
+    height 3
+    chrome #false
+    border "none"
+    command "{bin}" "__follow" "{log}"
+}}
+"#,
+            bin = rat_bin().replace('\\', "\\\\"),
+            log = log.display().to_string().replace('\\', "\\\\"),
+        ),
+    );
+    let assert = rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once", "--once-timeout", "300ms"])
+        .assert()
+        .code(124)
+        .stderr(predicates::str::contains("\"logs\""))
+        .stderr(predicates::str::contains("gave up"));
+    assert!(
+        assert.get_output().stdout.is_empty(),
+        "stdout must be empty on expiry"
+    );
+}
+
+#[test]
+fn once_timeout_needs_once() {
+    use predicates::boolean::PredicateBooleanExt;
+    rat()
+        .args(["dashboard", "whatever.kdl", "--once-timeout", "1s"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--once"))
+        .stderr(predicates::str::contains("unexpected argument").not());
+}
+
+#[test]
+fn once_timeout_does_not_fire_when_every_pane_finishes() {
+    // The no-regression pin: a slow-but-finishing pane under a
+    // generous bound exits 0 with its one frame, exactly as if the
+    // flag were absent.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "finishes.kdl",
+        &format!(
+            r#"
+pane "slow" {{
+    height 3
+    chrome #false
+    border "none"
+    command "{bin}" "__sleep" "200" "done-now"
+}}
+"#,
+            bin = rat_bin().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once", "--once-timeout", "30s"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("done-now"));
+}
+
+#[test]
 fn a_pane_that_cannot_start_shows_the_reason_before_the_path() {
     // A declared width no terminal can widen truncates from the
     // right, so whatever sits last is what no reader sees. The
