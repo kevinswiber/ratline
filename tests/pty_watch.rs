@@ -1031,12 +1031,16 @@ fn scrubbing_shows_an_older_frame_and_s_snapshots_it() {
     .expect("spawn under a pty");
     let mut terminal = FakeTerminal::dark();
 
+    // Awaited, not just drained. `<` parks on the previous DISTINCT
+    // entry and is a silent no-op when none exists, and a timed drain
+    // cannot promise a second frame on a loaded machine — every frame
+    // costs a shell spawn. The second counter value on the wire means
+    // the tick that recorded it is complete, so a scrub-back target
+    // exists by construction before < is sent.
     assert!(
-        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
-        "expected a first counter frame"
+        wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(3)),
+        "expected a second distinct frame for < to step back to"
     );
-    // Let history accrue distinct frames.
-    let _ = drain_for(&session, Duration::from_millis(400));
 
     session.write_bytes(b"<");
     let seen = wait_for_bytes(
