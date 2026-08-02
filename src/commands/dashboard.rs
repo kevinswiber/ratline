@@ -34,6 +34,7 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         ),
         once_timeout,
         clear: args.clear,
+        fullscreen: args.fullscreen,
         no_hide_cursor: args.no_hide_cursor,
         no_sync: args.no_sync,
         // Declared geometry: a wrapped line would add rows the composed

@@ -2821,3 +2821,101 @@ fn a_bars_advance_recolors_ink_instead_of_reversing_it() {
         "watch should have exited on q"
     );
 }
+
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[test]
+fn fullscreen_takes_and_returns_the_alternate_screen() {
+    // The contract: the alternate screen is entered before the first
+    // frame and left on exit, so the user's screen comes back exactly
+    // as it was and the frames never touch scrollback.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "--fullscreen",
+            "-n",
+            "1s",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(&session, &mut terminal, b"hi", Duration::from_secs(2))
+        .expect("expected the first fullscreen frame");
+    let enter = position(&seen, b"\x1b[?1049h").expect("the alternate screen must be entered");
+    let first_frame = position(&seen, b"\x1b[?2026h").expect("the first synchronized frame");
+    assert!(
+        enter < first_frame,
+        "the alternate screen must be entered before the first frame"
+    );
+    session.write_bytes(b"q");
+    let tail = drain_for(&session, Duration::from_millis(600));
+    assert!(
+        contains(&tail, b"\x1b[?1049l"),
+        "q must leave the alternate screen: {:?}",
+        String::from_utf8_lossy(&tail)
+    );
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}
+
+#[test]
+fn the_fullscreen_pager_round_trip_re_enters_the_alternate_screen() {
+    // `?1049` is not a nesting counter: rat must leave the alternate
+    // screen before the pager (which may take it itself) and re-enter
+    // afterward — and the re-entered buffer is blank, so the frame
+    // must repaint from scratch rather than resuming over a copy that
+    // is no longer there.
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "--fullscreen",
+            "-n",
+            "50ms",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "expected the first fullscreen frame"
+    );
+    let _ = drain_for(&session, Duration::from_millis(100));
+    session.write_bytes(b"v");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"\x1b[?1049h",
+        Duration::from_secs(3),
+    )
+    .expect("rat must re-enter the alternate screen after the pager");
+    assert!(
+        position(&seen, b"\x1b[?1049l").is_some(),
+        "rat must leave the alternate screen before the pager: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
+        "the frame must repaint onto the blank re-entered screen"
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}

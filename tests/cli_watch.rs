@@ -524,3 +524,28 @@ fn a_child_inside_the_bound_says_nothing_at_all() {
     );
     assert_eq!(String::from_utf8_lossy(&assert.get_output().stderr), "");
 }
+
+#[test]
+fn fullscreen_stays_silent_when_piped() {
+    // Framing only makes sense on a terminal: a piped run must never
+    // carry the alternate-screen escapes, exactly as --clear is
+    // ignored piped.
+    let assert = rat()
+        .args([
+            "watch",
+            "--fullscreen",
+            "--once",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(
+        !stdout.contains("\x1b[?1049"),
+        "piped output must stay plain"
+    );
+    assert!(stdout.contains("hi"));
+}

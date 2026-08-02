@@ -39,6 +39,7 @@ works. Check yours with `rat doctor`.
 ```sh
 rat watch --interval 2s -- ./status.sh        # flicker-free live view
 rat watch --clear -- ./status.sh              # wipe the screen first, atomically
+rat watch --fullscreen -- ./status.sh         # alternate screen, restored on exit
 rat watch --once -- ./status.sh               # render one frame
 rat watch --shell -- 'date; df -h | head -3'  # through sh -c
 ```
@@ -51,6 +52,16 @@ Piped output degrades to plain text, so `rat watch ... | tee log` stays
 readable. The interval is the quiet time between runs: a command slower
 than its interval never overlaps itself — the next run simply waits its
 turn.
+
+Two screen contracts, and a flag to pick one. The default paints
+inline: the frame sits under your last command, the session reads as a
+transcript, and exit leaves the last frame behind. `--fullscreen`
+(watch and dashboard both) takes the alternate screen instead, like
+`less` or `htop`: the status row is pinned to the bottom of the
+screen, and exit restores your terminal exactly as it was — the frames
+never enter scrollback, so keep a frame with `S` rather than by
+scrolling back. Ignored when piped. (A hard `SIGKILL` can leave the
+terminal on the alternate screen; `reset` recovers.)
 
 Beside (or instead of) the interval, `--trigger` refreshes on an
 external event. The sweet spot is two speeds — a slow heartbeat for what

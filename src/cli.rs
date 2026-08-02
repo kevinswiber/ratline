@@ -450,6 +450,11 @@ pub struct WatchArgs {
     /// Clear the screen before the first frame (atomically, inside it)
     #[arg(long)]
     pub clear: bool,
+    /// Take the alternate screen for the session and give it back on
+    /// exit: the screen returns exactly as it was, and the frames
+    /// never enter scrollback. Ignored when output is piped.
+    #[arg(long)]
+    pub fullscreen: bool,
     /// Leave the cursor visible
     #[arg(long)]
     pub no_hide_cursor: bool,
@@ -493,6 +498,11 @@ pub struct DashboardArgs {
     /// Clear the screen before the first frame (atomically, inside it)
     #[arg(long)]
     pub clear: bool,
+    /// Take the alternate screen for the session and give it back on
+    /// exit: the screen returns exactly as it was, and the frames
+    /// never enter scrollback. Ignored when output is piped.
+    #[arg(long)]
+    pub fullscreen: bool,
     /// Leave the cursor visible
     #[arg(long)]
     pub no_hide_cursor: bool,

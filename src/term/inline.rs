@@ -365,6 +365,22 @@ impl<W: Write> InlineRenderer<W> {
         self.diff_invalid = true;
     }
 
+    /// The pager returned on the ALTERNATE screen: unlike the inline
+    /// path there is nothing of ours to resume over — leaving alt for
+    /// the pager discarded our buffer, and re-entering gave a blank
+    /// one. The next draw starts from nothing: full repaint, the
+    /// clear-screen wipe re-homing the origin, no park, no trusted
+    /// rows, no remembered geometry.
+    pub fn restart_on_blank_screen(&mut self) {
+        self.screen_cleared = false;
+        self.cursor_hidden = false;
+        self.finished = false;
+        self.parked = None;
+        self.diff_invalid = true;
+        self.prev_rows = 0;
+        self.prev_lines.clear();
+    }
+
     /// Restore the cursor. Idempotent; also runs on drop.
     pub fn finish(&mut self) -> std::io::Result<()> {
         if self.finished {

@@ -211,6 +211,34 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Enter the alternate screen on construction, leave it on Drop —
+/// beside [`RawModeGuard`], so every exit path that already restores
+/// the terminal through guards restores this too (declare it AFTER the
+/// raw guard: reverse drop order then leaves the alternate screen
+/// before raw mode is disabled). `?1049` is write-only, so the
+/// renderer's no-queries rule is untouched; the bytes go to stdout,
+/// the frames' own stream. SIGKILL cannot unwind — `reset` recovers.
+pub struct AltScreenGuard;
+
+impl AltScreenGuard {
+    pub fn enter() -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        out.write_all(b"\x1b[?1049h")?;
+        out.flush()?;
+        Ok(AltScreenGuard)
+    }
+}
+
+impl Drop for AltScreenGuard {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?1049l");
+        let _ = out.flush();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

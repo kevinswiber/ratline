@@ -48,7 +48,7 @@ use crate::term::tap::TapEvent;
 use crate::term::tap::{TapChunk, TapScanner, TriggerReader, TtyTap};
 #[cfg(unix)]
 use crate::term::theme_notify::{OscColorKind, ThemeNotifyGuard, classify_colors, may_subscribe};
-use crate::term::tty::{ConsoleUtf8Guard, RawModeGuard};
+use crate::term::tty::{AltScreenGuard, ConsoleUtf8Guard, RawModeGuard};
 use crate::theme::{Appearance, AppearanceSource, Palette};
 use crate::ui::key::{Key, from_crossterm};
 
@@ -111,6 +111,10 @@ pub(crate) struct SessionArgs {
     /// forever.
     pub once_timeout: Option<Duration>,
     pub clear: bool,
+    /// Take the alternate screen for the run; gated on `interactive`
+    /// like every other framing concern, and subsuming `clear` (the
+    /// wipe-and-home happens inside the first frame either way).
+    pub fullscreen: bool,
     pub no_hide_cursor: bool,
     pub no_sync: bool,
     pub wrap: bool,
@@ -179,6 +183,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         // `rat dashboard` only.
         once_timeout: None,
         clear: args.clear,
+        fullscreen: args.fullscreen,
         no_hide_cursor: args.no_hide_cursor,
         no_sync: args.no_sync,
         wrap: !args.no_wrap,
@@ -207,16 +212,20 @@ pub(crate) fn run_registry(
 
     let stdout = std::io::stdout();
     let is_tty = stdout.is_tty();
-    // Framing only makes sense on a terminal; piped output gets the plain
-    // content so `rat watch | tee log` stays readable.
-    let mut renderer = InlineRenderer::new(stdout.lock())
-        .with_cursor_hidden(is_tty && !session.no_hide_cursor)
-        .with_sync_output(is_tty && !session.no_sync)
-        .with_clear_screen(is_tty && session.clear);
-
     // The looping tty mode reads keys (q quits, v pages the full frame), so
     // it owns the terminal input; children must not compete for it.
     let interactive = is_tty && !session.once;
+    // Gate on interactive, not merely is_tty: a --once run must not
+    // paint into a buffer nobody sees.
+    let fullscreen = interactive && session.fullscreen;
+    // Framing only makes sense on a terminal; piped output gets the plain
+    // content so `rat watch | tee log` stays readable. Fullscreen
+    // subsumes --clear: the same wipe-and-home inside the first frame
+    // is what homes the origin on the fresh alternate screen.
+    let mut renderer = InlineRenderer::new(stdout.lock())
+        .with_cursor_hidden(is_tty && !session.no_hide_cursor)
+        .with_sync_output(is_tty && !session.no_sync)
+        .with_clear_screen(is_tty && (session.clear || fullscreen));
     // The event-wait routes need a terminal to wake; only the stat-poll
     // works piped, so the other schemes refuse early, before any
     // terminal state changes. Per source: the pane that declared the
@@ -239,6 +248,14 @@ pub(crate) fn run_registry(
     }
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
+    } else {
+        None
+    };
+    // AFTER the raw guard: reverse drop order leaves the alternate
+    // screen first, then disables raw mode — the screen comes back
+    // exactly as it was on every unwinding exit path.
+    let _alt_guard = if fullscreen {
+        Some(AltScreenGuard::enter().context("entering the alternate screen")?)
     } else {
         None
     };
@@ -954,6 +971,7 @@ pub(crate) fn run_registry(
                         None,
                         size,
                         session.max_height,
+                        fullscreen,
                         &faint,
                         profile,
                         &history,
@@ -1141,6 +1159,7 @@ pub(crate) fn run_registry(
                     (!notices.is_empty()).then(|| notices.join(" · ")),
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
+                    fullscreen,
                     &faint,
                     profile,
                     &history,
@@ -1215,6 +1234,7 @@ pub(crate) fn run_registry(
                     None,
                     size,
                     session.max_height,
+                    fullscreen,
                     &faint,
                     profile,
                     &history,
@@ -1329,6 +1349,7 @@ pub(crate) fn run_registry(
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
+                    fullscreen,
                     &faint,
                     profile,
                     &history,
@@ -1417,7 +1438,7 @@ pub(crate) fn run_registry(
                             #[cfg(windows)]
                             let handed_off = true;
                             let pager_notice = if handed_off {
-                                page_frame(content, &mut renderer)
+                                page_frame(content, &mut renderer, fullscreen)
                             } else {
                                 Some(
                                     "pager unavailable: the input reader did not yield; try again"
@@ -1460,6 +1481,7 @@ pub(crate) fn run_registry(
                                     pager_notice,
                                     size,
                                     session.max_height,
+                                    fullscreen,
                                     &faint,
                                     profile,
                                     &history,
@@ -1503,6 +1525,7 @@ pub(crate) fn run_registry(
                                 None,
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -1532,6 +1555,7 @@ pub(crate) fn run_registry(
                                 None,
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -1565,6 +1589,7 @@ pub(crate) fn run_registry(
                                 None,
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -1618,6 +1643,7 @@ pub(crate) fn run_registry(
                                     None,
                                     size,
                                     session.max_height,
+                                    fullscreen,
                                     &faint,
                                     profile,
                                     &history,
@@ -1653,6 +1679,7 @@ pub(crate) fn run_registry(
                                 None,
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -1743,6 +1770,7 @@ pub(crate) fn run_registry(
                                 None,
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -1770,6 +1798,7 @@ pub(crate) fn run_registry(
                                 Some(text),
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -1814,6 +1843,7 @@ pub(crate) fn run_registry(
                                 debug_notice,
                                 size,
                                 session.max_height,
+                                fullscreen,
                                 &faint,
                                 profile,
                                 &history,
@@ -2378,6 +2408,7 @@ fn repaint(
     notice: Option<String>,
     size: (u16, u16),
     max_height: Option<u16>,
+    fullscreen: bool,
     faint: &StyleSpec,
     profile: ColorProfile,
     history: &History,
@@ -2467,6 +2498,7 @@ fn repaint(
         notice,
         size,
         max_height,
+        fullscreen,
         faint,
         profile,
         &time_seg_live,
@@ -2531,6 +2563,7 @@ fn paint_frame(
     notice: Option<String>,
     size: (u16, u16),
     max_height: Option<u16>,
+    fullscreen: bool,
     faint: &StyleSpec,
     profile: ColorProfile,
     time_seg_live: &str,
@@ -2549,6 +2582,7 @@ fn paint_frame(
         notice,
         size,
         max_height,
+        fullscreen,
         faint,
         profile,
         time_seg_live,
@@ -2575,6 +2609,7 @@ fn frame_rows(
     notice: Option<String>,
     size: (u16, u16),
     max_height: Option<u16>,
+    fullscreen: bool,
     faint: &StyleSpec,
     profile: ColorProfile,
     time_seg_live: &str,
@@ -2586,7 +2621,16 @@ fn frame_rows(
     dropped: Option<&str>,
 ) -> Vec<String> {
     let (cols, rows) = size;
-    let max_rows = window_rows(max_height, rows);
+    // Fullscreen pins the status row to the bottom screen row and
+    // must never paint the bottom-most row itself: a trailing newline
+    // there scrolls the alternate screen and destroys the top body
+    // row (there is no scrollback to absorb it). With the default
+    // terminal-derived budget, a one-shot notice row therefore takes
+    // its row from the body; a --max-height cap keeps the author's
+    // number and floats as it always did.
+    let fills = fullscreen && max_height.is_none();
+    let max_rows =
+        window_rows(max_height, rows).saturating_sub(u16::from(fills && notice.is_some()));
     let start = match mode {
         FrameMode::Live => 0,
         FrameMode::LiveScrolled | FrameMode::Paused => offset.min(lines.len()),
@@ -2646,6 +2690,16 @@ fn frame_rows(
     // at rest — never inherits a child color. The chop path above
     // already closes per row, so sealing it changes nothing.
     kept = seal_rows(kept);
+    if fills {
+        // Pad by RENDERED rows (a wrapped line occupies several) so
+        // the status row sits on the bottom screen row instead of
+        // floating under short content. A constant painted height is
+        // also what keeps the row differ eligible across frames whose
+        // line count moves.
+        for _ in crate::term::inline::rendered_rows(&kept, cols)..max_rows {
+            kept.push(String::new());
+        }
+    }
     let status = match mode {
         FrameMode::Paused => paused_notice(time_paused, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => {
@@ -2683,11 +2737,22 @@ fn snapshot_frame(lines: &[String], dir: Option<&std::path::Path>, ansi: bool) -
 fn page_frame(
     lines: &[String],
     renderer: &mut InlineRenderer<std::io::StdoutLock<'static>>,
+    fullscreen: bool,
 ) -> Option<String> {
     let pagers = resolve_pagers(&SystemEnv);
     let mut used = pagers.first().map(|p| p.bin.clone()).unwrap_or_default();
     let _ = crossterm::terminal::disable_raw_mode();
     let _ = renderer.finish();
+    // `?1049` is not a nesting counter: the default pager takes the
+    // alternate screen itself, and its leave would drop the terminal
+    // to the normal buffer with rat's content gone. Leave first; the
+    // pager runs on the normal screen like the inline mode always had.
+    if fullscreen {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?1049l");
+        let _ = out.flush();
+    }
     // The pager inherits the console; keep it decoding UTF-8 while the
     // pager owns the screen (more.com garbles the frame otherwise).
     let _console_utf8 = ConsoleUtf8Guard::enable();
@@ -2721,7 +2786,18 @@ fn page_frame(
     })();
 
     let _ = crossterm::terminal::enable_raw_mode();
-    renderer.resume_over_own_frame();
+    if fullscreen {
+        // Re-entered fresh: the alternate screen we left was
+        // discarded, so there is no frame of ours to resume over —
+        // the next draw starts from a blank buffer.
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[?1049h");
+        let _ = out.flush();
+        renderer.restart_on_blank_screen();
+    } else {
+        renderer.resume_over_own_frame();
+    }
     match result {
         Ok(()) => None,
         Err(err) => Some(format!(
@@ -4068,6 +4144,7 @@ mod tests {
             None,
             (80, 24),
             None,
+            false,
             &faint,
             ColorProfile::TrueColor,
             "since 12:00:00",
@@ -4109,6 +4186,7 @@ mod tests {
             None,
             (80, 24),
             None,
+            false,
             &faint,
             ColorProfile::TrueColor,
             "since 12:00:00",
@@ -4121,6 +4199,59 @@ mod tests {
         );
         assert_eq!(rows[0], "plain");
         assert_eq!(rows[1], "\x1b[31mclosed\x1b[0m");
+    }
+
+    #[test]
+    fn fullscreen_pads_the_body_and_reserves_the_notice_row() {
+        let view = ViewState {
+            wrap: true,
+            hshift: 0,
+            gutter: false,
+            highlight: false,
+            alt_time: false,
+        };
+        let faint = StyleSpec {
+            faint: true,
+            ..StyleSpec::default()
+        };
+        let lines = vec!["hi".to_string()];
+        let build = |notice: Option<String>, max_height: Option<u16>| {
+            frame_rows(
+                &lines,
+                0,
+                FrameMode::Live,
+                view,
+                notice,
+                (80, 24),
+                max_height,
+                true,
+                &faint,
+                ColorProfile::TrueColor,
+                "since 12:00:00",
+                " · ? help",
+                "",
+                None,
+                "▌ ",
+                "",
+                None,
+            )
+        };
+        // No notice: 22 padded body rows + the status row = 23 painted
+        // rows on a 24-row screen — the bottom row stays the cursor's,
+        // so nothing ever scrolls the alternate screen.
+        let rows = build(None, None);
+        assert_eq!(rows.len(), 23, "22 body rows + the status row");
+        assert_eq!(rows[0], "hi");
+        assert!(rows[1..22].iter().all(String::is_empty), "padded body");
+        assert!(rows[22].contains("since 12:00:00"), "status pinned last");
+        // A one-shot notice takes its row FROM the body: still 23
+        // painted rows, never 24.
+        let rows = build(Some("one notice".to_string()), None);
+        assert_eq!(rows.len(), 23, "the notice row comes out of the body");
+        assert!(rows[22].contains("one notice"), "the notice is last");
+        // A --max-height cap keeps the author's number: no padding.
+        let rows = build(None, Some(5));
+        assert_eq!(rows.len(), 2, "a capped frame still floats");
     }
 
     #[test]
