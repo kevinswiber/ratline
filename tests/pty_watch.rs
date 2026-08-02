@@ -2775,3 +2775,49 @@ fn a_scrolled_counting_row_keeps_counting() {
         "watch should have exited on q"
     );
 }
+
+#[test]
+fn a_bars_advance_recolors_ink_instead_of_reversing_it() {
+    // Reverse video on a full block draws the cell in the background
+    // color — the bar reads LESS at the moment it advances. A changed
+    // block glyph must take the bold+accent ink treatment while plain
+    // text keeps today's reverse.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let value = dir.path().join("value");
+    std::fs::write(&value, "██░░ 2/4").expect("seed");
+    let script = format!("cat {}", value.display());
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["watch", "-n", "100ms", "--shell", "--", &script],
+        &[],
+    )
+    .expect("spawn under a pty");
+    let mut terminal = FakeTerminal::dark();
+
+    assert!(
+        wait_for(&session, &mut terminal, b"2/4", Duration::from_secs(2)),
+        "expected the first bar frame"
+    );
+    session.write_bytes(b"c");
+    let _ = drain_for(&session, Duration::from_millis(100));
+    std::fs::write(&value, "███░ 3/4").expect("the bar advances");
+    // The digit's reverse is the positive control: highlights were
+    // live on the exact repaint that carried the block change.
+    let seen = wait_for_bytes(&session, &mut terminal, b"\x1b[7m3", Duration::from_secs(3))
+        .expect("the changed digit never got its reverse highlight");
+    assert!(
+        contains(&seen, b"\x1b[1;38"),
+        "the changed block must open the bold+accent ink: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert!(
+        !contains(&seen, "\x1b[7m█".as_bytes()),
+        "a block glyph must never be reversed: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "watch should have exited on q"
+    );
+}

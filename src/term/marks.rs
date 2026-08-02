@@ -125,21 +125,68 @@ pub fn prefix_rows(
         .collect()
 }
 
-/// Splice reverse video onto the changed character runs of one
-/// pre-rendered line: open `\x1b[7m`, close `\x1b[0m` plus a replay of
-/// the child's open SGR state, and re-assert the mark after any child
-/// escape inside a run — the mark PATCHES an attribute over the
-/// child's own styling, never replaces its colors. `cells` are char
-/// indices into the STRIPPED line, sorted and non-overlapping
-/// (`changed_marks` guarantees both). Empty `cells` returns the line
-/// unchanged.
+/// The reverse-only spelling of [`mark_cells_with`], kept for the
+/// byte-exact splice tests.
+#[cfg(test)]
 pub fn mark_cells(line: &str, cells: &[std::ops::Range<usize>]) -> String {
+    mark_cells_with(line, cells, None)
+}
+
+/// What a marked character gets: reverse video for text, the caller's
+/// ink prefix for glyphs whose coverage is the value.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Treatment {
+    None,
+    Reverse,
+    Solid,
+}
+
+/// A glyph whose ink coverage encodes the datum: Block Elements
+/// (`rat bar`'s █/░, sparkline ticks) and Braille (the Dots preset).
+/// A glyph-class heuristic, NOT a bar detector — rat highlights
+/// arbitrary child output and cannot tell a bar from ASCII art; the
+/// treatment is safe because it never changes which character the
+/// child printed. Thin Box Drawing glyphs (the Line preset) behave
+/// like text and keep reverse. The one solid shape this test cannot
+/// see is a space painted only by an open background color — its
+/// treatment differs (underline shows over a bg fill) and is scoped
+/// as its own follow-up.
+fn coverage_glyph(t: &str) -> bool {
+    t.chars()
+        .next()
+        .is_some_and(|c| matches!(c, '\u{2580}'..='\u{259F}' | '\u{2800}'..='\u{28FF}'))
+}
+
+/// Splice change marks onto the changed character runs of one
+/// pre-rendered line: reverse video (`\x1b[7m`) for text; for
+/// coverage glyphs, the caller's `solid` ink prefix instead — reverse
+/// inverts ink coverage, and on a bar or sparkline the coverage IS the
+/// datum, so a bar would read LESS at the moment it advances. Each
+/// treatment closes with `\x1b[0m` plus a replay of the child's open
+/// SGR state, switches close-and-reopen mid-run at a glyph-class
+/// boundary, and is re-asserted after any child escape inside a run —
+/// the mark PATCHES styling over the child's own colors, never
+/// replaces its characters. `solid` is the full pre-built escape (the
+/// caller owns style and profile, like `prefix_rows`' mark cell);
+/// `None` keeps reverse everywhere. `cells` are char indices into the
+/// STRIPPED line, sorted and non-overlapping (`changed_marks`
+/// guarantees both). Empty `cells` returns the line unchanged.
+pub fn mark_cells_with(
+    line: &str,
+    cells: &[std::ops::Range<usize>],
+    solid: Option<&str>,
+) -> String {
     if cells.is_empty() {
         return line.to_string();
     }
+    let open = |out: &mut String, treatment: Treatment| match treatment {
+        Treatment::Reverse => out.push_str("\x1b[7m"),
+        Treatment::Solid => out.push_str(solid.unwrap_or_default()),
+        Treatment::None => {}
+    };
     let mut out = String::new();
     let mut state = crate::core::measure::SgrState::default();
-    let mut inside = false;
+    let mut current = Treatment::None;
     let mut idx = 0usize; // char index in the stripped line
     let mut next = 0usize; // cursor into cells
     for chunk in crate::core::measure::chunks(line) {
@@ -147,29 +194,35 @@ pub fn mark_cells(line: &str, cells: &[std::ops::Range<usize>]) -> String {
             crate::core::measure::Chunk::Escape(e) => {
                 state.apply(e);
                 out.push_str(e);
-                if inside {
-                    out.push_str("\x1b[7m");
-                }
+                // Re-assert AFTER the child's escape so the mark wins.
+                open(&mut out, current);
             }
             crate::core::measure::Chunk::Text(t, _) => {
                 while next < cells.len() && cells[next].end <= idx {
                     next += 1;
                 }
                 let marked = next < cells.len() && cells[next].contains(&idx);
-                if marked && !inside {
-                    out.push_str("\x1b[7m");
-                    inside = true;
-                } else if !marked && inside {
-                    out.push_str("\x1b[0m");
-                    out.push_str(&state.prefix());
-                    inside = false;
+                let want = if !marked {
+                    Treatment::None
+                } else if solid.is_some() && coverage_glyph(t) {
+                    Treatment::Solid
+                } else {
+                    Treatment::Reverse
+                };
+                if want != current {
+                    if current != Treatment::None {
+                        out.push_str("\x1b[0m");
+                        out.push_str(&state.prefix());
+                    }
+                    open(&mut out, want);
+                    current = want;
                 }
                 out.push_str(t);
                 idx += 1;
             }
         }
     }
-    if inside {
+    if current != Treatment::None {
         out.push_str("\x1b[0m");
         out.push_str(&state.prefix());
     }
@@ -337,6 +390,66 @@ mod tests {
         assert_eq!(
             mark_cells("abcd", &[1..2, 3..4]),
             "a\x1b[7mb\x1b[0mc\x1b[7md\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn a_block_glyph_is_marked_with_ink_not_reverse() {
+        // In the Block Elements range the glyph's ink coverage IS the
+        // datum, and reverse video inverts coverage: a bar reads LESS
+        // at the moment it advances. The ink recolor keeps the glyph
+        // exactly as the child drew it.
+        let spliced = mark_cells_with("██", &[0..2], Some("\x1b[1;38;5;4m"));
+        assert_eq!(spliced, "\x1b[1;38;5;4m██\x1b[0m");
+        assert!(!spliced.contains("\x1b[7m"));
+    }
+
+    #[test]
+    fn a_braille_glyph_takes_the_ink_treatment_too() {
+        // The Dots preset's ⣿/⣀ encode coverage the same way.
+        assert_eq!(
+            mark_cells_with("⣿⣀", &[0..2], Some("\x1b[1m")),
+            "\x1b[1m⣿⣀\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn a_run_spanning_text_and_blocks_switches_treatment_mid_run() {
+        assert_eq!(
+            mark_cells_with("ab██", &[0..4], Some("\x1b[1m")),
+            "\x1b[7mab\x1b[0m\x1b[1m██\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn the_childs_state_is_replayed_after_a_solid_run() {
+        assert_eq!(
+            mark_cells_with("\x1b[31m██ab", &[0..2], Some("\x1b[1m")),
+            "\x1b[31m\x1b[1m██\x1b[0m\x1b[31mab"
+        );
+    }
+
+    #[test]
+    fn a_child_escape_inside_a_solid_run_reasserts_the_ink() {
+        assert_eq!(
+            mark_cells_with("█\x1b[32m█", &[0..2], Some("\x1b[1m")),
+            "\x1b[1m█\x1b[32m\x1b[1m█\x1b[0m\x1b[32m"
+        );
+    }
+
+    #[test]
+    fn without_an_ink_prefix_blocks_keep_reverse() {
+        assert_eq!(mark_cells_with("██", &[0..2], None), "\x1b[7m██\x1b[0m");
+    }
+
+    #[test]
+    fn a_shift_cut_through_a_solid_run_keeps_the_mark() {
+        use crate::core::measure::shift_chop;
+        let spliced = mark_cells_with("abc████", &[3..7], Some("\x1b[1m"));
+        let cut = shift_chop(&spliced, 4, 10);
+        assert!(
+            cut.starts_with("\x1b[1m"),
+            "the ink prefix must replay across the cut: {cut:?}"
         );
     }
 

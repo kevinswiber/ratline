@@ -39,7 +39,7 @@ use crate::exit::{AppError, AppResult};
 use crate::style_spec::StyleSpec;
 use crate::term::history::History;
 use crate::term::inline::{InlineRenderer, truncate_to_rows};
-use crate::term::marks::{GUTTER_COLS, LineMark, changed_marks, mark_cells, prefix_rows};
+use crate::term::marks::{GUTTER_COLS, LineMark, changed_marks, mark_cells_with, prefix_rows};
 use crate::term::scroll::{
     HSHIFT_STEP, LiveScroll, ScrollState, ScrollStep, paused_notice, scrolled_notice,
 };
@@ -2399,6 +2399,23 @@ fn repaint(
         }
         .render("▌", profile)
     );
+    // The ink for a changed coverage glyph (block/braille): bold +
+    // accent foreground, built at paint time like the gutter cell so
+    // it rides the live theme. Empty under Ascii (highlights are off
+    // there anyway).
+    let solid_mark = {
+        let prefix = StyleSpec {
+            bold: true,
+            foreground: Some(palette.accent),
+            ..StyleSpec::default()
+        }
+        .sgr_prefix(profile);
+        if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("\x1b[{prefix}m")
+        }
+    };
     let time_seg_live = live_time_segment(view.alt_time, &live.since, age_seconds(live.changed_at));
     let time_paused = pause.map_or_else(
         || age_text(0),
@@ -2420,6 +2437,7 @@ fn repaint(
         &time_paused,
         marks.as_deref(),
         &mark_cell,
+        &solid_mark,
         live.dropped.as_deref(),
     )?;
     Ok(key)
@@ -2477,6 +2495,7 @@ fn paint_frame(
     time_paused: &str,
     marks: Option<&[LineMark]>,
     mark_cell: &str,
+    solid_mark: &str,
     dropped: Option<&str>,
 ) -> anyhow::Result<()> {
     let kept = frame_rows(
@@ -2494,6 +2513,7 @@ fn paint_frame(
         time_paused,
         marks,
         mark_cell,
+        solid_mark,
         dropped,
     );
     renderer.draw(&kept, size.0).context("writing frame")?;
@@ -2519,6 +2539,7 @@ fn frame_rows(
     time_paused: &str,
     marks: Option<&[LineMark]>,
     mark_cell: &str,
+    solid_mark: &str,
     dropped: Option<&str>,
 ) -> Vec<String> {
     let (cols, rows) = size;
@@ -2534,9 +2555,10 @@ fn frame_rows(
     let highlight = view.highlight && profile != ColorProfile::Ascii;
     let spliced = |i: usize, line: &String| -> String {
         match (highlight, marks) {
-            (true, Some(ms)) => mark_cells(
+            (true, Some(ms)) => mark_cells_with(
                 line,
                 ms.get(start + i).map_or(&[][..], |m| m.cells.as_slice()),
+                (!solid_mark.is_empty()).then_some(solid_mark),
             ),
             _ => line.clone(),
         }
@@ -4004,6 +4026,7 @@ mod tests {
             "",
             None,
             "▌ ",
+            "",
             None,
         );
         assert_eq!(rows[0], "\x1b[31mred\x1b[0m");
@@ -4044,6 +4067,7 @@ mod tests {
             "",
             None,
             "▌ ",
+            "",
             None,
         );
         assert_eq!(rows[0], "plain");

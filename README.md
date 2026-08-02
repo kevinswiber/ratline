@@ -159,7 +159,9 @@ frame, and both work live, scrolled, frozen, or stepped back in time —
 a scrubbed frame shows what changed into it. `D` toggles a margin
 column marking the changed lines; `c` highlights the changed
 characters in place, in reverse video layered over the output's own
-colors. Run either or both. The marks stay put until the output
+colors — except glyphs whose ink coverage is the value (bar blocks,
+sparkline ticks, braille), which recolor their ink instead, so a bar
+never reads emptier at the moment it advances. Run either or both. The marks stay put until the output
 changes again, so on a slow dashboard they answer "what moved last",
 and they mark content only: a line that merely changed color stays
 unmarked, and so does pure whitespace reshuffling, like a table
