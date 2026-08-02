@@ -258,8 +258,8 @@ pub fn spawn_live_tick(
 /// Drain one pipe into a live source's shared caps, offering what it has
 /// as it goes.
 ///
-/// **Always runs to EOF**, exactly as `read_all` does and for the reason
-/// plan 0016 measured rather than reasoned about: an early exit does not
+/// **Always runs to EOF**, exactly as `read_all` does and for a reason
+/// that was measured rather than reasoned about: an early exit does not
 /// hang, it drops the pipe, the child dies of SIGPIPE, and the drop count
 /// comes back ZERO while everything past the bound is silently lost.
 fn pump_live<R: Read>(
