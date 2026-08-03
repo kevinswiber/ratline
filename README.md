@@ -805,7 +805,12 @@ Terminal does; others fall back to dark). The UI stream uses `CONOUT$`
 where unix uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`;
 `rat` enables VT processing on the console itself, so escapes are
 processed even in legacy conhost, which simply ignores the synchronized-
-output mode it doesn't implement (Windows Terminal supports it). Three
+output mode it doesn't implement (Windows Terminal supports it). A
+child that writes in the console's legacy codepage (OEM 437, 850, …)
+renders correctly: output that is not valid UTF-8 is decoded with the
+active console codepage, per line, and UTF-8 output passes through
+untouched — while a child emitting legacy bytes under a `chcp 65001`
+console still shows exactly what the console itself would show. Three
 notes:
 
 - The `v` key in `watch` prefers `less.exe` on PATH (Git for Windows,
