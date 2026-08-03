@@ -431,9 +431,13 @@ deliberately not refused, because `defaults interval="5s"` would
 otherwise be a load error for every live pane that inherits it, and a
 mixed dashboard is the normal shape. `interval "never"` means no
 replacement — the pane keeps its exit badge. A `trigger` on a live
-pane *restarts* the child: the running one is killed and the
+pane *restarts* the child: the running one is asked to exit
+(`SIGTERM`), forced two seconds later if it will not, and the
 replacement spawned once it is reaped, debounced like every other
-fire. Resizes and theme flips leave a live child alone — a follower
+fire. A child that handles the signal gets to flush a final line, and
+that line reaches the pane. (On Windows the restart is a hard kill;
+there is no polite signal to send.) Resizes and theme flips leave a
+live child alone — a follower
 mid-stream is not restarted for cosmetics — so give it a `trigger` if
 you want a handle to restart it by. `?` says all of this where the
 chrome row has no room to.
