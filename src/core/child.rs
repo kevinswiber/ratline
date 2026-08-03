@@ -45,8 +45,11 @@ impl ChildSlot {
         }
     }
 
-    /// Kill whatever is parked WITHOUT barring the slot — the supersede
-    /// verb, as distinct from `shutdown()`'s exit verb.
+    /// Ask whatever is parked to exit — SIGTERM, so the child may flush
+    /// a final line and close what it holds — WITHOUT barring the slot:
+    /// the supersede verb, as distinct from `shutdown()`'s exit verb.
+    /// On Windows there is no polite signal; the supersede stays a hard
+    /// kill (TerminateProcess) and `grace` is ignored.
     ///
     /// The distinction is load-bearing: `shutdown()` is called from
     /// `ShutdownGuard::Drop` on the way out of the process, where
@@ -67,9 +70,27 @@ impl ChildSlot {
     /// something hangs. The loop's trigger path gets this for free: a
     /// respawn request waits out single-in-flight, and the killed
     /// child's completion is what discharges it.
-    pub fn kill_current(&self) {
+    pub fn kill_current(&self, grace: std::time::Duration) {
         let mut state = self.lock();
-        if let Some(child) = state.child.as_mut() {
+        let Some(child) = state.child.as_mut() else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            let _ = grace;
+            let pid = child.id();
+            // TERM first: the child may flush and exit on its own.
+            // SAFETY: pid names the parked child, which is not yet
+            // reaped — the worker only reaps after taking it from this
+            // slot, and we hold the slot's lock — so the pid cannot
+            // have been reused.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = grace;
             let _ = child.kill();
         }
     }
@@ -1086,7 +1107,7 @@ mod tests {
         )
         .expect("spawn worker");
         wait_until_parked(&slot);
-        slot.kill_current();
+        slot.kill_current(Duration::ZERO);
         // The old worker's completion is the handshake: it means the
         // child is reaped, the readers are done, and the slot is free.
         let done = rx
@@ -1122,7 +1143,7 @@ mod tests {
         )
         .expect("spawn worker");
         wait_until_parked(&slot);
-        slot.kill_current();
+        slot.kill_current(Duration::ZERO);
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "a killed child must complete, or nothing can sequence a respawn"
@@ -1165,7 +1186,7 @@ mod tests {
 
     #[test]
     fn kill_current_on_an_empty_slot_is_a_no_op() {
-        ChildSlot::default().kill_current(); // must not panic or block
+        ChildSlot::default().kill_current(Duration::ZERO); // must not panic or block
     }
 
     #[test]
@@ -1174,7 +1195,7 @@ mod tests {
         // not resurrect a slot the exit path has already closed.
         let slot = ChildSlot::default();
         slot.shutdown();
-        slot.kill_current();
+        slot.kill_current(Duration::ZERO);
         let (tx, rx) = mpsc::channel();
         spawn_tick(
             sleeper(),
@@ -1218,7 +1239,7 @@ mod tests {
         .expect("spawn worker");
         wait_until_parked(&slot);
         let pid = slot.lock().child.as_ref().expect("parked").id();
-        slot.kill_current();
+        slot.kill_current(Duration::ZERO);
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "the killed child must complete"
@@ -1234,6 +1255,56 @@ mod tests {
         }
         #[cfg(windows)]
         let _ = pid;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_superseded_child_that_handles_term_flushes_and_exits_cleanly() {
+        // THE POINT of the ladder: SIGKILL can never deliver this line.
+        // The shell itself is the child (compound body, no exec) and owns
+        // the trap; `sleep 0.1` bounds trap latency under dash and macOS
+        // sh. A NAMED guard, the file's idiom: a failed assertion below
+        // must not leak a trap-loop child past the test.
+        let slot = ChildSlot::default();
+        let _shutdown = slot.guard();
+        let emissions = Emissions::new(ample(), ample());
+        let (tx, rx) = mpsc::channel();
+        spawn_live_tick(
+            script(
+                "trap 'echo bye-graceful; exit 0' TERM; echo ready; while :; do sleep 0.1; done",
+            ),
+            SourceId(0),
+            slot.clone(),
+            emissions.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+        // The trap must be installed before the signal: `ready` proves
+        // the shell reached the loop.
+        let body = wait_for_body(&emissions, Duration::from_secs(5));
+        assert_eq!(body.stdout, vec![b"ready\n".to_vec()]);
+        slot.kill_current(Duration::from_secs(5));
+        // Drain PAST the progress wakes: the `ready` publish queued one
+        // before the kill, and the completion is behind it.
+        let outcome = loop {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(TickEvent::Completed(outcome)) => break outcome,
+                Ok(TickEvent::Progress { .. }) => continue,
+                Err(_) => panic!("the superseded child never completed"),
+            }
+        };
+        let all = outcome.stdout.concat();
+        assert!(
+            contains(&all, b"bye-graceful"),
+            "the farewell never reached the final body: {:?}",
+            String::from_utf8_lossy(&all)
+        );
+        assert!(
+            outcome.status.is_some_and(|status| status.success()),
+            "a trap that exits 0 must be allowed to: {:?}",
+            outcome.status
+        );
     }
 
     #[test]

@@ -69,6 +69,14 @@ const ONCE_QUIET: Duration = Duration::from_secs(5);
 /// paces the respawn.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// How long a superseded live child gets between SIGTERM and the
+/// force-kill. Two seconds: measured TERM->exit latency for the
+/// representative children (a follower, rat's own __follow, a shell
+/// trap loop) is under 50 ms, so 2 s clears a compliant exit by more
+/// than an order of magnitude while bounding a TERM-ignoring child's
+/// staleness to less than one typical cadence.
+const SUPERSEDE_GRACE: Duration = Duration::from_secs(2);
+
 /// The newest composed frame and everything derived from it. Absent
 /// until the first child completes: the loop is live during that first
 /// run (q quits, keys dispatch), but there is nothing to paint yet.
@@ -1094,7 +1102,7 @@ pub(crate) fn run_registry(
                     // own completion discharges the request, as it
                     // always has.
                     if registry.spec(id).live {
-                        r.slot.kill_current();
+                        r.slot.kill_current(SUPERSEDE_GRACE);
                     }
                     // The one site where a respawn is trigger-driven. Recorded
                     // as an EVENT, never a running count: a count that cannot
