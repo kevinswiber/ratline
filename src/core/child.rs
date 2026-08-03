@@ -11,7 +11,10 @@
 //! bar and spawns/parks under ONE critical section (the lock spans
 //! the spawn), while `shutdown` takes the same lock — so it either
 //! kills a parked child or bars a spawn that has not happened yet.
-//! There is no window in between.
+//! There is no window in between. The supersede verb rides the same
+//! lock with a gentler ladder — TERM now, a generation-guarded force
+//! at its grace bound — while `shutdown` stays kill-only, because the
+//! way out must not wait.
 
 use std::io::Read;
 use std::process::Stdio;
@@ -30,6 +33,12 @@ pub struct ChildSlot(Arc<Mutex<SlotState>>);
 struct SlotState {
     child: Option<std::process::Child>,
     shutdown: bool,
+    /// Bumped when a child parks; an armed escalation force-kills only
+    /// its own generation, so a stale ladder can never hit a
+    /// replacement. A counter rather than a pid on purpose: pids are
+    /// reused, generations are not.
+    #[cfg_attr(windows, allow(dead_code))]
+    generation: u64,
 }
 
 impl ChildSlot {
@@ -46,10 +55,18 @@ impl ChildSlot {
     }
 
     /// Ask whatever is parked to exit — SIGTERM, so the child may flush
-    /// a final line and close what it holds — WITHOUT barring the slot:
-    /// the supersede verb, as distinct from `shutdown()`'s exit verb.
-    /// On Windows there is no polite signal; the supersede stays a hard
+    /// a final line and close what it holds — then force-kill at
+    /// `grace` if it has not gone, WITHOUT barring the slot: the
+    /// supersede verb, as distinct from `shutdown()`'s exit verb. On
+    /// Windows there is no polite signal; the supersede stays a hard
     /// kill (TerminateProcess) and `grace` is ignored.
+    ///
+    /// The escalation is generation-guarded: it force-kills only the
+    /// child it was armed for, so a deadline outliving its target can
+    /// never hit the replacement parked after it. Repeated calls during
+    /// one grace window are safe — each re-sends TERM (harmless) and
+    /// arms another guarded deadline, of which the earliest wins; there
+    /// is deliberately no "ladder armed" dedup state to get stale.
     ///
     /// The distinction is load-bearing: `shutdown()` is called from
     /// `ShutdownGuard::Drop` on the way out of the process, where
@@ -77,7 +94,6 @@ impl ChildSlot {
         };
         #[cfg(unix)]
         {
-            let _ = grace;
             let pid = child.id();
             // TERM first: the child may flush and exit on its own.
             // SAFETY: pid names the parked child, which is not yet
@@ -86,6 +102,27 @@ impl ChildSlot {
             // have been reused.
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            let generation = state.generation;
+            let armed = self.clone();
+            let escalation = std::thread::Builder::new()
+                .name("rat-watch-force".into())
+                .spawn(move || {
+                    std::thread::sleep(grace);
+                    let mut state = armed.lock();
+                    if state.generation == generation
+                        && let Some(child) = state.child.as_mut()
+                    {
+                        let _ = child.kill();
+                    }
+                });
+            if escalation.is_err() {
+                // No thread, no ladder: fall back to the old contract
+                // rather than leave a TERM-ignoring child superseding
+                // forever.
+                if let Some(child) = state.child.as_mut() {
+                    let _ = child.kill();
+                }
             }
         }
         #[cfg(windows)]
@@ -335,6 +372,7 @@ fn run_parked(
             Err(err) => return not_started(source, err),
         };
         let pipes = (child.stdout.take(), child.stderr.take());
+        state.generation += 1;
         state.child = Some(child);
         pipes
     };
@@ -593,6 +631,20 @@ mod tests {
             events.push(event);
         }
         events
+    }
+
+    /// The next completion on the channel, skipping the progress wakes
+    /// a live child queues ahead of it. `within` bounds each receive.
+    /// Unix-only like its callers, the ladder tests.
+    #[cfg(unix)]
+    fn await_completion(rx: &mpsc::Receiver<TickEvent>, within: Duration) -> TickOutcome {
+        loop {
+            match rx.recv_timeout(within) {
+                Ok(TickEvent::Completed(outcome)) => return outcome,
+                Ok(TickEvent::Progress { .. }) => continue,
+                Err(_) => panic!("no completion arrived within {within:?}"),
+            }
+        }
     }
 
     /// The line's text, with its platform terminator removed.
@@ -1287,13 +1339,7 @@ mod tests {
         slot.kill_current(Duration::from_secs(5));
         // Drain PAST the progress wakes: the `ready` publish queued one
         // before the kill, and the completion is behind it.
-        let outcome = loop {
-            match rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(TickEvent::Completed(outcome)) => break outcome,
-                Ok(TickEvent::Progress { .. }) => continue,
-                Err(_) => panic!("the superseded child never completed"),
-            }
-        };
+        let outcome = await_completion(&rx, Duration::from_secs(5));
         let all = outcome.stdout.concat();
         assert!(
             contains(&all, b"bye-graceful"),
@@ -1304,6 +1350,83 @@ mod tests {
             outcome.status.is_some_and(|status| status.success()),
             "a trap that exits 0 must be allowed to: {:?}",
             outcome.status
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_term_ignoring_child_is_forced_at_the_grace_deadline() {
+        // trap "" TERM = ignore. Without the escalation this child would
+        // supersede forever; with it, SIGKILL lands at the deadline and
+        // the status says which signal won.
+        use std::os::unix::process::ExitStatusExt as _;
+        let slot = ChildSlot::default();
+        let _shutdown = slot.guard();
+        let emissions = Emissions::new(ample(), ample());
+        let (tx, rx) = mpsc::channel();
+        spawn_live_tick(
+            script(r#"trap "" TERM; echo ready; while :; do sleep 0.1; done"#),
+            SourceId(0),
+            slot.clone(),
+            emissions.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+        let body = wait_for_body(&emissions, Duration::from_secs(5));
+        assert_eq!(body.stdout, vec![b"ready\n".to_vec()]);
+        slot.kill_current(Duration::from_millis(100));
+        let outcome = await_completion(&rx, Duration::from_secs(5));
+        assert_eq!(
+            outcome.status.and_then(|status| status.signal()),
+            Some(libc::SIGKILL),
+            "the deadline must be enforced with SIGKILL, on the child that ignored TERM"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_ladder_spares_the_replacement_child() {
+        // The supersede's escalation must die with its own generation.
+        // The TERMed sleeper exits fast, the replacement parks well
+        // before the 300 ms deadline, and the deadline must then find a
+        // LATER generation and stand down. Deterministic on both
+        // interleavings: deadline-before-park finds an empty slot,
+        // deadline-after-park finds generation n+1 — both spare.
+        let slot = ChildSlot::default();
+        let _shutdown = slot.guard();
+        let (tx, rx) = mpsc::channel();
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx.clone(),
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        wait_until_parked(&slot);
+        slot.kill_current(Duration::from_millis(300));
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the superseded child completes"
+        );
+        spawn_tick(
+            sleeper(),
+            SourceId(0),
+            slot.clone(),
+            tx,
+            Vec::new(),
+            ample(),
+        )
+        .expect("spawn worker");
+        wait_until_parked(&slot);
+        // Outlive the original deadline, then some.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(parked(&slot), "the stale ladder killed the replacement");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "no completion may arrive for a child nobody killed"
         );
     }
 
