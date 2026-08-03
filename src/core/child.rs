@@ -1430,6 +1430,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_does_not_wait_for_an_armed_grace_window() {
+        // The way out must not block: with a TERM-ignoring child
+        // mid-grace (30 s deadline), shutdown() SIGKILLs now. The
+        // completion arriving inside 5 s is the proof the exit path
+        // never inherited the ladder. Failure-path hygiene: the guard
+        // reclaims the trap-loop child if an assertion fires before the
+        // explicit shutdown() below.
+        let slot = ChildSlot::default();
+        let _shutdown = slot.guard();
+        let emissions = Emissions::new(ample(), ample());
+        let (tx, rx) = mpsc::channel();
+        spawn_live_tick(
+            script(r#"trap "" TERM; echo ready; while :; do sleep 0.1; done"#),
+            SourceId(0),
+            slot.clone(),
+            emissions.clone(),
+            tx,
+            Vec::new(),
+        )
+        .expect("spawn worker");
+        let body = wait_for_body(&emissions, Duration::from_secs(5));
+        assert_eq!(body.stdout, vec![b"ready\n".to_vec()]);
+        slot.kill_current(Duration::from_secs(30));
+        slot.shutdown();
+        let _ = await_completion(&rx, Duration::from_secs(5));
+        assert!(!parked(&slot), "and the slot stays barred and empty");
+    }
+
     #[test]
     fn an_outcome_carries_its_source_tag() {
         // The tag every per-source resource is indexed by: it rides the
