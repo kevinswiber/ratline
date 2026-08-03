@@ -2679,20 +2679,13 @@ fn compose_frame(
     stderr: &[u8],
     join_stderr: bool,
 ) -> Vec<String> {
-    let body = String::from_utf8_lossy(stdout);
     let mut lines: Vec<String> = Vec::new();
     if let Some(title) = title {
         lines.push(title.clone());
     }
-    lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
+    lines.extend(crate::core::decode::stream_lines(stdout));
     if join_stderr && !stderr.is_empty() {
-        let err_body = String::from_utf8_lossy(stderr);
-        lines.extend(
-            err_body
-                .trim_end_matches('\n')
-                .split('\n')
-                .map(str::to_string),
-        );
+        lines.extend(crate::core::decode::stream_lines(stderr));
     }
     lines
 }
@@ -3875,20 +3868,13 @@ fn interval_words(interval: Duration) -> String {
     format!("{secs}s")
 }
 
-/// A child's raw bytes as frame lines: lossy UTF-8, the trailing
-/// newline dropped, stderr lines after stdout's when present.
+/// A child's raw bytes as frame lines: decoded by `core::decode`, the
+/// trailing newline dropped, stderr lines after stdout's when present.
 fn output_lines(stdout: &[u8], stderr: &[u8]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    let body = String::from_utf8_lossy(stdout);
-    lines.extend(body.trim_end_matches('\n').split('\n').map(str::to_string));
+    lines.extend(crate::core::decode::stream_lines(stdout));
     if !stderr.is_empty() {
-        let err_body = String::from_utf8_lossy(stderr);
-        lines.extend(
-            err_body
-                .trim_end_matches('\n')
-                .split('\n')
-                .map(str::to_string),
-        );
+        lines.extend(crate::core::decode::stream_lines(stderr));
     }
     lines
 }

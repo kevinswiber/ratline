@@ -4,6 +4,7 @@ pub mod child;
 pub mod dashboard_file;
 pub mod dashboard_kdl;
 pub mod datetime;
+pub mod decode;
 pub mod duration;
 pub mod fuzzy;
 pub mod join;
