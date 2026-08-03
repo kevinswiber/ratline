@@ -18,6 +18,15 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// First index of `needle` in `haystack` — `contains`'s locating
+/// sibling, for the tests that assert ORDER within a byte stream.
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// When nextest KILLS one of the cycle tests: `period x terminate-after`
 /// from the matching override in `.config/nextest.toml`, which is
 /// `60s x 2`. Recorded because it is INVISIBLE where test authors choose
@@ -1686,7 +1695,7 @@ fn a_live_pane_bounded_at_its_cap_reports_the_drop() {
 }
 
 /// A single live pane with a `file:` trigger — the declaration whose
-/// contract these two tests settle.
+/// contract these tests settle.
 fn live_trigger_board(interval: &str, command: &str, trigger: &std::path::Path) -> String {
     format!(
         "row-gap 0\n\ndefaults {{\n    height 5\n    border \"rounded\"\n    shell #true\n}}\n\n\
@@ -1764,6 +1773,52 @@ fn a_trigger_respawns_a_live_child_that_already_exited() {
     assert!(
         wait_for(&session, &mut terminal, b"gone-2", Duration::from_secs(5)),
         "the trigger never revived the dead live pane"
+    );
+    assert_counter_settled_at(&counter, 2);
+}
+
+/// The supersede ladder at the trigger site: a fire delivers SIGTERM
+/// first, so a child that handles it flushes a farewell — which rides
+/// the completion into the frame — before the replacement spawns.
+/// Under the old SIGKILL supersede the farewell can never exist.
+#[test]
+fn a_trigger_fire_lets_the_live_child_flush_before_the_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (counter, poke) = (dir.path().join("counter"), dir.path().join("poke"));
+    seed(&poke, "seed\n");
+    // Run N prints ready-N and waits, trapping TERM to flush a
+    // farewell. Single quotes only (a KDL double-quoted string carries
+    // this verbatim); the shell IS the child (compound body, no exec)
+    // so the trap lives in the signalled process; `sleep 0.1` bounds
+    // trap latency; `tr -d` normalizes macOS wc's padding; every
+    // witness line is echo-terminated because the live feed withholds
+    // an unterminated line.
+    let cmd = format!(
+        "echo run >> {c}; echo ready-$(wc -l < {c} | tr -d ' '); \
+         trap 'echo bye-graceful; exit 0' TERM; while :; do sleep 0.1; done",
+        c = counter.display()
+    );
+    let decl = write_dashboard(dir.path(), &live_trigger_board("1h", &cmd, &poke));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"ready-1", Duration::from_secs(5)),
+        "the live pane never painted"
+    );
+    append(&poke, "fire\n");
+    // ONE capture for the whole restart sequence. The farewell is on
+    // screen only between the completion's paint and the replacement's
+    // (record_output replaces the body), so two sequential waits would
+    // race that window; the raw byte stream keeps everything painted.
+    let bytes = wait_for_bytes(&session, &mut terminal, b"ready-2", Duration::from_secs(10))
+        .expect("the replacement never painted");
+    let farewell = position(&bytes, b"bye-graceful")
+        .expect("the farewell never reached the frame — the child was not allowed to flush");
+    let replacement = position(&bytes, b"ready-2").expect("contained by the wait");
+    assert!(
+        farewell < replacement,
+        "the farewell must paint before the replacement does"
     );
     assert_counter_settled_at(&counter, 2);
 }

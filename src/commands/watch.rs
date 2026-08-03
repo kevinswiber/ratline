@@ -1098,9 +1098,11 @@ pub(crate) fn run_registry(
                     // forever. The revocable kill is what discharges
                     // it: the killed child's completion hands the slot
                     // back, and the surviving request spawns the
-                    // replacement. A batch child is NOT killed — its
-                    // own completion discharges the request, as it
-                    // always has.
+                    // replacement. The kill is TERM-first with a
+                    // bounded force, so a compliant child flushes
+                    // before the replacement spawns. A batch child is
+                    // NOT killed — its own completion discharges the
+                    // request, as it always has.
                     if registry.spec(id).live {
                         r.slot.kill_current(SUPERSEDE_GRACE);
                     }
