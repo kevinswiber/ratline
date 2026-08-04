@@ -3521,3 +3521,66 @@ fn the_banner_names_the_cadence_and_the_way_out() {
     session.write_bytes(b"q");
     assert!(!session.kill_if_alive(Duration::from_secs(2)));
 }
+
+#[test]
+fn a_trigger_ending_appends_its_own_row() {
+    use common::pty::{counter_cmd, wait_for_counter};
+
+    // The fd-EOF shape an_fd_source_ending_shows_one_notice… pins for
+    // the painted path, replayed in append mode: the fact must arrive
+    // as its own `rat watch: `-prefixed appended row, not a status-row
+    // repaint.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (r, w) = (fds[0], fds[1]);
+    assert_ne!(
+        unsafe { libc::fcntl(w, libc::F_SETFD, libc::FD_CLOEXEC) },
+        -1,
+        "cloexec on the write end"
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let counter = dir.path().join("count");
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &[
+            "watch",
+            "-n",
+            "2s",
+            "--append",
+            "--trigger",
+            &format!("fd:{r}"),
+            "--trigger-debounce",
+            "0ms",
+            "--shell",
+            "--",
+            &counter_cmd(&counter),
+        ],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn rat watch under a pty");
+    unsafe { libc::close(r) };
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"count-1", Duration::from_secs(5)),
+        "the first tick never appended"
+    );
+    unsafe { libc::close(w) };
+    let needle = format!("rat watch: trigger ended: fd:{r}");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        needle.as_bytes(),
+        Duration::from_secs(5),
+    );
+    assert!(
+        seen.is_some(),
+        "the trigger's end must append as its own prefixed row"
+    );
+    if let Some(seen) = seen {
+        assert_no_forbidden_escapes(&seen, "trigger-ended row");
+    }
+    // The heartbeat keeps ticking after the source ends.
+    wait_for_counter(&counter, 2);
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}

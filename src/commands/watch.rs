@@ -1224,7 +1224,21 @@ pub(crate) fn run_registry(
             // drops. Piped output is left alone entirely — a notice is
             // chrome, and the piped contract is frame lines. (The badge
             // still reaches a piped dashboard: it is IN those lines.)
-            if is_tty && let (true, Some(l)) = (!notices.is_empty() || badge_moved, live.as_ref()) {
+            if append {
+                // Chrome events become their own rows: this is the only
+                // surface here, and a one-shot row nobody paints is a
+                // row nobody hears. ONE LINE EACH, never joined with
+                // " · " — a listener parses lines. `badge_moved` is not
+                // consulted: apply_verdict takes `boxed = !plain` and
+                // returns false whenever it is false, so a plain
+                // watch's badge can never move.
+                if !notices.is_empty() {
+                    let rows: Vec<String> = notices.iter().map(|n| append_notice(n)).collect();
+                    append_rows(&mut std::io::stdout().lock(), rows, eol)?;
+                }
+            } else if is_tty
+                && let (true, Some(l)) = (!notices.is_empty() || badge_moved, live.as_ref())
+            {
                 previous_key = Some(repaint(
                     &mut renderer,
                     pause.as_ref(),
