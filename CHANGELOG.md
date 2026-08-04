@@ -2,6 +2,19 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.13.0](https://github.com/kevinswiber/ratto/compare/bfd8ba38b90964a4a0002fcd7694ada480956d1c..v0.13.0) - 2026-08-04
+#### Features
+- a legacy-codepage child renders clean on Windows - ([dee3243](https://github.com/kevinswiber/ratto/commit/dee324369e15c638df4a3da800021f30f01cbcb7)) - [@kevinswiber](https://github.com/kevinswiber)
+- the supersede's force-kill arrives on a generation-guarded deadline - ([6ce21a8](https://github.com/kevinswiber/ratto/commit/6ce21a82a3dbcaa1ca3050114a9d04434fc9c37a)) - [@kevinswiber](https://github.com/kevinswiber)
+- a superseded live child is asked before it is killed - ([bfd8ba3](https://github.com/kevinswiber/ratto/commit/bfd8ba38b90964a4a0002fcd7694ada480956d1c)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the Windows section says legacy-codepage child output decodes - ([a394afe](https://github.com/kevinswiber/ratto/commit/a394afe91fb8c2da185fe1701dfaadf388a17c5c)) - [@kevinswiber](https://github.com/kevinswiber)
+- the live-pane trigger restart asks before it kills - ([f4e737c](https://github.com/kevinswiber/ratto/commit/f4e737c44b6edd15802e3f548c57d43b0f3941ae)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- one display-side decode for child output - ([c51650c](https://github.com/kevinswiber/ratto/commit/c51650c6f3c5c6555943f1ed21431845304216e4)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.12.0](https://github.com/kevinswiber/ratto/compare/f966dede69b7f8656b28cbf41c2555da05771345..v0.12.0) - 2026-08-02
 #### Features
 - the wheel scrolls a captured frame - ([1b9e446](https://github.com/kevinswiber/ratto/commit/1b9e44626268c4271ee8cfbed0b08cebbbfdc310)) - [@kevinswiber](https://github.com/kevinswiber)
