@@ -40,6 +40,7 @@ works. Check yours with `rat doctor`.
 rat watch --interval 2s -- ./status.sh        # flicker-free live view
 rat watch --clear -- ./status.sh              # wipe the screen first, atomically
 rat watch --fullscreen -- ./status.sh         # alternate screen, restored on exit
+rat watch --append -- ./status.sh             # append frames; scrollback keeps them
 rat watch --once -- ./status.sh               # render one frame
 rat watch --shell -- 'date; df -h | head -3'  # through sh -c
 ```
@@ -53,7 +54,7 @@ readable. The interval is the quiet time between runs: a command slower
 than its interval never overlaps itself — the next run simply waits its
 turn.
 
-Two screen contracts, and a flag to pick one. The default paints
+Three screen contracts, and a flag to pick one. The default paints
 inline: the frame sits under your last command, the session reads as a
 transcript, and exit leaves the last frame behind. `--fullscreen`
 (watch and dashboard both) takes the alternate screen instead, like
@@ -62,6 +63,21 @@ screen, and exit restores your terminal exactly as it was — the frames
 never enter scrollback, so keep a frame with `S` rather than by
 scrolling back. Ignored when piped. (A hard `SIGKILL` can leave the
 terminal on the alternate screen; `reset` recovers.)
+
+`--append` (watch only) is the opposite bargain: every distinct frame
+is appended to the scrollback as plain lines — no status row, no
+repainting, nothing ever rewritten — so the terminal's own scrollback
+holds the whole history and its wheel does the scrolling. Duplicate
+frames still write nothing, and rat speaks in whole lines prefixed
+`rat watch: ` when it has something to say (a trigger ending, lines
+dropped, the command's exit status changing). Four keys work — `q`
+quits, `Ctrl-C` aborts, `S` snapshots, `?` lists exactly this — and
+every viewport key is deliberately inert; the scrollback is the
+viewport. This mode exists for linear readers of all kinds: in our
+testing with VoiceOver in macOS Terminal, appended lines were announced
+as they arrived while in-place repaints were not, and a slower
+`--interval` gives each announcement room to finish. Ignored when
+piped: a piped watch already appends.
 
 Beside (or instead of) the interval, `--trigger` refreshes on an
 external event. The sweet spot is two speeds — a slow heartbeat for what
