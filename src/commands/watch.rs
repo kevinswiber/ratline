@@ -544,6 +544,9 @@ pub(crate) fn run_registry(
     // stays None in append mode, which also keeps the 1 Hz age-refresh
     // arm structurally inert.
     let mut previous_append: Option<u64> = None;
+    // The last SPOKEN exit badge — append mode's second, independent
+    // gate (the exit stays out of the frame hash).
+    let mut prev_exit: Option<String> = None;
     let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
@@ -719,6 +722,12 @@ pub(crate) fn run_registry(
         // its stdout is somebody's data — so this rides stderr, beside
         // where a spawn error already goes.
         let mut piped_dropped: Option<String> = None;
+        // Append mode's exit fact for this iteration's Plain outcome —
+        // Some only when the child actually RAN: a spawn error has no
+        // status, carries its reason as frame content, and must neither
+        // speak nor update prev_exit (exit_badge(None) would read as a
+        // clean exit and fake a recovery).
+        let mut plain_exit: Option<Option<String>> = None;
         while let Ok(event) = rx.try_recv() {
             let outcome = match event {
                 TickEvent::Completed(outcome) => outcome,
@@ -828,6 +837,9 @@ pub(crate) fn run_registry(
                     r.truncated = truncated.clone();
                     piped_dropped = truncated;
                     piped_stderr = stderr;
+                    if outcome.status.is_some() {
+                        plain_exit = Some(exit_badge(outcome.status));
+                    }
                     changed_now
                 }
                 Composition::Panes { .. } => {
@@ -1031,6 +1043,14 @@ pub(crate) fn run_registry(
                         append_frame(&current.lines, current.dropped.as_deref()),
                         eol,
                     )?;
+                }
+                // The exit status has its OWN gate: a command can print
+                // byte-identical output and START failing.
+                if once_ready && let Some(now) = plain_exit.take() {
+                    if let Some(row) = append_exit_line(prev_exit.as_deref(), now.as_deref()) {
+                        append_rows(&mut std::io::stdout().lock(), vec![row], eol)?;
+                    }
+                    prev_exit = now;
                 }
             } else if once_ready && previous_key != Some(key) {
                 previous_key = Some(key);
@@ -2303,6 +2323,27 @@ fn append_action_for(key: Key) -> AppendAction {
 /// output that distinction has nowhere else to live.
 fn append_notice(text: &str) -> String {
     format!("rat watch: {text}")
+}
+
+/// The child's exit status as a row, or None when nothing changed.
+///
+/// Kept OUT of the frame hash ON PURPOSE: folding it in would change
+/// WHEN THE PIPED PATH RE-EMITS a frame — a command printing identical
+/// bytes while flipping 0 to 1 would start re-emitting — and those
+/// bytes are frozen. Two independent gates instead.
+///
+/// Silence means success: a first tick that exits 0 says nothing; a
+/// recovery speaks, because "it passes now" is the moment worth
+/// hearing. (Plain watch shows the exit code nowhere else — this row
+/// is new information, not moved chrome.)
+fn append_exit_line(previous: Option<&str>, current: Option<&str>) -> Option<String> {
+    if previous == current {
+        return None;
+    }
+    Some(match current {
+        Some(badge) => format!("rat watch: {badge}"),
+        None => "rat watch: exit 0".to_string(),
+    })
 }
 
 /// The one startup row. Removing the footer removes `· ? help` — the
@@ -4311,6 +4352,20 @@ mod tests {
         // live_suffix's output, never a second spelling.
         let tail = live_suffix(false, Some("2s"), false);
         assert_eq!(append_banner(&tail), format!("rat watch: appending{tail}"));
+    }
+
+    #[test]
+    fn the_exit_row_speaks_only_on_a_transition() {
+        assert_eq!(append_exit_line(None, None), None);
+        assert_eq!(
+            append_exit_line(None, Some("exit 3")),
+            Some("rat watch: exit 3".to_string())
+        );
+        assert_eq!(append_exit_line(Some("exit 3"), Some("exit 3")), None);
+        assert_eq!(
+            append_exit_line(Some("exit 3"), None),
+            Some("rat watch: exit 0".to_string())
+        );
     }
 
     #[test]

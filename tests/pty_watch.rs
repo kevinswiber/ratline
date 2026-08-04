@@ -3584,3 +3584,80 @@ fn a_trigger_ending_appends_its_own_row() {
     session.write_bytes(b"q");
     assert!(!session.kill_if_alive(Duration::from_secs(2)));
 }
+
+#[test]
+fn a_failing_child_appends_its_exit_and_says_so_when_it_recovers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("probe.sh");
+    let write_script = |body: &str| {
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("write script");
+        let mut perms = std::fs::metadata(&script).expect("meta").permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod");
+    };
+    // Phase a: a real child that fails.
+    write_script("echo phase-a; exit 3");
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &[
+            "watch",
+            "-n",
+            "1",
+            "--append",
+            "--",
+            &script.display().to_string(),
+        ],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for_bytes(
+            &session,
+            &mut terminal,
+            b"rat watch: exit 3",
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "a real failure appends its exit row"
+    );
+    // Phase b: DELETE the executable itself — the spawn fails with no
+    // status at all (a wrapper would itself spawn fine and exit 127,
+    // missing this branch). The reason is frame content; no exit row —
+    // and in particular no false `exit 0`.
+    std::fs::remove_file(&script).expect("rm script");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"o such file",
+        Duration::from_secs(5),
+    )
+    .expect("the spawn error renders as frame content");
+    assert!(
+        !contains(&seen, b"rat watch: exit"),
+        "a spawn error must not speak an exit row: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    let extra = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        !contains(&extra, b"rat watch: exit"),
+        "a spawn error must not speak an exit row (settle): {:?}",
+        String::from_utf8_lossy(&extra)
+    );
+    // Phase c: the real recovery speaks.
+    write_script("echo phase-c; exit 0");
+    assert!(
+        wait_for_bytes(
+            &session,
+            &mut terminal,
+            b"rat watch: exit 0",
+            Duration::from_secs(5)
+        )
+        .is_some(),
+        "\"it passes now\" is the moment worth hearing"
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
