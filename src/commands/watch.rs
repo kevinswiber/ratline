@@ -555,6 +555,16 @@ pub(crate) fn run_registry(
         highlight: false,
         alt_time: false,
     };
+    // `append && interactive` ⟺ append && !once (append implies
+    // is_tty), and live_suffix returns "" under --once — so this also
+    // never prints a useless stub on a one-shot run.
+    if append && interactive {
+        append_rows(
+            &mut std::io::stdout().lock(),
+            vec![append_banner(&live_tail)],
+            eol,
+        )?;
+    }
     loop {
         // 1. Signals — checked every slice, child running or not.
         if interrupted.load(Ordering::Relaxed) {
@@ -1467,6 +1477,51 @@ pub(crate) fn run_registry(
         // repaints once, not once per notch.
         let events = fold_wheel(events);
         for event in events {
+            if append {
+                // Append mode's own dispatch, BEFORE the shared match,
+                // so the painted table stays byte-frozen. The `continue`
+                // also drops Mouse and theme events — none can arrive
+                // (--mouse conflicts; the subscription is gated off) —
+                // and keeps every painted key arm unreachable.
+                if let TapEvent::Key(key) = event {
+                    match append_action_for(key) {
+                        AppendAction::Abort => {
+                            // A near no-op — nothing was hidden — but
+                            // every exit path restores through the same
+                            // call; an exit that reads differently is
+                            // one that drifts.
+                            renderer.finish().context("restoring terminal")?;
+                            return Err(AppError::Aborted);
+                        }
+                        AppendAction::Quit => {
+                            renderer.finish().context("restoring terminal")?;
+                            return Ok(());
+                        }
+                        AppendAction::Snapshot => {
+                            let Some(l) = live.as_ref() else { continue };
+                            let text = snapshot_frame(
+                                &l.lines,
+                                session.snapshot_dir.as_deref(),
+                                session.snapshot_ansi,
+                            );
+                            append_rows(
+                                &mut std::io::stdout().lock(),
+                                vec![append_notice(&text)],
+                                eol,
+                            )?;
+                        }
+                        AppendAction::Help => {
+                            append_rows(
+                                &mut std::io::stdout().lock(),
+                                append_help_lines(&session.help_extra),
+                                eol,
+                            )?;
+                        }
+                        AppendAction::Ignore => {}
+                    }
+                }
+                continue;
+            }
             match event {
                 TapEvent::Key(_) | TapEvent::Mouse(_) => {
                     let action = match event {
@@ -2198,6 +2253,77 @@ enum WatchAction {
     ToggleTime,
     ToggleMouse,
     Ignore,
+}
+
+/// What append mode does with one key. A separate, CLOSED vocabulary —
+/// not a FrameMode arm — because the set is four and must stay four:
+/// everything rat's viewport keys drive (scroll, freeze, scrub, wrap,
+/// shift, gutter, highlight, time style, mouse) is inert here BY
+/// DESIGN. The terminal's own scrollback is the review surface, so
+/// consuming those keys would take something away and give nothing
+/// back. `t` in particular must stay inert — it is what arms the
+/// once-per-second counting footer.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum AppendAction {
+    Abort,
+    Quit,
+    Snapshot,
+    Help,
+    Ignore,
+}
+
+/// Append mode's key table — see [`AppendAction`] for why it is closed.
+fn append_action_for(key: Key) -> AppendAction {
+    match key {
+        Key::CtrlC => AppendAction::Abort,
+        Key::Char('q') => AppendAction::Quit,
+        Key::Char('S') => AppendAction::Snapshot,
+        Key::Char('?') => AppendAction::Help,
+        _ => AppendAction::Ignore,
+    }
+}
+
+/// A chrome event as a spoken row. The `rat watch: ` prefix is the
+/// piped drop marker's own — one prefix, one meaning: this row is rat
+/// talking, not the command. In a linear stream mixed with child
+/// output that distinction has nowhere else to live.
+fn append_notice(text: &str) -> String {
+    format!("rat watch: {text}")
+}
+
+/// The one startup row. Removing the footer removes `· ? help` — the
+/// only discoverability breadcrumb rat ships — and the cadence; this
+/// line replaces both, once, before the first frame, so it costs no
+/// re-announcement. `tail` is `live_suffix`'s output: the one home of
+/// the interval's meaning.
+fn append_banner(tail: &str) -> String {
+    format!("rat watch: appending{tail}")
+}
+
+/// The key reference, APPENDED rather than paged — everything this
+/// mode says it says by appending, and the pager is an in-place
+/// alternate-screen surface, the exact thing the mode avoids. The
+/// shared `help_lines` is not reused: twenty of its keys are inert
+/// here, and a reference that names inert keys teaches a mode that
+/// does not exist.
+fn append_help_lines(extra: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = [
+        "rat watch --append — keys",
+        "",
+        "  q                  quit",
+        "  Ctrl-C             abort",
+        "  S                  snapshot the newest frame to a file",
+        "  ?                  this key reference",
+        "",
+        "  Every frame rat has printed is still in the terminal's own",
+        "  scrollback — scroll there to review. rat's viewport keys are",
+        "  inert in this mode on purpose.",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    lines.extend(extra.iter().cloned());
+    lines
 }
 
 /// The whole binding table, for both input paths and every mode — unix and
@@ -4102,6 +4228,84 @@ mod tests {
     use super::*;
 
     const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
+
+    #[test]
+    fn the_append_key_table_answers_only_the_four_keys() {
+        // ENUMERATED over every key action_for binds — a checklist of
+        // remembered keys is not proof that no other key is live.
+        let bound = [
+            Key::CtrlC,
+            Key::Char('q'),
+            Key::Char('v'),
+            Key::Enter,
+            Key::Char('?'),
+            Key::Char('S'),
+            Key::Char('j'),
+            Key::Down,
+            Key::Char('k'),
+            Key::Up,
+            Key::Char('d'),
+            Key::Char('u'),
+            Key::Char('f'),
+            Key::PageDown,
+            Key::Char('b'),
+            Key::PageUp,
+            Key::Char('g'),
+            Key::Home,
+            Key::Char('G'),
+            Key::End,
+            Key::Char('w'),
+            Key::Char('h'),
+            Key::Left,
+            Key::Char('l'),
+            Key::Right,
+            Key::Char('D'),
+            Key::Char('c'),
+            Key::Char('t'),
+            Key::Char('m'),
+            Key::Esc,
+            Key::Char('F'),
+            Key::Char('p'),
+            Key::Char('<'),
+            Key::Char(','),
+            Key::Char('>'),
+            Key::Char('.'),
+        ];
+        for key in bound {
+            let expect = match key {
+                Key::CtrlC => AppendAction::Abort,
+                Key::Char('q') => AppendAction::Quit,
+                Key::Char('S') => AppendAction::Snapshot,
+                Key::Char('?') => AppendAction::Help,
+                _ => AppendAction::Ignore,
+            };
+            assert_eq!(append_action_for(key), expect, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_append_reference_names_every_key_the_table_answers() {
+        let lines = append_help_lines(&[]).join("\n");
+        for needle in ["q  ", "Ctrl-C", "S  ", "?  "] {
+            assert!(lines.contains(needle), "missing {needle:?} in {lines}");
+        }
+    }
+
+    #[test]
+    fn the_append_banner_carries_the_run_constant_tail() {
+        // One home for the cadence's meaning: the banner reuses
+        // live_suffix's output, never a second spelling.
+        let tail = live_suffix(false, Some("2s"), false);
+        assert_eq!(append_banner(&tail), format!("rat watch: appending{tail}"));
+    }
+
+    #[test]
+    fn a_notice_row_wears_the_rat_prefix() {
+        assert_eq!(
+            append_notice("trigger ended: fifo:/tmp/x"),
+            "rat watch: trigger ended: fifo:/tmp/x"
+        );
+    }
 
     #[test]
     fn an_append_frame_with_nothing_dropped_is_the_sealed_body() {

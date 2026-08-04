@@ -3368,3 +3368,156 @@ fn append_once_prints_one_frame_and_exits() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn the_viewport_keys_append_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let script = format!("echo run >> {c}; echo steady", c = count.display());
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--shell", "--", &script],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    wait_for(&session, &mut terminal, b"steady", Duration::from_secs(5));
+    // Every viewport key, including `t` — the counting-footer metronome
+    // must be unarmable here.
+    session.write_bytes(b"jGptv<");
+    let before = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    common::pty::wait_for_counter(&count, before + 2);
+    let extra = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        extra.is_empty(),
+        "a viewport key appended bytes: {:?}",
+        String::from_utf8_lossy(&extra)
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn question_mark_appends_the_key_reference() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--", &rat, "style", "hi"],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    wait_for(&session, &mut terminal, b"hi", Duration::from_secs(5));
+    session.write_bytes(b"?");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"rat watch --append \xe2\x80\x94 keys",
+        Duration::from_secs(5),
+    )
+    .expect("the appended reference");
+    let more = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"q                  quit",
+        Duration::from_secs(2),
+    );
+    assert!(
+        more.is_some() || contains(&seen, b"q                  quit"),
+        "the reference names the way out"
+    );
+    assert!(
+        !contains(&seen, b"\x1b[?1049"),
+        "the reference APPENDS; the pager's alternate screen must not open"
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn s_appends_the_snapshot_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--", &rat, "style", "hi"],
+        &[
+            ("RAT_APPEARANCE", "dark"),
+            ("NO_COLOR", "1"),
+            ("RAT_SNAPSHOT_DIR", &dir.path().display().to_string()),
+        ],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    wait_for(&session, &mut terminal, b"hi", Duration::from_secs(5));
+    session.write_bytes(b"S");
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"rat watch: snapshot \xe2\x86\x92 ",
+        Duration::from_secs(5),
+    );
+    assert!(seen.is_some(), "the snapshot notice appends as its own row");
+    let snapshots = std::fs::read_dir(dir.path()).expect("read dir").count();
+    assert_eq!(snapshots, 1, "one snapshot file lands in the directory");
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn q_quits_and_ctrl_c_aborts_an_append_session() {
+    let rat = rat_bin();
+    for key in [&b"q"[..], &b"\x03"[..]] {
+        let session = PtySession::spawn(
+            &rat,
+            &["watch", "-n", "1", "--append", "--", &rat, "style", "hi"],
+            &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+        )
+        .expect("spawn");
+        let mut terminal = FakeTerminal::dark();
+        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(5));
+        session.write_bytes(key);
+        assert!(
+            !session.kill_if_alive(Duration::from_secs(2)),
+            "{key:?} must end the session"
+        );
+    }
+}
+
+#[test]
+fn the_banner_names_the_cadence_and_the_way_out() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--", &rat, "style", "hi"],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(&session, &mut terminal, b"hi", Duration::from_secs(5))
+        .expect("first frame");
+    let banner = find_at(&seen, b"rat watch: appending").expect("the banner");
+    let frame = find_at(&seen, b"hi").expect("the frame");
+    assert!(
+        banner < frame,
+        "the banner leads, once, before the first frame"
+    );
+    assert!(
+        contains(
+            &seen,
+            b"rat watch: appending \xc2\xb7 every 1 \xc2\xb7 ? help"
+        ),
+        "the banner carries the cadence and the way out: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    let tail = &seen[banner + 1..];
+    assert!(
+        find_at(tail, b"rat watch: appending").is_none(),
+        "the banner never repeats"
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
