@@ -485,6 +485,16 @@ pub struct WatchArgs {
     /// Chop long lines instead of wrapping (toggle at runtime with `w`)
     #[arg(long)]
     pub no_wrap: bool,
+    /// Append each distinct frame to the scrollback as plain lines
+    /// instead of repainting in place: every frame persists where
+    /// scrollback review — and a screen reader reading new terminal
+    /// output — can reach it. No status row, no chrome. Ignored when
+    /// output is piped: a piped watch already appends
+    #[arg(
+        long,
+        conflicts_with_all = ["clear", "fullscreen", "mouse", "max_height", "no_wrap"]
+    )]
+    pub append: bool,
     /// Command to run each tick (after --)
     #[arg(last = true, required = true)]
     pub command: Vec<String>,

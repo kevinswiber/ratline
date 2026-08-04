@@ -144,6 +144,11 @@ pub(crate) struct SessionArgs {
     /// Reflow boxes and respawn every source on a resize; off means the
     /// spawn step owns the geometry re-measure (one writer per mode).
     pub resize_respawn: bool,
+    /// Append distinct frames to the scrollback instead of repainting
+    /// in place (watch-only; a TTY concern — piped output already
+    /// appends, so the loop gates this on ttyness).
+    #[allow(dead_code)] // staged: read by the append arm (task 2.2)
+    pub append: bool,
 }
 
 /// Parse the watch flags, build the one-source registry, run it. The
@@ -208,6 +213,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         help_heading: "rat watch — keys",
         help_extra,
         resize_respawn: false,
+        append: args.append,
     };
     run_registry(registry, session, profile, palette)
 }

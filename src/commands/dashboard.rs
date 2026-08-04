@@ -50,6 +50,10 @@ pub fn run(args: DashboardArgs, profile: ColorProfile, palette: Palette) -> AppR
         // Boxes are allocated from the terminal width, so a resize
         // reflows and every child is respawned under the new geometry.
         resize_respawn: true,
+        // Append is watch-only today: a dashboard's composed panes
+        // don't linearize, and this arm's resize/reflow machinery would
+        // need its own treatment first.
+        append: false,
     };
     run_registry(registry, session, profile, palette)
 }

@@ -367,6 +367,121 @@ fn a_trigger_conflicts_with_once() {
 }
 
 #[test]
+fn append_conflicts_with_fullscreen() {
+    rat()
+        .args([
+            "watch",
+            "--append",
+            "--fullscreen",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--append"))
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn append_conflicts_with_clear() {
+    rat()
+        .args([
+            "watch",
+            "--append",
+            "--clear",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--append"))
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn append_conflicts_with_mouse() {
+    rat()
+        .args([
+            "watch",
+            "--append",
+            "--mouse",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--append"))
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn append_conflicts_with_max_height() {
+    rat()
+        .args([
+            "watch",
+            "--append",
+            "--max-height",
+            "5",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--append"))
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn append_conflicts_with_no_wrap() {
+    rat()
+        .args([
+            "watch",
+            "--append",
+            "--no-wrap",
+            "--",
+            &rat_bin(),
+            "style",
+            "hi",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("--append"))
+        .stderr(predicates::str::contains("cannot be used with"));
+}
+
+#[test]
+fn append_is_ignored_when_piped() {
+    // A piped watch already IS the appended stream, so the flag changes
+    // nothing there: byte-identical with
+    // a_child_inside_the_bound_says_nothing_at_all's run.
+    let assert = rat()
+        .args([
+            "watch",
+            "--once",
+            "--append",
+            "--",
+            &rat_bin(),
+            "__lines",
+            "3",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8_lossy(&assert.get_output().stdout),
+        "0\n1\n2\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&assert.get_output().stderr), "");
+}
+
+#[test]
 fn a_trigger_debounce_requires_a_trigger() {
     rat()
         .args([
