@@ -147,7 +147,6 @@ pub(crate) struct SessionArgs {
     /// Append distinct frames to the scrollback instead of repainting
     /// in place (watch-only; a TTY concern — piped output already
     /// appends, so the loop gates this on ttyness).
-    #[allow(dead_code)] // staged: read by the append arm (task 2.2)
     pub append: bool,
 }
 
@@ -238,12 +237,21 @@ pub(crate) fn run_registry(
     // Gate on interactive, not merely is_tty: a --once run must not
     // paint into a buffer nobody sees.
     let fullscreen = interactive && session.fullscreen;
+    // is_tty, not interactive: a --once --append run on a terminal must
+    // still append. Piped stdout ignores the flag entirely — the piped
+    // path already IS the appended stream, which is what keeps its
+    // bytes frozen by construction.
+    let append = is_tty && session.append;
+    // Raw mode clears OPOST/ONLCR, so LF alone drops a row without
+    // returning the column (src/term/inline.rs's rule). A --once run
+    // never enables raw mode and keeps the terminal's own ONLCR.
+    let eol = if interactive { "\r\n" } else { "\n" };
     // Framing only makes sense on a terminal; piped output gets the plain
     // content so `rat watch | tee log` stays readable. Fullscreen
     // subsumes --clear: the same wipe-and-home inside the first frame
     // is what homes the origin on the fresh alternate screen.
     let mut renderer = InlineRenderer::new(stdout.lock())
-        .with_cursor_hidden(is_tty && !session.no_hide_cursor)
+        .with_cursor_hidden(is_tty && !session.no_hide_cursor && !append)
         .with_sync_output(is_tty && !session.no_sync)
         .with_clear_screen(is_tty && (session.clear || fullscreen));
     // The event-wait routes need a terminal to wake; only the stat-poll
@@ -308,10 +316,17 @@ pub(crate) fn run_registry(
     // theme changes while this is live, and only the reader above ever
     // sees them.
     #[cfg(unix)]
-    let mut theme_sub = may_subscribe(palette.source, profile, interactive && tap.is_some())
-        .then(|| ThemeNotifyGuard::subscribe(std::io::stdout()))
-        .transpose()
-        .context("subscribing to theme notifications")?;
+    let mut theme_sub = may_subscribe(
+        palette.source,
+        profile,
+        // No live theme re-verification in append mode: an adoption
+        // respawn would re-announce a frame that only changed color.
+        // Children still get the startup verdict via RAT_APPEARANCE.
+        interactive && tap.is_some() && !append,
+    )
+    .then(|| ThemeNotifyGuard::subscribe(std::io::stdout()))
+    .transpose()
+    .context("subscribing to theme notifications")?;
     #[cfg(unix)]
     let mut verify = VerifyState::default();
 
@@ -523,6 +538,12 @@ pub(crate) fn run_registry(
     let once_started = Instant::now();
     let mut once_notice_sent = false;
     let mut previous_key: Option<PaintKey> = None;
+    // Append mode's gate: CONTENT ONLY. A PaintKey carries the terminal
+    // size and the palette, and on a TTY both move — a resize or theme
+    // flip must never re-announce an unchanged frame. `previous_key`
+    // stays None in append mode, which also keeps the 1 Hz age-refresh
+    // arm structurally inert.
+    let mut previous_append: Option<u64> = None;
     let mut live: Option<Live> = None;
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
@@ -942,9 +963,12 @@ pub(crate) fn run_registry(
                     Composition::Panes { .. } => None,
                 },
             };
-            if is_tty {
+            if is_tty && !append {
                 // Every distinct frame is retained (byte-capped,
                 // deduped) so the scrub keys can walk back through it.
+                // Scrub, freeze, and the change marks are the ring's
+                // only readers, and append answers none of those keys —
+                // the terminal's scrollback is the review surface.
                 history.record(current.hash, &current.lines, newest);
             }
             // A resize while frozen must not leave the window past the frame.
@@ -985,7 +1009,20 @@ pub(crate) fn run_registry(
             // wave (some panes still running) composes and records but
             // must not reach the terminal or the pipe.
             let once_ready = !session.once || runtime.iter().all(|r| r.posted);
-            if once_ready && previous_key != Some(key) {
+            if append {
+                // The linear stream: one write per DISTINCT frame, and
+                // never a rewrite. The whole frame appends (measured
+                // shape), sealed by append_frame, terminated for the
+                // live line discipline.
+                if once_ready && previous_append != Some(current.hash) {
+                    previous_append = Some(current.hash);
+                    append_rows(
+                        &mut std::io::stdout().lock(),
+                        append_frame(&current.lines, current.dropped.as_deref()),
+                        eol,
+                    )?;
+                }
+            } else if once_ready && previous_key != Some(key) {
                 previous_key = Some(key);
                 if is_tty {
                     repaint(
@@ -2704,7 +2741,6 @@ fn compose_frame(
 /// standalone rows carry user-provided text (a trigger path, a
 /// snapshot path) that can smuggle an open escape toward the shell
 /// prompt. Rows that open nothing pass through byte-identical.
-#[allow(dead_code)] // staged: wired by the append arm (task 2.2)
 fn append_rows<W: Write>(out: &mut W, rows: Vec<String>, eol: &str) -> anyhow::Result<()> {
     for row in rows {
         for sealed in seal_rows(vec![row]) {
@@ -2725,7 +2761,6 @@ fn append_rows<W: Write>(out: &mut W, rows: Vec<String>, eol: &str) -> anyhow::R
 /// self-delimits, and unchanged rows inside a changed frame re-read
 /// per burst by design. The marker wording is the piped sentence
 /// verbatim: one wording per fact.
-#[allow(dead_code)] // staged: wired by the append arm (task 2.2)
 fn append_frame(lines: &[String], dropped: Option<&str>) -> Vec<String> {
     let mut rows = seal_rows(lines.to_vec());
     if let Some(text) = dropped {

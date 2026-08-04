@@ -16,6 +16,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Byte offset of `needle` in `haystack`, if present.
+fn find_at(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Accumulate everything the session writes within `total` — unlike
 /// `read_available`, which returns at the first chunk.
 fn drain_for(session: &PtySession, total: std::time::Duration) -> Vec<u8> {
@@ -3107,4 +3115,256 @@ fn the_pager_round_trip_releases_and_recaptures_the_mouse() {
     );
     session.write_bytes(b"q");
     assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+// ---------------------------------------------------------------------------
+// --append: the linear stream (plan-fixed contracts; the mode appends
+// distinct frames as plain rows and never rewrites one).
+
+/// Every escape the in-place engine uses; none may reach an append
+/// session's stream.
+const APPEND_FORBIDDEN: [&[u8]; 6] = [
+    b"\x1b[?25l",  // hide cursor
+    b"\x1b[0J",    // erase below
+    b"\x1b[2K",    // erase line
+    b"\x1b[?2026", // synchronized output
+    b"\x1b[1A",    // cursor up
+    b"\x1b[?1049", // alternate screen
+];
+
+fn assert_no_forbidden_escapes(bytes: &[u8], context: &str) {
+    for escape in APPEND_FORBIDDEN {
+        assert!(
+            !contains(bytes, escape),
+            "{context}: found {:?} in {:?}",
+            String::from_utf8_lossy(escape),
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+#[test]
+fn append_writes_plain_rows_and_never_moves_the_cursor() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--", &rat, "style", "hi"],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(&session, &mut terminal, b"hi", Duration::from_secs(5))
+        .expect("first frame");
+    assert_no_forbidden_escapes(&seen, "first frame");
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn the_appended_rows_end_crlf() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--", &rat, "style", "hi"],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(&session, &mut terminal, b"hi\r\n", Duration::from_secs(5))
+        .expect("raw mode clears ONLCR, so the row must carry its own CRLF");
+    assert_no_forbidden_escapes(&seen, "crlf frame");
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn an_identical_frame_appends_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let script = format!("echo run >> {c}; echo steady", c = count.display());
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--shell", "--", &script],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let first = wait_for_bytes(&session, &mut terminal, b"steady", Duration::from_secs(5))
+        .expect("first frame");
+    assert_no_forbidden_escapes(&first, "first frame");
+    // The child keeps running (counter is the evidence) while the
+    // byte-identical frames write nothing.
+    common::pty::wait_for_counter(&count, 3);
+    let extra = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        extra.is_empty(),
+        "an unchanged frame appended bytes: {:?}",
+        String::from_utf8_lossy(&extra)
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn a_changed_frame_appends_the_whole_frame_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let script = format!(
+        "echo run >> {c}; n=$(wc -l < {c} | tr -d ' '); echo head-$n; echo alpha; echo omega",
+        c = count.display()
+    );
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--shell", "--", &script],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    wait_for(&session, &mut terminal, b"head-1", Duration::from_secs(5));
+    // The SECOND burst arrives whole and ordered — whole-frame
+    // appending is the settled shape. One accumulate loop: a burst can
+    // land in one chunk, so sequential waits could eat their own needle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no ordered second burst in {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        let chunk = session.read_available(Duration::from_millis(50));
+        if chunk.is_empty() {
+            continue;
+        }
+        terminal.respond(&session, &chunk);
+        seen.extend_from_slice(&chunk);
+        if let Some(head) = find_at(&seen, b"head-2")
+            && let Some(alpha) = find_at(&seen[head..], b"alpha")
+            && find_at(&seen[head + alpha..], b"omega").is_some()
+        {
+            break;
+        }
+    }
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn a_resize_appends_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let script = format!("echo run >> {c}; echo steady", c = count.display());
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "-n", "1", "--append", "--shell", "--", &script],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    wait_for(&session, &mut terminal, b"steady", Duration::from_secs(5));
+    let before = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    // The gate is CONTENT, not a PaintKey: a resize moves the key's
+    // cols/rows and must not re-announce an unchanged frame.
+    session.set_winsize(30, 100);
+    common::pty::wait_for_counter(&count, before + 2);
+    let extra = drain_for(&session, Duration::from_millis(400));
+    assert!(
+        extra.is_empty(),
+        "a resize re-announced the frame: {:?}",
+        String::from_utf8_lossy(&extra)
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn an_open_color_never_leaks_past_an_appended_row() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &[
+            "watch",
+            "-n",
+            "1",
+            "--append",
+            "--shell",
+            "--",
+            "printf '\\033[31mred\\n'",
+        ],
+        &[("RAT_APPEARANCE", "dark")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let seen =
+        wait_for_bytes(&session, &mut terminal, b"red", Duration::from_secs(5)).expect("frame");
+    assert!(
+        contains(&seen, b"red\x1b[0m"),
+        "the child's open SGR must close before the row ends: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_no_forbidden_escapes(&seen, "sealed frame");
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn a_flooding_child_says_so_on_its_own_row() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &[
+            "watch", "-n", "5", "--append", "--", &rat, "__lines", "3000",
+        ],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"\r\nrat watch: 2.0k lines dropped; kept the last 1000\r\n",
+        Duration::from_secs(10),
+    );
+    assert!(
+        seen.is_some(),
+        "the drop marker must arrive as its own clean appended row"
+    );
+    session.write_bytes(b"q");
+    assert!(!session.kill_if_alive(Duration::from_secs(2)));
+}
+
+#[test]
+fn append_once_prints_one_frame_and_exits() {
+    let rat = rat_bin();
+    let session = PtySession::spawn(
+        &rat,
+        &["watch", "--once", "--append", "--", &rat, "__lines", "3"],
+        &[("RAT_APPEARANCE", "dark"), ("NO_COLOR", "1")],
+    )
+    .expect("spawn");
+    let mut terminal = FakeTerminal::dark();
+    // ONLCR is on (no raw mode under --once), so the pty presents LF
+    // rows as CRLF at the master either way.
+    let seen = wait_for_bytes(&session, &mut terminal, b"2\r\n", Duration::from_secs(5))
+        .expect("the once frame");
+    assert!(
+        contains(&seen, b"0\r\n1\r\n2\r\n"),
+        "the whole frame, in order"
+    );
+    assert!(
+        !contains(&seen, b"appending"),
+        "--once prints no banner: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    assert_no_forbidden_escapes(&seen, "once frame");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !session.exited() {
+        assert!(std::time::Instant::now() < deadline, "--once must exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
