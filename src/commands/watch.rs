@@ -2696,6 +2696,46 @@ fn compose_frame(
     lines
 }
 
+/// The linear stream's one write. Nothing here moves the cursor: an
+/// appended row is the one thing a screen reader reliably announces,
+/// and a row that can be rewritten is a row that can be destroyed
+/// mid-word. Each row seals as ITS OWN group — a single-row seal
+/// closes any open SGR and has nothing to replay onto — because rat's
+/// standalone rows carry user-provided text (a trigger path, a
+/// snapshot path) that can smuggle an open escape toward the shell
+/// prompt. Rows that open nothing pass through byte-identical.
+#[allow(dead_code)] // staged: wired by the append arm (task 2.2)
+fn append_rows<W: Write>(out: &mut W, rows: Vec<String>, eol: &str) -> anyhow::Result<()> {
+    for row in rows {
+        for sealed in seal_rows(vec![row]) {
+            out.write_all(sealed.as_bytes()).context("writing")?;
+        }
+        out.write_all(eol.as_bytes()).context("writing")?;
+    }
+    out.flush().context("flushing")
+}
+
+/// What one distinct frame contributes to the appended stream: the
+/// composed rows sealed as ONE group (style continuity across the
+/// child's own rows), then the retention marker OUTSIDE that group —
+/// `seal_rows` close-and-replays within the vec it is given, so a
+/// marker sealed alongside the body would wear the child's open color.
+///
+/// WHOLE-FRAME, NO SEPARATOR — a frame that leads with a changing row
+/// self-delimits, and unchanged rows inside a changed frame re-read
+/// per burst by design. The marker wording is the piped sentence
+/// verbatim: one wording per fact.
+#[allow(dead_code)] // staged: wired by the append arm (task 2.2)
+fn append_frame(lines: &[String], dropped: Option<&str>) -> Vec<String> {
+    let mut rows = seal_rows(lines.to_vec());
+    if let Some(text) = dropped {
+        rows.push(format!(
+            "rat watch: {text}; kept the last {MAX_RETAINED_LINES}"
+        ));
+    }
+    rows
+}
+
 /// The single place a tty frame body is painted: assemble the rows, draw.
 #[allow(clippy::too_many_arguments)]
 fn paint_frame(
@@ -4027,6 +4067,70 @@ mod tests {
     use super::*;
 
     const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
+
+    #[test]
+    fn an_append_frame_with_nothing_dropped_is_the_sealed_body() {
+        // Plain rows pass seal_rows byte-identical.
+        let body = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(append_frame(&body, None), body);
+    }
+
+    #[test]
+    fn an_append_frame_seals_the_child_body() {
+        let rows = append_frame(&["\x1b[31mred".to_string(), "next".to_string()], None);
+        assert!(
+            rows[0].contains("\x1b[0m"),
+            "open SGR closed at the row end: {rows:?}"
+        );
+        // The last row must also end closed — nothing leaks to the prompt.
+        let last = rows.last().unwrap();
+        assert!(
+            !last.contains('\x1b') || last.ends_with("\x1b[0m"),
+            "the final row must end closed: {last:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_child_color_never_styles_the_drop_marker_row() {
+        // seal_rows close-and-replays WITHIN its vec, so the marker must
+        // join AFTER sealing or the child's open color styles it.
+        let rows = append_frame(&["\x1b[31mred".to_string()], Some("2.0k lines dropped"));
+        let marker = rows.last().unwrap();
+        assert!(
+            marker.starts_with("rat watch: "),
+            "no replayed SGR prefix: {marker:?}"
+        );
+        assert_eq!(
+            *marker,
+            format!("rat watch: 2.0k lines dropped; kept the last {MAX_RETAINED_LINES}")
+        );
+    }
+
+    #[test]
+    fn append_rows_writes_a_plain_row_verbatim_with_the_terminator() {
+        let mut out: Vec<u8> = Vec::new();
+        append_rows(&mut out, vec!["hi".to_string()], "\r\n").unwrap();
+        assert_eq!(out, b"hi\r\n");
+    }
+
+    #[test]
+    fn a_standalone_row_with_an_open_sgr_cannot_style_what_follows() {
+        // User-provided text (a trigger path, a snapshot path) can carry
+        // escapes into rat's own rows; each row seals as its own group at
+        // the write boundary.
+        let mut out: Vec<u8> = Vec::new();
+        append_rows(
+            &mut out,
+            vec!["rat watch: trigger ended: fifo:/tmp/\x1b[31mevil".to_string()],
+            "\n",
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.trim_end().ends_with("\x1b[0m"),
+            "the open SGR must be closed before the terminator: {text:?}"
+        );
+    }
 
     #[test]
     fn the_interval_resolves_by_the_trigger_rule() {
