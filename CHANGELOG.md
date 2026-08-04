@@ -2,6 +2,18 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.14.0](https://github.com/kevinswiber/ratto/compare/15e6b3afff91561cfc9d3e315ad031b5558415b6..v0.14.0) - 2026-08-04
+#### Features
+- append mode speaks the child's exit only when it changes - ([49cf9a7](https://github.com/kevinswiber/ratto/commit/49cf9a71ce53898c96f2ba6c0579590fd37c7576)) - [@kevinswiber](https://github.com/kevinswiber)
+- append mode speaks chrome events as their own rows - ([147740c](https://github.com/kevinswiber/ratto/commit/147740c35d6395207400228641f6cf106840363c)) - [@kevinswiber](https://github.com/kevinswiber)
+- append mode answers four keys and one banner replaces the footer - ([1f5f095](https://github.com/kevinswiber/ratto/commit/1f5f095db25daa158d7fed583cd9f68b1b00445e)) - [@kevinswiber](https://github.com/kevinswiber)
+- --append streams distinct frames to the scrollback - ([990bd3b](https://github.com/kevinswiber/ratto/commit/990bd3b2aeb00f4266c9f8d735278b54500fa6d7)) - [@kevinswiber](https://github.com/kevinswiber)
+- watch accepts --append and refuses the flags it cannot serve - ([15e6b3a](https://github.com/kevinswiber/ratto/commit/15e6b3afff91561cfc9d3e315ad031b5558415b6)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the third screen contract — --append and the scrollback bargain - ([8c3bbfd](https://github.com/kevinswiber/ratto/commit/8c3bbfd49147dc4bb995d56291c4651eaa406625)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.13.0](https://github.com/kevinswiber/ratto/compare/bfd8ba38b90964a4a0002fcd7694ada480956d1c..v0.13.0) - 2026-08-04
 #### Features
 - a legacy-codepage child renders clean on Windows - ([dee3243](https://github.com/kevinswiber/ratto/commit/dee324369e15c638df4a3da800021f30f01cbcb7)) - [@kevinswiber](https://github.com/kevinswiber)
