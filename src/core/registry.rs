@@ -16,15 +16,43 @@ use crate::core::trigger::TriggerSpec;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SourceId(pub usize);
 
+/// How a source's command reaches the OS: directly as argv, through
+/// the platform's own shell, or through a shell the author named.
+///
+/// Data only. WHICH program `Platform` resolves to is the spawning
+/// module's business — this module carries no `#[cfg]`, and
+/// `%COMSPEC%` is a Windows fact read at spawn time.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum ShellMode {
+    /// argv, executed directly. No shell at all.
+    #[default]
+    Direct,
+    /// `sh` on unix, `%COMSPEC%` (or `cmd`) on Windows.
+    Platform,
+    /// The named program, invoked with its dialect's command flag.
+    // Constructed only by tests until the selection surfaces land.
+    #[allow(dead_code)]
+    Named(String),
+}
+
+impl ShellMode {
+    /// Whether a shell is involved at all — the ONE thing the command
+    /// SPLIT depends on. Which shell it is never changes the argv's
+    /// shape.
+    pub fn runs_a_shell(&self) -> bool {
+        !matches!(self, ShellMode::Direct)
+    }
+}
+
 /// What one source runs and how often — what every surface constructs.
 #[derive(Clone, PartialEq, Debug)]
 pub struct SourceSpec {
     pub id: String,
-    /// argv when `shell` is false; the single script string (joined
-    /// with spaces, exactly as `rat watch --shell` does) when it is
-    /// true.
+    /// argv under `Direct`; the single script string (joined with
+    /// spaces, exactly as `rat watch --shell` does) under any shell
+    /// mode.
     pub command: Vec<String>,
-    pub shell: bool,
+    pub shell: ShellMode,
     /// `None`: no deadline of its own, triggers only.
     pub interval: Option<Duration>,
     pub triggers: Vec<TriggerSpec>,
@@ -481,7 +509,7 @@ mod tests {
         SourceSpec {
             id: id.to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(120),

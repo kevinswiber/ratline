@@ -206,14 +206,16 @@ mod tests {
 
     use super::*;
     use crate::core::box_model::{BorderPreset, Sides};
-    use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth, SourceId, SourceSpec};
+    use crate::core::registry::{
+        LayoutNode, Overflow, PaneBox, PaneWidth, ShellMode, SourceId, SourceSpec,
+    };
     use crate::core::trigger::TriggerSpec;
 
     fn registry(triggers: bool) -> Registry {
         let spec = |id: &str, path: &str| SourceSpec {
             id: id.to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: (!triggers).then(|| Duration::from_secs(5)),
             triggers: if triggers {
                 vec![TriggerSpec::File(std::path::PathBuf::from(path))]
@@ -252,7 +254,7 @@ mod tests {
         let batch = SourceSpec {
             id: "a".to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(5)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
@@ -261,7 +263,7 @@ mod tests {
         let follow = SourceSpec {
             id: "follow".to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),

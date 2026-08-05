@@ -27,7 +27,9 @@ use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
 use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
-use crate::core::registry::{Composition, Overflow, PaneGeometry, Registry, SourceId, SourceSpec};
+use crate::core::registry::{
+    Composition, Overflow, PaneGeometry, Registry, ShellMode, SourceId, SourceSpec,
+};
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
 use crate::core::snapshot::{snapshot_body, snapshot_stamp, write_snapshot};
@@ -169,17 +171,23 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         .or(triggers.is_empty().then_some("2s"));
     let live_tail = live_suffix(args.once, interval_label, !triggers.is_empty());
     let help_extra = trigger_help(&triggers);
+    // Bridge until the flag learns names: `--shell` still speaks bool.
+    let shell = if args.shell {
+        ShellMode::Platform
+    } else {
+        ShellMode::Direct
+    };
     let registry = Registry::single(
         SourceSpec {
             id: String::new(),
-            command: if args.shell {
+            command: if shell.runs_a_shell() {
                 // A shell source keeps the raw script as ONE element,
                 // or split-then-join would destroy its quoting.
                 vec![args.command.join(" ")]
             } else {
                 args.command.clone()
             },
-            shell: args.shell,
+            shell,
             interval,
             triggers,
             debounce,
@@ -3237,14 +3245,22 @@ fn build_source_command(
     appearance: Appearance,
     geom: PaneGeometry,
 ) -> std::process::Command {
-    let mut command = if spec.shell {
-        // A shell spec holds the raw script as one element, so the
-        // join reproduces it byte for byte.
-        shell_command(&spec.command.join(" "))
-    } else {
-        let mut cmd = std::process::Command::new(&spec.command[0]);
-        cmd.args(&spec.command[1..]);
-        cmd
+    // A shell spec holds the raw script as one element, so the join
+    // reproduces it byte for byte.
+    let mut command = match &spec.shell {
+        ShellMode::Direct => {
+            let mut cmd = std::process::Command::new(&spec.command[0]);
+            cmd.args(&spec.command[1..]);
+            cmd
+        }
+        ShellMode::Platform => shell_command(&spec.command.join(" ")),
+        ShellMode::Named(program) => {
+            // Interim: every named shell takes `-c` until the dialect
+            // table arrives with the platform seam rework.
+            let mut cmd = std::process::Command::new(program);
+            cmd.arg("-c").arg(spec.command.join(" "));
+            cmd
+        }
     };
     if interactive {
         command.stdin(std::process::Stdio::null());
@@ -5076,7 +5092,7 @@ mod tests {
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
@@ -5112,7 +5128,7 @@ mod tests {
             .map(|(id, live)| SourceSpec {
                 id: (*id).to_string(),
                 command: vec!["true".to_string()],
-                shell: false,
+                shell: ShellMode::Direct,
                 interval: Some(Duration::from_secs(3600)),
                 triggers: Vec::new(),
                 debounce: Duration::from_millis(250),
@@ -5296,7 +5312,7 @@ mod tests {
             SourceSpec {
                 id: "watch".to_string(),
                 command: vec!["true".to_string()],
-                shell: false,
+                shell: ShellMode::Direct,
                 interval: Some(Duration::from_secs(2)),
                 triggers: Vec::new(),
                 debounce: Duration::from_millis(250),
@@ -5317,7 +5333,7 @@ mod tests {
         SourceSpec {
             id: "follower".to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval,
             triggers: if triggered {
                 vec![TriggerSpec::File(std::path::PathBuf::from("./t"))]
@@ -6052,7 +6068,7 @@ mod tests {
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
             debounce: Duration::from_millis(250),
@@ -6373,7 +6389,7 @@ mod tests {
         let spec = |id: &str, path: &str| SourceSpec {
             id: id.to_string(),
             command: vec!["true".to_string()],
-            shell: false,
+            shell: ShellMode::Direct,
             interval: None,
             triggers: vec![TriggerSpec::File(std::path::PathBuf::from(path))],
             debounce: Duration::from_millis(250),
@@ -6451,7 +6467,7 @@ mod tests {
             SourceSpec {
                 id: "watch".to_string(),
                 command: vec!["true".to_string()],
-                shell: false,
+                shell: ShellMode::Direct,
                 interval: None,
                 triggers: vec![TriggerSpec::File(std::path::PathBuf::from("./stamp"))],
                 debounce: Duration::from_millis(250),
@@ -6604,7 +6620,7 @@ mod tests {
         assert_eq!(size_fallback(Some("wide"), Some("-3"), (80, 24)), (80, 24));
     }
 
-    fn source_spec(command: &[&str], shell: bool) -> SourceSpec {
+    fn source_spec(command: &[&str], shell: ShellMode) -> SourceSpec {
         SourceSpec {
             id: String::new(),
             command: command.iter().map(|s| s.to_string()).collect(),
@@ -6640,7 +6656,7 @@ mod tests {
 
     #[test]
     fn every_child_is_told_the_frame_size_and_appearance() {
-        let spec = source_spec(&["some-tool", "--flag"], false);
+        let spec = source_spec(&["some-tool", "--flag"], ShellMode::Direct);
         let cmd = build_source_command(&spec, true, Appearance::Light, terminal_geom(100, 40));
         let envs: std::collections::HashMap<String, String> = cmd
             .get_envs()
@@ -6661,10 +6677,18 @@ mod tests {
 
     #[test]
     fn direct_mode_runs_the_command_verbatim() {
-        let spec = source_spec(&["some-tool", "--flag", "value"], false);
+        let spec = source_spec(&["some-tool", "--flag", "value"], ShellMode::Direct);
         let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(program_of(&cmd), "some-tool");
         assert_eq!(argv_of(&cmd), ["--flag", "value"]);
+    }
+
+    #[test]
+    fn a_named_shell_runs_that_program() {
+        let spec = source_spec(&["echo hi"], ShellMode::Named("fish".to_string()));
+        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
+        assert_eq!(program_of(&cmd), "fish");
+        assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
     }
 
     #[test]
@@ -6696,7 +6720,7 @@ mod tests {
 
     #[test]
     fn shell_mode_goes_through_the_platform_shell() {
-        let spec = source_spec(&["echo hi"], true);
+        let spec = source_spec(&["echo hi"], ShellMode::Platform);
         let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         #[cfg(unix)]
         {
