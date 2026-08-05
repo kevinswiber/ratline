@@ -96,9 +96,6 @@ pub enum SourceProgram {
     /// interpreter and the body is materialized as a file; without one
     /// the body runs through `shell` — which, for a shebang-less body,
     /// is never `Direct` (`resolve_source` promotes or refuses).
-    // staged(dead_code): constructed by resolve_source once the
-    // `script` key lands; the allow leaves with it.
-    #[allow(dead_code)]
     Script(String),
 }
 

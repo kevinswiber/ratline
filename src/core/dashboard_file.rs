@@ -24,7 +24,7 @@ use crate::core::box_model::{BorderPreset, Sides, parse_sides};
 use crate::core::duration::parse_interval;
 use crate::core::registry::{
     LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellMode, SourceId, SourceProgram,
-    SourceSpec, TitleSource,
+    SourceSpec, TitleSource, shebang,
 };
 use crate::core::trigger::parse_trigger;
 
@@ -135,6 +135,13 @@ impl DashboardFile {
         if self.defaults.id.is_some() {
             bail!("an id is not a default: give each pane its own id");
         }
+        if self.defaults.command.is_some() && self.defaults.script.is_some() {
+            bail!(
+                "defaults: declares both `command` and `script` — a pane runs \
+                 one program; keep the `script` body or the `command` argv, \
+                 not both"
+            );
+        }
 
         let names = self.pane_names()?;
         let mut sources = Vec::with_capacity(self.panes.len());
@@ -244,29 +251,58 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
     let defaults_shell = defaults.shell.clone().unwrap_or_default();
     let shell = decl.shell.clone().unwrap_or_else(|| defaults_shell.clone());
     let live = decl.live.or(defaults.live).unwrap_or(false);
-    // A command string is word-split (or kept verbatim) at PARSE time,
-    // under the shell mode in force where it was written — and its
-    // SYNTAX belongs to that shell too. A pane that inherits the
-    // defaults' command while changing `shell`, in either direction or
-    // to a different shell, would run a command nobody wrote for it.
-    // Fail with the fix instead.
-    if decl.command.is_none() && shell != defaults_shell {
+    if decl.command.is_some() && decl.script.is_some() {
         bail!(
-            "{}: inherits `command` from `defaults` but overrides `shell` — \
-             the inherited command was read and written under the defaults' \
-             shell mode ({}), not this pane's ({}); declare the pane's own \
-             `command`",
-            at(id),
-            shell_label(&defaults_shell),
-            shell_label(&shell),
+            "{}: declares both `command` and `script` — a pane runs one \
+             program; keep the `script` body or the `command` argv, not both",
+            at(id)
         );
     }
-    let command = decl
-        .command
-        .clone()
-        .or_else(|| defaults.command.clone())
-        .filter(|words| !words.is_empty())
-        .ok_or_else(|| anyhow!("{}: needs a `command`", at(id)))?;
+    // The effective program: own beats inherited, even across kinds (a
+    // pane's `command` overrides a defaults `script`).
+    let inherits_program = decl.command.is_none() && decl.script.is_none();
+    let script = decl.script.as_deref().or_else(|| {
+        decl.command
+            .is_none()
+            .then_some(defaults.script.as_deref())
+            .flatten()
+    });
+    let (program, shell) = if let Some(body) = script {
+        resolve_script(
+            body,
+            decl,
+            defaults,
+            &shell,
+            &defaults_shell,
+            inherits_program,
+            id,
+        )?
+    } else {
+        // A command string is word-split (or kept verbatim) at PARSE
+        // time, under the shell mode in force where it was written —
+        // and its SYNTAX belongs to that shell too. A pane that
+        // inherits the defaults' program while changing `shell`, in
+        // either direction or to a different shell, would run a
+        // command nobody wrote for it. Fail with the fix instead.
+        if inherits_program && shell != defaults_shell {
+            bail!(
+                "{}: inherits `command` from `defaults` but overrides `shell` — \
+                 the inherited command was read and written under the defaults' \
+                 shell mode ({}), not this pane's ({}); declare the pane's own \
+                 `command`",
+                at(id),
+                shell_label(&defaults_shell),
+                shell_label(&shell),
+            );
+        }
+        let command = decl
+            .command
+            .clone()
+            .or_else(|| defaults.command.clone())
+            .filter(|words| !words.is_empty())
+            .ok_or_else(|| anyhow!("{}: needs a `command` or a `script`", at(id)))?;
+        (SourceProgram::Argv(command), shell)
+    };
 
     let triggers = decl
         .trigger
@@ -296,15 +332,106 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
 
     Ok(SourceSpec {
         id: id.to_string(),
-        // Verbatim: a shell pane's script must never round-trip through
-        // split-then-join.
-        program: SourceProgram::Argv(command),
+        // Verbatim in both kinds: a shell pane's script never
+        // round-trips through split-then-join, and a body's bytes are
+        // the author's.
+        program,
         shell,
         interval,
         triggers,
         debounce,
         live,
     })
+}
+
+/// The script-body half of `resolve_source`: every rule a `script`
+/// declaration carries, and the shell mode the spec should hold.
+///
+/// A SHEBANG body names its own interpreter, so its shell mode is
+/// inert — an own RUNNING shell beside it is a dead declaration and is
+/// refused, while `shell #false` beside it is an honest statement and
+/// allowed (refusing it would leave a defaults-wide `shell #false`
+/// with a shebang pane no legal spelling). A body with NO shebang runs
+/// through the pane's shell, so it can never be `Direct`: an explicit
+/// `#false` is refused, absence promotes to the platform's shell, and
+/// the inherit-guard applies exactly as it does to a `command`.
+fn resolve_script(
+    body: &str,
+    decl: &PaneDecl,
+    defaults: &PaneDecl,
+    shell: &ShellMode,
+    defaults_shell: &ShellMode,
+    inherited: bool,
+    id: &str,
+) -> anyhow::Result<(SourceProgram, ShellMode)> {
+    if body.trim().is_empty() {
+        bail!(
+            "{}: `script` has no body — write the script inside a `\"\"\"` \
+             block, or drop the key",
+            at(id)
+        );
+    }
+    match shebang(body) {
+        Some(line) => {
+            if let Some(own) = &decl.shell
+                && own.runs_a_shell()
+            {
+                let spelled = match &line.arg {
+                    Some(arg) => format!("{} {arg}", line.interpreter),
+                    None => line.interpreter.clone(),
+                };
+                bail!(
+                    "{}: declares `shell` and a `script` whose `#!` line \
+                     already names its interpreter (`{}`) — the `#!` wins \
+                     and {} would never run. Drop `shell`, or drop the \
+                     `#!` line to run the body through {}",
+                    at(id),
+                    spelled,
+                    shell_label(own),
+                    shell_label(own),
+                );
+            }
+            Ok((SourceProgram::Script(body.to_string()), shell.clone()))
+        }
+        None => {
+            let first = body.lines().next().unwrap_or("");
+            if first.trim_start().starts_with("#!") {
+                bail!(
+                    "{}: the `#!` line must be the body's first two bytes, \
+                     but this one is indented. KDL removes the closing \
+                     `\"\"\"`'s indentation from every line — align the \
+                     closing `\"\"\"` with the script",
+                    at(id)
+                );
+            }
+            let explicit = decl.shell.as_ref().or(defaults.shell.as_ref());
+            if matches!(explicit, Some(ShellMode::Direct)) {
+                bail!(
+                    "{}: `script` runs through a shell, but this pane \
+                     declares `shell #false` — a body has no argv to execute \
+                     directly. Drop the `shell #false`, or write the program \
+                     as `command`",
+                    at(id)
+                );
+            }
+            if inherited && shell != defaults_shell {
+                bail!(
+                    "{}: inherits `script` from `defaults` but overrides \
+                     `shell` — the inherited body was written under the \
+                     defaults' shell mode ({}), not this pane's ({}); declare \
+                     the pane's own `script`",
+                    at(id),
+                    shell_label(defaults_shell),
+                    shell_label(shell),
+                );
+            }
+            let shell = match shell {
+                ShellMode::Direct => ShellMode::Platform,
+                other => other.clone(),
+            };
+            Ok((SourceProgram::Script(body.to_string()), shell))
+        }
+    }
 }
 
 fn resolve_box(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<PaneBox> {
@@ -919,6 +1046,258 @@ mod tests {
         let spec = registry.spec(SourceId(0));
         assert_eq!(spec.shell, ShellMode::Platform);
         assert_eq!(spec.program, SourceProgram::Argv(vec![script.to_string()]));
+    }
+
+    /// The smallest legal script pane: a name, a body, a height.
+    fn script_pane(id: &str, body: &str) -> PaneDecl {
+        PaneDecl {
+            id: Some(id.to_string()),
+            script: Some(body.to_string()),
+            height: Some(3),
+            ..PaneDecl::default()
+        }
+    }
+
+    #[test]
+    fn a_pane_with_both_command_and_script_is_rejected() {
+        let mut decl = pane("x", &["date"]);
+        decl.script = Some("#!/bin/sh\necho hi".to_string());
+        let err = err_of(file(vec![decl]));
+        assert!(err.contains("pane \"x\""), "{err}");
+        assert!(err.contains("both `command` and `script`"), "{err}");
+        assert!(err.contains("not both"), "{err}");
+    }
+
+    #[test]
+    fn defaults_with_both_command_and_script_are_rejected() {
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                command: Some(vec!["date".to_string()]),
+                script: Some("#!/bin/sh\necho hi".to_string()),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![pane("a", &["true"])],
+            ..DashboardFile::default()
+        };
+        let err = err_of(decl);
+        assert!(err.starts_with("defaults:"), "{err}");
+        assert!(err.contains("both `command` and `script`"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_script_body_is_rejected_with_the_block_spelling() {
+        for body in ["", "   \n  "] {
+            let err = err_of(file(vec![script_pane("x", body)]));
+            assert!(err.contains("pane \"x\""), "{err}");
+            assert!(err.contains("no body"), "{err}");
+            assert!(err.contains("\"\"\""), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_indented_shebang_is_rejected_naming_the_dedent_rule() {
+        // KDL's dedent can move a `#!` off byte 0; silently taking the
+        // fallback would run the body through a shell the author never
+        // chose. Refuse loudly, naming the mechanism and the fix.
+        let err = err_of(file(vec![script_pane("x", "  #!/bin/sh\necho hi")]));
+        assert!(err.contains("pane \"x\""), "{err}");
+        assert!(err.contains("first two bytes"), "{err}");
+        assert!(err.contains("align the closing"), "{err}");
+        // A body with no `#!` anywhere still falls back gracefully —
+        // the refusal is only for a demonstrably indented shebang.
+        let decl = file(vec![script_pane("y", "echo hi")]);
+        assert!(decl.into_registry().is_ok());
+    }
+
+    #[test]
+    fn a_pane_with_no_program_teaches_both_spellings() {
+        let mut decl = pane("x", &["unused"]);
+        decl.command = None;
+        let err = err_of(file(vec![decl]));
+        assert!(err.contains("needs a `command` or a `script`"), "{err}");
+    }
+
+    #[test]
+    fn a_panes_own_running_shell_under_a_shebang_body_is_rejected() {
+        // `#true` and a name both: the declared shell would never run.
+        for shell in [ShellMode::Platform, ShellMode::Named("fish".to_string())] {
+            let mut decl = script_pane("x", "#!/usr/bin/env python3\nprint(1)");
+            decl.shell = Some(shell);
+            let err = err_of(file(vec![decl]));
+            assert!(err.contains("pane \"x\""), "{err}");
+            assert!(err.contains("`#!` wins"), "{err}");
+            assert!(err.contains("/usr/bin/env python3"), "{err}");
+            assert!(err.contains("Drop `shell`"), "{err}");
+        }
+        // The own key fires it even when the shebang body is INHERITED:
+        // that pane's shell is exactly as dead.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                script: Some("#!/bin/sh\necho hi".to_string()),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                id: Some("x".to_string()),
+                shell: Some(ShellMode::Named("fish".to_string())),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let err = err_of(decl);
+        assert!(err.contains("`#!` wins"), "{err}");
+    }
+
+    #[test]
+    fn shell_false_under_a_shebangless_body_is_rejected() {
+        // Own `#false`.
+        let mut decl = script_pane("x", "echo hi");
+        decl.shell = Some(ShellMode::Direct);
+        let err = err_of(file(vec![decl]));
+        assert!(err.contains("pane \"x\""), "{err}");
+        assert!(err.contains("shell #false"), "{err}");
+        assert!(err.contains("`command`"), "{err}");
+        // Inherited `#false` refuses the same way — resolved is
+        // resolved.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Direct),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![script_pane("y", "echo hi")],
+            ..DashboardFile::default()
+        };
+        let err = err_of(decl);
+        assert!(err.contains("shell #false"), "{err}");
+    }
+
+    #[test]
+    fn shell_false_under_a_shebang_body_is_allowed_as_honest() {
+        // No shell runs and none was promised: `#false` beside a `#!`
+        // is true, and refusing it would deadlock a defaults-wide
+        // `shell #false` with any shebang pane.
+        let mut decl = script_pane("x", "#!/bin/sh\necho hi");
+        decl.shell = Some(ShellMode::Direct);
+        let registry = file(vec![decl]).into_registry().expect("registry");
+        assert_eq!(
+            registry.spec(SourceId(0)).program,
+            SourceProgram::Script("#!/bin/sh\necho hi".to_string())
+        );
+        // Inherited #false likewise.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Direct),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![script_pane("y", "#!/bin/sh\necho hi")],
+            ..DashboardFile::default()
+        };
+        assert!(decl.into_registry().is_ok());
+    }
+
+    #[test]
+    fn a_script_body_inherits_from_defaults() {
+        // One dispatcher body serving every pane is the advertised use:
+        // the id reaches each child as RAT_PANE.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                script: Some("#!/bin/sh\necho $RAT_PANE".to_string()),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![
+                PaneDecl {
+                    id: Some("a".to_string()),
+                    ..PaneDecl::default()
+                },
+                PaneDecl {
+                    id: Some("b".to_string()),
+                    ..PaneDecl::default()
+                },
+            ],
+            ..DashboardFile::default()
+        };
+        let registry = decl.into_registry().expect("registry");
+        for id in [SourceId(0), SourceId(1)] {
+            assert_eq!(
+                registry.spec(id).program,
+                SourceProgram::Script("#!/bin/sh\necho $RAT_PANE".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_shebangless_script_with_a_changed_shell_dialect_is_rejected() {
+        // The M7.1 guard, generalized: a no-shebang body's syntax
+        // belongs to the shell it was written under.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Platform),
+                script: Some("echo inherited".to_string()),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                id: Some("x".to_string()),
+                shell: Some(ShellMode::Named("fish".to_string())),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let err = err_of(decl);
+        assert!(err.contains("inherits `script`"), "{err}");
+        assert!(err.contains("overrides `shell`"), "{err}");
+    }
+
+    #[test]
+    fn a_shebang_body_ignores_an_inherited_shell() {
+        // The defaults' shell serves the OTHER panes; this pane's `#!`
+        // wins silently — nothing pane-local is dead.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Named("fish".to_string())),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![script_pane("x", "#!/bin/sh\necho hi")],
+            ..DashboardFile::default()
+        };
+        let registry = decl.into_registry().expect("registry");
+        assert_eq!(
+            registry.spec(SourceId(0)).program,
+            SourceProgram::Script("#!/bin/sh\necho hi".to_string())
+        );
+    }
+
+    #[test]
+    fn a_script_body_with_no_shell_declared_resolves_to_the_platform_shell() {
+        // A shebang-less body cannot run Direct; absence promotes to
+        // the platform's shell, exactly what `shell #true` means.
+        let registry = file(vec![script_pane("x", "echo hi")])
+            .into_registry()
+            .expect("registry");
+        assert_eq!(registry.spec(SourceId(0)).shell, ShellMode::Platform);
+    }
+
+    #[test]
+    fn a_panes_own_command_overrides_an_inherited_script() {
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                script: Some("#!/bin/sh\necho hi".to_string()),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![pane("x", &["date"])],
+            ..DashboardFile::default()
+        };
+        let registry = decl.into_registry().expect("registry");
+        assert_eq!(
+            registry.spec(SourceId(0)).program,
+            SourceProgram::Argv(vec!["date".to_string()])
+        );
     }
 
     #[test]
