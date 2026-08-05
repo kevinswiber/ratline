@@ -42,6 +42,50 @@ impl ShellMode {
     }
 }
 
+/// A parsed `#!` line: the interpreter, and the single optional
+/// argument the one-argument rule allows.
+///
+/// Pure data, shared by validation (does this body name its own
+/// interpreter?) and spawning (what runs it?) — one parser, one
+/// decision, on every platform.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Shebang {
+    pub interpreter: String,
+    pub arg: Option<String>,
+}
+
+/// The body's `#!` line, or `None` when it has none — which is not an
+/// error but a route: the body runs through the pane's shell instead,
+/// mirroring what unix does with ENOEXEC. The decision is made HERE,
+/// up front, so both platform arms take the same observable fallback
+/// rather than unix silently relying on the kernel's retry.
+///
+/// The magic must be the body's first two bytes — no leading
+/// whitespace, no BOM — exactly what `execve` requires. One trailing
+/// `\r` is stripped from the line (an explicit `\r` escape in KDL can
+/// deliver one even though literal CRLF is normalized). A `#!` naming
+/// nothing is not a shebang.
+// staged(dead_code): consumed by resolve_source and the spawn routes;
+// the allow leaves with the first production caller.
+#[allow(dead_code)]
+pub fn shebang(body: &str) -> Option<Shebang> {
+    let rest = body.strip_prefix("#!")?;
+    let line = rest.split('\n').next().unwrap_or(rest);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let line = line.trim_matches([' ', '\t']);
+    let (interpreter, arg) = match line.split_once([' ', '\t']) {
+        Some((first, rest)) => (first, rest.trim_matches([' ', '\t'])),
+        None => (line, ""),
+    };
+    if interpreter.is_empty() {
+        return None;
+    }
+    Some(Shebang {
+        interpreter: interpreter.to_string(),
+        arg: (!arg.is_empty()).then(|| arg.to_string()),
+    })
+}
+
 /// What one source runs and how often — what every surface constructs.
 #[derive(Clone, PartialEq, Debug)]
 pub struct SourceSpec {
@@ -839,5 +883,82 @@ mod tests {
         assert_eq!(geom[0].cells, 80);
         assert_eq!(geom[1].cells, 20);
         assert_eq!(geom[2].cells, 59);
+    }
+
+    #[test]
+    fn a_body_without_a_shebang_has_no_interpreter() {
+        // No `#!` at all; after a space; after a BOM; bare `#!`; `#!`
+        // followed by nothing but whitespace. Each is a ROUTE (the body
+        // runs through the pane's shell), never an error.
+        for body in [
+            "echo hi",
+            " #!/bin/sh\necho hi",
+            "\u{feff}#!/bin/sh\necho hi",
+            "#!",
+            "#!   \necho hi",
+        ] {
+            assert_eq!(shebang(body), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_shebang_names_its_interpreter_and_one_argument() {
+        assert_eq!(
+            shebang("#!/bin/sh\necho hi"),
+            Some(Shebang {
+                interpreter: "/bin/sh".into(),
+                arg: None,
+            })
+        );
+        assert_eq!(
+            shebang("#!/usr/bin/awk -f\n{ print }"),
+            Some(Shebang {
+                interpreter: "/usr/bin/awk".into(),
+                arg: Some("-f".into()),
+            })
+        );
+        // Space after the magic is tolerated (the historical unix form).
+        assert_eq!(
+            shebang("#! /bin/sh\necho hi"),
+            Some(Shebang {
+                interpreter: "/bin/sh".into(),
+                arg: None,
+            })
+        );
+        // A one-line body with no newline at all still parses.
+        assert_eq!(
+            shebang("#!/usr/bin/env fish"),
+            Some(Shebang {
+                interpreter: "/usr/bin/env".into(),
+                arg: Some("fish".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn the_one_argument_rule_keeps_the_remainder_whole() {
+        // Everything after the interpreter is ONE argument, spaces
+        // included. (Kernel-arm splitting differs per OS and is never
+        // asserted; the Interpreter arm implements this rule.)
+        assert_eq!(
+            shebang("#!/usr/bin/env -S deno run --allow-net\nDeno.exit(0)"),
+            Some(Shebang {
+                interpreter: "/usr/bin/env".into(),
+                arg: Some("-S deno run --allow-net".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_shebang_line_survives_a_carriage_return() {
+        // kdl normalizes literal CRLF, but an explicit `\r` escape can
+        // still deliver one; exactly one trailing CR is stripped.
+        assert_eq!(
+            shebang("#!/bin/sh\r\necho hi"),
+            Some(Shebang {
+                interpreter: "/bin/sh".into(),
+                arg: None,
+            })
+        );
     }
 }
