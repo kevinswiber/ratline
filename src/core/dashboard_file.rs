@@ -98,6 +98,10 @@ pub struct PaneDecl {
     pub id: Option<String>,
     /// Split argv, or one raw script string under `shell`.
     pub command: Option<Vec<String>>,
+    /// A multi-line body declared with `script`. A leading `#!` names
+    /// the body's own interpreter; without one the body runs through
+    /// the pane's resolved shell, exactly as unix ENOEXEC does.
+    pub script: Option<String>,
     /// `None` inherits; `Some(ShellMode::Direct)` is an explicit
     /// `shell=#false`.
     pub shell: Option<ShellMode>,

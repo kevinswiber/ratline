@@ -71,6 +71,13 @@ const PANE_KEYS: &[Key] = &[
         set: Set::List(set_command),
     },
     Key {
+        name: "script",
+        // `r##`: with one hash the `"#` inside `"#!` would terminate
+        // the raw string early.
+        example: r##"script "#!/bin/sh\necho hi""##,
+        set: Set::Text(|d, v| d.script = Some(v)),
+    },
+    Key {
         name: "shell",
         example: "shell #true",
         set: Set::FlagOrText(|d, v| d.shell = Some(v)),
@@ -1675,6 +1682,57 @@ pane "all" {
         assert_eq!(pane.padding.as_deref(), Some("0 1"));
         assert_eq!(pane.title.as_deref(), Some("Recent commits"));
         assert_eq!(pane.chrome, Some(false));
+    }
+
+    #[test]
+    fn the_script_key_reaches_the_declaration_through_the_table() {
+        // Parse-level only: `script` beside `command` is a VALIDATION
+        // refusal (into_registry), not a grammar one — the walk reads
+        // both.
+        let file = parse("pane \"log\" {\n    script \"#!/bin/sh\"\n}\n").expect("parses");
+        assert_eq!(file.panes[0].script.as_deref(), Some("#!/bin/sh"));
+    }
+
+    #[test]
+    fn a_multi_line_script_body_reaches_the_declaration_dedented() {
+        // The measured kdl fact: the closing line's indentation is
+        // removed from every line — which is why the docs must teach
+        // "align the closing quotes with the script".
+        let file = parse(
+            "\npane \"log\" {\n    script \"\"\"\n        #!/usr/bin/env fish\n        echo hi\n        \"\"\"\n}\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            file.panes[0].script.as_deref(),
+            Some("#!/usr/bin/env fish\necho hi")
+        );
+    }
+
+    #[test]
+    fn a_script_body_may_be_written_as_a_property() {
+        let file = parse(r##"pane "log" script="#!/bin/sh\necho hi""##).expect("parses");
+        assert_eq!(file.panes[0].script.as_deref(), Some("#!/bin/sh\necho hi"));
+    }
+
+    #[test]
+    fn a_raw_script_body_keeps_its_backslashes() {
+        // #"""…"""# is the form for sed/awk/regex-heavy bodies.
+        let file = parse(
+            "pane \"log\" {\n    script #\"\"\"\n        #!/bin/sh\n        printf '%s\\n' hi\n        \"\"\"#\n}\n",
+        )
+        .expect("parses");
+        let body = file.panes[0].script.as_deref().expect("script");
+        assert!(body.contains("%s\\n"), "{body:?}");
+    }
+
+    #[test]
+    fn a_script_key_takes_exactly_one_string() {
+        let err = parse("pane \"a\" {\n    script \"x\" \"y\"\n}\n").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("script") && text.contains("one string"),
+            "{text}"
+        );
     }
 
     /// I-52 at the pane's keys: a value of the wrong shape, or too many
