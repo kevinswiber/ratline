@@ -43,6 +43,7 @@ rat watch --fullscreen -- ./status.sh         # alternate screen, restored on ex
 rat watch --append -- ./status.sh             # append frames; scrollback keeps them
 rat watch --once -- ./status.sh               # render one frame
 rat watch --shell -- 'date; df -h | head -3'  # through sh -c
+rat watch --shell=fish -- 'date; df -h | head -3'  # through fish -c
 ```
 
 Cursor hiding, synchronized frames, redraw-only-on-change, height capping,
@@ -53,6 +54,18 @@ Piped output degrades to plain text, so `rat watch ... | tee log` stays
 readable. The interval is the quiet time between runs: a command slower
 than its interval never overlaps itself — the next run simply waits its
 turn.
+
+Bare `--shell` always means the platform's own shell — `sh -c` on unix,
+`%COMSPEC% /C` on Windows — and `--shell=NAME` picks another by name or
+full path. A named shell gets its own dialect's flag: `cmd` gets `/C`,
+`powershell` and `pwsh` get `-NoProfile -Command`, and everything else
+gets `-c` (sh, bash, zsh, fish, nu all agree on it). Unknown names are
+not rejected — a wrong name surfaces as the spawn error naming that
+shell. PowerShell skips the profile deliberately: the child respawns
+every tick, so the profile's load cost would recur at the interval and
+anything it prints would land in the frame; a script that wants the
+profile opts back in (`--shell=pwsh -- '. $PROFILE; Get-Thing'`), while
+there would be no way to opt out.
 
 Three screen contracts, and a flag to pick one. The default paints
 inline: the frame sits under your last command, the session reads as a
@@ -259,7 +272,9 @@ on it), and the anchor a `ref="#id"` points at. An id sticks to
 letters, digits, and `-` `.` `_` `~` — every id is a valid URI
 fragment — and display text belongs in `title`. `command` is a string split like a shell word list,
 multiple arguments taken verbatim as argv, or a raw script string with
-`shell #true`. For a script with backslashes in it — a `sed` program,
+`shell #true`. A string names a specific shell instead —
+`shell="fish"` — with the same dialect table `--shell=NAME` uses. For
+a script with backslashes in it — a `sed` program,
 say — reach for KDL's raw strings (`command #"sed 's/\t/ · /'"#`) so
 the escaping is the shell's job alone.
 
@@ -818,7 +833,9 @@ or ssh'd into from any terminal). Native sessions get full color with no
 `TERM` needed — a bare Windows console reports truecolor — and light/dark
 is detected where the terminal answers the background query (Windows
 Terminal does; others fall back to dark). The UI stream uses `CONOUT$`
-where unix uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`;
+where unix uses `/dev/tty`; `watch --shell` runs through `%COMSPEC% /C`,
+and `--shell=NAME` picks another (`--shell=pwsh` runs
+`-NoProfile -Command`);
 `rat` enables VT processing on the console itself, so escapes are
 processed even in legacy conhost, which simply ignores the synchronized-
 output mode it doesn't implement (Windows Terminal supports it). A

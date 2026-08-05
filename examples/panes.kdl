@@ -11,7 +11,9 @@
 // written as child nodes only. `row` and `column` are not keys: they
 // hold cells, and `title`/`gap`/`row-gap` are the whole dashboard's,
 // written once at the top level — this `title` names the dashboard;
-// a `title` inside a pane block labels that one box's border.
+// a `title` inside a pane block labels that one box's border. `shell`
+// takes a name as well as `#true`: `shell="fish"` runs the script
+// through fish instead of the platform's shell.
 
 title "repo at a glance"
 gap 1
