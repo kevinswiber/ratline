@@ -98,7 +98,9 @@ pub struct PaneDecl {
     pub id: Option<String>,
     /// Split argv, or one raw script string under `shell`.
     pub command: Option<Vec<String>>,
-    pub shell: Option<bool>,
+    /// `None` inherits; `Some(ShellMode::Direct)` is an explicit
+    /// `shell=#false`.
+    pub shell: Option<ShellMode>,
     /// "5s" | "never".
     pub interval: Option<String>,
     pub trigger: Option<Vec<String>>,
@@ -225,13 +227,14 @@ fn at(name: &str) -> String {
 }
 
 fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<SourceSpec> {
-    let shell = decl.shell.or(defaults.shell).unwrap_or(false);
+    let defaults_shell = defaults.shell.clone().unwrap_or_default();
+    let shell = decl.shell.clone().unwrap_or_else(|| defaults_shell.clone());
     let live = decl.live.or(defaults.live).unwrap_or(false);
     // A command string is word-split (or kept verbatim) at PARSE time,
     // under the shell mode in force where it was written. A pane that
     // inherits the defaults' command while flipping `shell` would
     // execute a wrongly-shaped argv — fail with the fix instead.
-    if decl.command.is_none() && shell != defaults.shell.unwrap_or(false) {
+    if decl.command.is_none() && shell.runs_a_shell() != defaults_shell.runs_a_shell() {
         bail!(
             "{}: inherits `command` from `defaults` but overrides `shell` — \
              the inherited command was read under the defaults' shell mode; \
@@ -277,13 +280,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
         // Verbatim: a shell pane's script must never round-trip through
         // split-then-join.
         command,
-        // Bridge until the KDL surface learns named shells: the
-        // declaration still speaks bool.
-        shell: if shell {
-            ShellMode::Platform
-        } else {
-            ShellMode::Direct
-        },
+        shell,
         interval,
         triggers,
         debounce,
@@ -529,7 +526,7 @@ mod tests {
             },
             panes: vec![PaneDecl {
                 id: Some("b".to_string()),
-                shell: Some(true),
+                shell: Some(ShellMode::Platform),
                 height: Some(3),
                 ..PaneDecl::default()
             }],
@@ -895,7 +892,7 @@ mod tests {
         // quoting is destroyed. into_registry copies the vec.
         let script = "date +%H:%M | tr -d '\\n'";
         let decl = file(vec![PaneDecl {
-            shell: Some(true),
+            shell: Some(ShellMode::Platform),
             command: Some(vec![script.to_string()]),
             ..pane("stamp", &["unused"])
         }]);
@@ -913,14 +910,14 @@ mod tests {
         // wrongly-shaped argv. Both directions error, teaching the fix.
         let decl = DashboardFile {
             defaults: PaneDecl {
-                shell: Some(true),
+                shell: Some(ShellMode::Platform),
                 command: Some(vec!["printf inherited".to_string()]),
                 height: Some(3),
                 ..PaneDecl::default()
             },
             panes: vec![PaneDecl {
                 id: Some("plain".to_string()),
-                shell: Some(false),
+                shell: Some(ShellMode::Direct),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()
@@ -938,7 +935,7 @@ mod tests {
             },
             panes: vec![PaneDecl {
                 id: Some("shelly".to_string()),
-                shell: Some(true),
+                shell: Some(ShellMode::Platform),
                 ..PaneDecl::default()
             }],
             ..DashboardFile::default()

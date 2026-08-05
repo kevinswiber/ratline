@@ -20,6 +20,7 @@
 use anyhow::{anyhow, bail};
 
 use crate::core::dashboard_file::{DashboardFile, LayoutDecl, PaneDecl};
+use crate::core::registry::ShellMode;
 
 /// The one function that puts a key's value on the declaration. The
 /// variant IS the key's shape: it says what the value looks like, and
@@ -30,6 +31,11 @@ enum Set {
     Count(fn(&mut PaneDecl, i128, &Ctx<'_>) -> anyhow::Result<()>),
     Flag(fn(&mut PaneDecl, bool)),
     List(fn(&mut PaneDecl, Vec<String>, &Ctx<'_>) -> anyhow::Result<()>),
+    /// `#true`, `#false`, or one string naming the choice — a switch
+    /// and a choice in one key. `shell` is the only key with this
+    /// shape, so the payload is its own type; a second such key would
+    /// earn a shape-neutral one.
+    FlagOrText(fn(&mut PaneDecl, ShellMode)),
 }
 
 impl Set {
@@ -67,7 +73,7 @@ const PANE_KEYS: &[Key] = &[
     Key {
         name: "shell",
         example: "shell #true",
-        set: Set::Flag(|d, v| d.shell = Some(v)),
+        set: Set::FlagOrText(|d, v| d.shell = Some(v)),
     },
     Key {
         name: "interval",
@@ -202,6 +208,7 @@ fn takes(k: &Key) -> &'static str {
         Set::Count(_) => "one integer",
         Set::Flag(_) => "#true or #false",
         Set::List(_) => "one or more strings",
+        Set::FlagOrText(_) => "#true, #false, or one string",
     }
 }
 
@@ -444,7 +451,12 @@ pub fn parse_styled(text: &str, colored: bool) -> anyhow::Result<DashboardFile> 
             }
         }
     }
-    let default_shell = file.defaults.shell.unwrap_or(false);
+    // The split cares whether a shell is involved, never which one.
+    let default_shell = file
+        .defaults
+        .shell
+        .as_ref()
+        .is_some_and(ShellMode::runs_a_shell);
     let mut panes = Vec::new();
     let mut items = Vec::with_capacity(tree.len());
     for (index, node) in tree.iter().enumerate() {
@@ -556,7 +568,9 @@ fn pane_block(
     let shell = peek_shell(node, &at)?;
     let ctx = Ctx {
         at: &at,
-        shell: shell.unwrap_or(default_shell),
+        shell: shell
+            .as_ref()
+            .map_or(default_shell, ShellMode::runs_a_shell),
     };
     let mut decl = PaneDecl {
         id,
@@ -593,6 +607,7 @@ fn pane_block(
             Set::Text(set) => set(&mut decl, prop_text(entry.value(), k, &at)?),
             Set::Count(set) => set(&mut decl, prop_count(entry.value(), k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut decl, prop_flag(entry.value(), k, &at)?),
+            Set::FlagOrText(set) => set(&mut decl, prop_mode(entry.value(), k, &at)?),
         }
     }
 
@@ -615,6 +630,7 @@ fn pane_block(
             Set::Count(set) => set(&mut decl, one_count(child, k, &at)?, &ctx)?,
             Set::Flag(set) => set(&mut decl, one_flag(child, k, &at)?),
             Set::List(set) => set(&mut decl, many_text(child, k, &at)?, &ctx)?,
+            Set::FlagOrText(set) => set(&mut decl, one_mode(child, k, &at)?),
         }
     }
     Ok(decl)
@@ -624,13 +640,13 @@ fn pane_block(
 /// split depends on it. A peek only: if `shell` is written in both
 /// positions the pass raises the duplicate error, so the peek's choice
 /// never reaches a spawn.
-fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<bool>> {
+fn peek_shell(node: &kdl::KdlNode, at: &str) -> anyhow::Result<Option<ShellMode>> {
     let k = key("shell").expect("`shell` is a pane key");
     if let Some(entry) = node.entry("shell") {
-        return prop_flag(entry.value(), k, at).map(Some);
+        return prop_mode(entry.value(), k, at).map(Some);
     }
     match node.children().and_then(|doc| doc.get("shell")) {
-        Some(child) => one_flag(child, k, at).map(Some),
+        Some(child) => one_mode(child, k, at).map(Some),
         None => Ok(None),
     }
 }
@@ -679,6 +695,34 @@ fn one_count(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<i128> {
 fn one_flag(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<bool> {
     match positional(node).as_slice() {
         [value] => value.as_bool().ok_or_else(|| shape_err(k, at)),
+        _ => Err(shape_err(k, at)),
+    }
+}
+
+/// `#true` is the platform's shell, `#false` no shell at all, and a
+/// string names the program. An EMPTY string names nothing: a shape
+/// error, never a spawn of `""`.
+fn shell_value(value: &kdl::KdlValue) -> Option<ShellMode> {
+    if let Some(flag) = value.as_bool() {
+        return Some(if flag {
+            ShellMode::Platform
+        } else {
+            ShellMode::Direct
+        });
+    }
+    value
+        .as_string()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| ShellMode::Named(name.to_string()))
+}
+
+fn prop_mode(value: &kdl::KdlValue, k: &Key, at: &str) -> anyhow::Result<ShellMode> {
+    shell_value(value).ok_or_else(|| prop_shape_err(k, at))
+}
+
+fn one_mode(node: &kdl::KdlNode, k: &Key, at: &str) -> anyhow::Result<ShellMode> {
+    match positional(node).as_slice() {
+        [value] => shell_value(value).ok_or_else(|| shape_err(k, at)),
         _ => Err(shape_err(k, at)),
     }
 }
@@ -742,6 +786,12 @@ fn stray_key_err(at: &str, k: &Key, values: &[&kdl::KdlValue]) -> anyhow::Error 
         Set::Count(_) => value.as_integer().is_some(),
         Set::Text(_) => value.as_string().is_some(),
         Set::List(_) => false,
+        // A value that names ANOTHER key is the next stray, not this
+        // key's choice — echoing it would teach `shell="height"`.
+        Set::FlagOrText(_) => shell_value(value).is_some_and(|mode| match mode {
+            ShellMode::Named(name) => key(&name).is_none(),
+            _ => true,
+        }),
     };
     let spelling = values
         .iter()
@@ -1069,6 +1119,12 @@ mod tests {
         assert_eq!(
             container_err("pane \"a\" shell height 3 { command \"true\" }"),
             "pane #1: `shell` is a key, not an id — write `shell=#true`"
+        );
+        // A string that names no other key DOES fit `shell` now, so
+        // the author's own shell name is the taught spelling.
+        assert_eq!(
+            container_err("pane \"a\" shell fish { command \"true\" }"),
+            "pane #1: `shell` is a key, not an id — write `shell=\"fish\"`"
         );
         assert_eq!(
             container_err("defaults height #true\npane \"a\" { command \"true\" height 3 }"),
@@ -1605,7 +1661,7 @@ pane "all" {
             pane.command,
             Some(vec!["git".to_string(), "log".to_string()])
         );
-        assert_eq!(pane.shell, Some(false));
+        assert_eq!(pane.shell, Some(ShellMode::Direct));
         assert_eq!(pane.interval.as_deref(), Some("5s"));
         assert_eq!(
             pane.trigger,
@@ -1637,6 +1693,10 @@ pane "all" {
             (
                 "pane \"log\" {\n    command \"date\"\n    chrome \"yes\"\n}\n",
                 "#true or #false",
+            ),
+            (
+                "pane \"log\" {\n    command \"date\"\n    shell 3\n}\n",
+                "#true, #false, or one string",
             ),
             ("pane \"log\" {\n    command\n}\n", "one or more strings"),
         ] {
@@ -2081,12 +2141,66 @@ pane "log" {
     fn a_property_holds_the_same_shell_the_command_split_reads() {
         let file = parse("pane \"x\" shell=#true {\n    command \"date +%H | tr -d x\"\n}\n")
             .expect("parses");
-        assert_eq!(file.panes[0].shell, Some(true));
+        assert_eq!(file.panes[0].shell, Some(ShellMode::Platform));
         assert_eq!(
             file.panes[0].command,
             Some(vec!["date +%H | tr -d x".to_string()]),
             "one word under shell stays one word"
         );
+        // The split follows runs_a_shell, never WHICH shell: a named
+        // shell keeps its script one word exactly as #true does.
+        let file = parse("pane \"x\" shell=\"fish\" {\n    command \"date +%H | tr -d x\"\n}\n")
+            .expect("parses");
+        assert_eq!(
+            file.panes[0].shell,
+            Some(ShellMode::Named("fish".to_string()))
+        );
+        assert_eq!(
+            file.panes[0].command,
+            Some(vec!["date +%H | tr -d x".to_string()]),
+            "one word under a named shell stays one word"
+        );
+    }
+
+    /// `#true` is the platform's shell, `#false` no shell at all, and a
+    /// string names the program — in both spellings, both positions.
+    #[test]
+    fn a_shell_key_names_the_shell_it_runs() {
+        for (text, wanted) in [
+            (
+                "pane \"x\" shell=#true {\n    command \"date\"\n}\n",
+                ShellMode::Platform,
+            ),
+            (
+                "pane \"x\" {\n    shell #true\n    command \"date\"\n}\n",
+                ShellMode::Platform,
+            ),
+            (
+                "pane \"x\" shell=#false {\n    command \"date\"\n}\n",
+                ShellMode::Direct,
+            ),
+            (
+                "pane \"x\" shell=\"fish\" {\n    command \"date\"\n}\n",
+                ShellMode::Named("fish".to_string()),
+            ),
+            (
+                "pane \"x\" {\n    shell \"fish\"\n    command \"date\"\n}\n",
+                ShellMode::Named("fish".to_string()),
+            ),
+        ] {
+            let file = parse(text).expect("parses");
+            assert_eq!(file.panes[0].shell, Some(wanted.clone()), "{text}");
+        }
+        // An EMPTY string names nothing — a shape error naming the
+        // accepted values, never a spawn of `""`.
+        for text in [
+            "pane \"x\" shell=\"\" {\n    command \"date\"\n}\n",
+            "pane \"x\" shell=\"   \" {\n    command \"date\"\n}\n",
+            "pane \"x\" {\n    shell \"\"\n    command \"date\"\n}\n",
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains("#true, #false, or one string"), "{err}");
+        }
     }
 
     /// The teaching error names the pane it happened in, the token the
