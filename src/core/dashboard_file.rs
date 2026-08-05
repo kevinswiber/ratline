@@ -23,8 +23,8 @@ use anyhow::{Context, anyhow, bail};
 use crate::core::box_model::{BorderPreset, Sides, parse_sides};
 use crate::core::duration::parse_interval;
 use crate::core::registry::{
-    LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellMode, SourceId, SourceSpec,
-    TitleSource,
+    LayoutNode, Overflow, PaneBox, PaneWidth, Registry, ShellMode, SourceId, SourceProgram,
+    SourceSpec, TitleSource,
 };
 use crate::core::trigger::parse_trigger;
 
@@ -294,7 +294,7 @@ fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Res
         id: id.to_string(),
         // Verbatim: a shell pane's script must never round-trip through
         // split-then-join.
-        command,
+        program: SourceProgram::Argv(command),
         shell,
         interval,
         triggers,
@@ -914,7 +914,7 @@ mod tests {
         let registry = decl.into_registry().expect("registry");
         let spec = registry.spec(SourceId(0));
         assert_eq!(spec.shell, ShellMode::Platform);
-        assert_eq!(spec.command, vec![script.to_string()]);
+        assert_eq!(spec.program, SourceProgram::Argv(vec![script.to_string()]));
     }
 
     #[test]

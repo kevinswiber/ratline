@@ -65,9 +65,6 @@ pub struct Shebang {
 /// `\r` is stripped from the line (an explicit `\r` escape in KDL can
 /// deliver one even though literal CRLF is normalized). A `#!` naming
 /// nothing is not a shebang.
-// staged(dead_code): consumed by resolve_source and the spawn routes;
-// the allow leaves with the first production caller.
-#[allow(dead_code)]
 pub fn shebang(body: &str) -> Option<Shebang> {
     let rest = body.strip_prefix("#!")?;
     let line = rest.split('\n').next().unwrap_or(rest);
@@ -86,14 +83,30 @@ pub fn shebang(body: &str) -> Option<Shebang> {
     })
 }
 
+/// What one source runs: an argv (or a shell script string), or a
+/// declared body that names its own interpreter.
+#[derive(Clone, PartialEq, Debug)]
+pub enum SourceProgram {
+    /// argv under `Direct`; the single raw script string (joined with
+    /// spaces, exactly as `rat watch --shell` does) under any shell
+    /// mode — the shape every surface has always constructed. Never
+    /// empty: every constructor validates before building one.
+    Argv(Vec<String>),
+    /// A `script` body. A leading `#!` names the body's own
+    /// interpreter and the body is materialized as a file; without one
+    /// the body runs through `shell` — which, for a shebang-less body,
+    /// is never `Direct` (`resolve_source` promotes or refuses).
+    // staged(dead_code): constructed by resolve_source once the
+    // `script` key lands; the allow leaves with it.
+    #[allow(dead_code)]
+    Script(String),
+}
+
 /// What one source runs and how often — what every surface constructs.
 #[derive(Clone, PartialEq, Debug)]
 pub struct SourceSpec {
     pub id: String,
-    /// argv under `Direct`; the single script string (joined with
-    /// spaces, exactly as `rat watch --shell` does) under any shell
-    /// mode.
-    pub command: Vec<String>,
+    pub program: SourceProgram,
     pub shell: ShellMode,
     /// `None`: no deadline of its own, triggers only.
     pub interval: Option<Duration>,
@@ -550,7 +563,7 @@ mod tests {
     fn spec(id: &str) -> SourceSpec {
         SourceSpec {
             id: id.to_string(),
-            command: vec!["true".to_string()],
+            program: SourceProgram::Argv(vec!["true".to_string()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),

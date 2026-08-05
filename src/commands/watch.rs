@@ -28,7 +28,8 @@ use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{
-    Composition, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId, SourceSpec,
+    Composition, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId, SourceProgram,
+    SourceSpec, shebang,
 };
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
@@ -175,13 +176,13 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
     let registry = Registry::single(
         SourceSpec {
             id: String::new(),
-            command: if shell.runs_a_shell() {
+            program: SourceProgram::Argv(if shell.runs_a_shell() {
                 // A shell source keeps the raw script as ONE element,
                 // or split-then-join would destroy its quoting.
                 vec![args.command.join(" ")]
             } else {
                 args.command.clone()
-            },
+            }),
             shell,
             interval,
             triggers,
@@ -3236,19 +3237,38 @@ fn spawn_first(pagers: &[PagerCommand]) -> std::io::Result<(String, std::process
 /// everything upstream of it deals only in a spec and a geometry.
 fn build_source_command(
     spec: &SourceSpec,
+    script: Option<&std::path::Path>,
     interactive: bool,
     appearance: Appearance,
     geom: PaneGeometry,
 ) -> std::process::Command {
-    // A shell spec holds the raw script as one element, so the join
-    // reproduces it byte for byte.
-    let mut command = match shell_invocation(&spec.shell) {
-        Some((program, flags)) => shell_command(&program, flags, &spec.command.join(" ")),
-        None => {
-            let mut cmd = std::process::Command::new(&spec.command[0]);
-            cmd.args(&spec.command[1..]);
-            cmd
+    let mut command = match (&spec.program, script) {
+        // A shebang body, materialized. On unix the KERNEL parses the
+        // `#!`; on Windows we did.
+        (SourceProgram::Script(body), Some(path)) => {
+            let line = shebang(body).expect("a materialized script has a shebang");
+            interpreter_command(SHEBANG_ARM, &line, path)
         }
+        // A body with no `#!`: the same shell path a `command` under a
+        // shell takes, which is what mirrors unix ENOEXEC. Only
+        // no-shebang bodies reach here (materialization covers every
+        // shebang body), and those are never Direct.
+        (SourceProgram::Script(body), None) => {
+            let (program, flags) = shell_invocation(&spec.shell)
+                .expect("a shebang-less script body never resolves to Direct");
+            shell_command(&program, flags, body)
+        }
+        // Shipped behavior, untouched bytes. A shell spec holds the
+        // raw script as one element, so the join reproduces it byte
+        // for byte.
+        (SourceProgram::Argv(argv), _) => match shell_invocation(&spec.shell) {
+            Some((program, flags)) => shell_command(&program, flags, &argv.join(" ")),
+            None => {
+                let mut cmd = std::process::Command::new(&argv[0]);
+                cmd.args(&argv[1..]);
+                cmd
+            }
+        },
     };
     if interactive {
         command.stdin(std::process::Stdio::null());
@@ -3323,7 +3343,7 @@ fn source_command(
     appearance: Appearance,
     geom: PaneGeometry,
 ) -> std::process::Command {
-    let mut command = build_source_command(registry.spec(id), interactive, appearance, geom);
+    let mut command = build_source_command(registry.spec(id), None, interactive, appearance, geom);
     if registry.pane(id).is_some() {
         command.env("RAT_PANE", &registry.spec(id).id);
     }
@@ -4360,9 +4380,19 @@ fn shell_mode(flag: Option<&Option<String>>) -> anyhow::Result<ShellMode> {
 /// where `command[0]` is the script rather than a program. A spawn
 /// error must name what failed to start.
 fn spawn_program(spec: &SourceSpec) -> String {
-    match shell_invocation(&spec.shell) {
-        Some((program, _)) => program,
-        None => spec.command[0].clone(),
+    match &spec.program {
+        SourceProgram::Script(body) => match shebang(body) {
+            Some(line) => shebang_program(SHEBANG_ARM, &line),
+            // Unreachable for a well-formed spec (a shebang-less body
+            // is never Direct), but a diagnostic path must not panic.
+            None => shell_invocation(&spec.shell)
+                .map(|(program, _)| program)
+                .unwrap_or_default(),
+        },
+        SourceProgram::Argv(argv) => match shell_invocation(&spec.shell) {
+            Some((program, _)) => program,
+            None => argv[0].clone(),
+        },
     }
 }
 
@@ -4391,9 +4421,6 @@ enum ShebangArm {
 /// The arm this build runs. A `const`, not a `#[cfg]` item: BOTH arms
 /// stay compiled and unit-tested on every platform, and the branch
 /// this build does not take is folded away.
-// staged(dead_code): consumed by the spawn routes; the allows on this
-// block leave with the first production caller.
-#[allow(dead_code)]
 const SHEBANG_ARM: ShebangArm = if cfg!(windows) {
     ShebangArm::Interpreter
 } else {
@@ -4512,8 +4539,6 @@ fn script_file(arm: ShebangArm, line: &Shebang, stem: &str, body: &str) -> (Stri
 /// kernel parses the `#!` line itself. The interpreter arm invokes the
 /// resolved interpreter: our flags, then the author's shebang
 /// argument(s), then the path.
-// staged(dead_code): consumed by the spawn routes; see SHEBANG_ARM.
-#[allow(dead_code)]
 fn interpreter_command(
     arm: ShebangArm,
     line: &Shebang,
@@ -4535,8 +4560,6 @@ fn interpreter_command(
 /// ENOENT names that; on the interpreter arm it names the program we
 /// resolved. Never the tempfile — the file is ours and we just wrote
 /// it; what can fail to start is the interpreter.
-// staged(dead_code): consumed by spawn_program; see SHEBANG_ARM.
-#[allow(dead_code)]
 fn shebang_program(arm: ShebangArm, line: &Shebang) -> String {
     match arm {
         ShebangArm::Kernel => line.interpreter.clone(),
@@ -5343,7 +5366,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
-            command: vec!["true".to_string()],
+            program: SourceProgram::Argv(vec!["true".to_string()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
@@ -5379,7 +5402,7 @@ mod tests {
             .iter()
             .map(|(id, live)| SourceSpec {
                 id: (*id).to_string(),
-                command: vec!["true".to_string()],
+                program: SourceProgram::Argv(vec!["true".to_string()]),
                 shell: ShellMode::Direct,
                 interval: Some(Duration::from_secs(3600)),
                 triggers: Vec::new(),
@@ -5563,7 +5586,7 @@ mod tests {
         let registry = Registry::single(
             SourceSpec {
                 id: "watch".to_string(),
-                command: vec!["true".to_string()],
+                program: SourceProgram::Argv(vec!["true".to_string()]),
                 shell: ShellMode::Direct,
                 interval: Some(Duration::from_secs(2)),
                 triggers: Vec::new(),
@@ -5584,7 +5607,7 @@ mod tests {
     fn cadence_spec(live: bool, interval: Option<Duration>, triggered: bool) -> SourceSpec {
         SourceSpec {
             id: "follower".to_string(),
-            command: vec!["true".to_string()],
+            program: SourceProgram::Argv(vec!["true".to_string()]),
             shell: ShellMode::Direct,
             interval,
             triggers: if triggered {
@@ -6319,7 +6342,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str| SourceSpec {
             id: id.to_string(),
-            command: vec!["true".to_string()],
+            program: SourceProgram::Argv(vec!["true".to_string()]),
             shell: ShellMode::Direct,
             interval: Some(Duration::from_secs(3600)),
             triggers: Vec::new(),
@@ -6640,7 +6663,7 @@ mod tests {
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
         let spec = |id: &str, path: &str| SourceSpec {
             id: id.to_string(),
-            command: vec!["true".to_string()],
+            program: SourceProgram::Argv(vec!["true".to_string()]),
             shell: ShellMode::Direct,
             interval: None,
             triggers: vec![TriggerSpec::File(std::path::PathBuf::from(path))],
@@ -6718,7 +6741,7 @@ mod tests {
         let registry = Registry::single(
             SourceSpec {
                 id: "watch".to_string(),
-                command: vec!["true".to_string()],
+                program: SourceProgram::Argv(vec!["true".to_string()]),
                 shell: ShellMode::Direct,
                 interval: None,
                 triggers: vec![TriggerSpec::File(std::path::PathBuf::from("./stamp"))],
@@ -6875,7 +6898,7 @@ mod tests {
     fn source_spec(command: &[&str], shell: ShellMode) -> SourceSpec {
         SourceSpec {
             id: String::new(),
-            command: command.iter().map(|s| s.to_string()).collect(),
+            program: SourceProgram::Argv(command.iter().map(|s| s.to_string()).collect()),
             shell,
             interval: Some(Duration::from_secs(2)),
             triggers: Vec::new(),
@@ -6909,7 +6932,8 @@ mod tests {
     #[test]
     fn every_child_is_told_the_frame_size_and_appearance() {
         let spec = source_spec(&["some-tool", "--flag"], ShellMode::Direct);
-        let cmd = build_source_command(&spec, true, Appearance::Light, terminal_geom(100, 40));
+        let cmd =
+            build_source_command(&spec, None, true, Appearance::Light, terminal_geom(100, 40));
         let envs: std::collections::HashMap<String, String> = cmd
             .get_envs()
             .filter_map(|(k, v)| {
@@ -6930,7 +6954,7 @@ mod tests {
     #[test]
     fn direct_mode_runs_the_command_verbatim() {
         let spec = source_spec(&["some-tool", "--flag", "value"], ShellMode::Direct);
-        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(program_of(&cmd), "some-tool");
         assert_eq!(argv_of(&cmd), ["--flag", "value"]);
     }
@@ -6938,7 +6962,7 @@ mod tests {
     #[test]
     fn a_named_shell_runs_that_program() {
         let spec = source_spec(&["echo hi"], ShellMode::Named("fish".to_string()));
-        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(program_of(&cmd), "fish");
         assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
     }
@@ -7140,6 +7164,60 @@ mod tests {
         assert_eq!(bytes, "set /a 6*7\n");
     }
 
+    fn script_spec(body: &str, shell: ShellMode) -> SourceSpec {
+        SourceSpec {
+            id: String::new(),
+            program: SourceProgram::Script(body.to_string()),
+            shell,
+            interval: Some(Duration::from_secs(2)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+            live: false,
+        }
+    }
+
+    #[test]
+    fn a_shebang_body_runs_the_materialized_file() {
+        let spec = script_spec("#!/usr/bin/env fish\necho hi", ShellMode::Platform);
+        let path = std::path::Path::new("/tmp/rat-script/0-a");
+        let cmd = build_source_command(
+            &spec,
+            Some(path),
+            false,
+            Appearance::Dark,
+            terminal_geom(80, 24),
+        );
+        match SHEBANG_ARM {
+            // The kernel parses the #! itself.
+            ShebangArm::Kernel => assert_eq!(cmd.get_program(), path.as_os_str()),
+            // We parsed it: fish from PATH, then the path.
+            ShebangArm::Interpreter => assert_eq!(cmd.get_program(), "fish"),
+        }
+    }
+
+    #[test]
+    fn a_body_without_a_shebang_runs_through_the_panes_shell() {
+        let spec = script_spec("echo hi", ShellMode::Named("sh".to_string()));
+        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
+        assert_eq!(cmd.get_program(), "sh");
+        assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn a_spawn_error_under_a_shebang_names_the_interpreter_not_the_tempfile() {
+        // Direct descendant of "a spawn error under a shell names the
+        // shell, not the script": the tempfile is ours and we just
+        // wrote it; what can fail to start is the interpreter.
+        let spec = script_spec("#!/usr/bin/env python3\nprint(1)", ShellMode::Platform);
+        match SHEBANG_ARM {
+            ShebangArm::Kernel => assert_eq!(spawn_program(&spec), "/usr/bin/env"),
+            ShebangArm::Interpreter => assert_eq!(spawn_program(&spec), "python3"),
+        }
+        // The fallback body's failure names the shell.
+        let spec = script_spec("echo hi", ShellMode::Named("fish".to_string()));
+        assert_eq!(spawn_program(&spec), "fish");
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_backslash_path_reaches_the_same_table_row() {
@@ -7153,7 +7231,7 @@ mod tests {
         // The table is platform-free: pinning cmd→/C on unix too stops
         // a future #[cfg] creeping in.
         let spec = source_spec(&["set /a 6*7"], ShellMode::Named("cmd".to_string()));
-        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(argv_of(&cmd), ["/C", "set /a 6*7"]);
     }
 
@@ -7233,7 +7311,7 @@ mod tests {
     #[test]
     fn shell_mode_goes_through_the_platform_shell() {
         let spec = source_spec(&["echo hi"], ShellMode::Platform);
-        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
+        let cmd = build_source_command(&spec, None, false, Appearance::Dark, terminal_geom(80, 24));
         #[cfg(unix)]
         {
             assert_eq!(program_of(&cmd), "sh");
