@@ -2,6 +2,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.15.0](https://github.com/kevinswiber/ratto/compare/1c4bfbf011ebc84b659fa7ede959970ae3a1c9b4..v0.15.0) - 2026-08-05
+#### Features
+- the inherit-command guard covers shell dialect changes - ([1b939bb](https://github.com/kevinswiber/ratto/commit/1b939bbfa0da9c93e76fc639246bba184b8d3354)) - [@kevinswiber](https://github.com/kevinswiber)
+- the dashboard shell key takes a shell name - ([1f7c34b](https://github.com/kevinswiber/ratto/commit/1f7c34b3475a5a72cdc3aaed398de25a8802c443)) - [@kevinswiber](https://github.com/kevinswiber)
+- --shell=NAME selects the shell the script runs through - ([7ae7457](https://github.com/kevinswiber/ratto/commit/7ae7457464e2ba8ec9571f50f9c999f2067c029c)) - [@kevinswiber](https://github.com/kevinswiber)
+- named shells get their dialect's command flags - ([f97fcb6](https://github.com/kevinswiber/ratto/commit/f97fcb6c60b83733e5dfd29303e4c9ee3d5d671e)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- a spawn error under a shell names the shell, not the script - ([331d008](https://github.com/kevinswiber/ratto/commit/331d008d6e2e927afdea8a79a1a187d1184f7d4d)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the shell selection story, dialect table included - ([291bb7b](https://github.com/kevinswiber/ratto/commit/291bb7b79c3e3b21356693c894045b28386523d0)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Refactoring
+- sources carry a shell mode, not a bool - ([1c4bfbf](https://github.com/kevinswiber/ratto/commit/1c4bfbf011ebc84b659fa7ede959970ae3a1c9b4)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.14.0](https://github.com/kevinswiber/ratto/compare/15e6b3afff91561cfc9d3e315ad031b5558415b6..v0.14.0) - 2026-08-04
 #### Features
 - append mode speaks the child's exit only when it changes - ([49cf9a7](https://github.com/kevinswiber/ratto/commit/49cf9a71ce53898c96f2ba6c0579590fd37c7576)) - [@kevinswiber](https://github.com/kevinswiber)
