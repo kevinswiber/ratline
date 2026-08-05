@@ -3247,18 +3247,11 @@ fn build_source_command(
 ) -> std::process::Command {
     // A shell spec holds the raw script as one element, so the join
     // reproduces it byte for byte.
-    let mut command = match &spec.shell {
-        ShellMode::Direct => {
+    let mut command = match shell_invocation(&spec.shell) {
+        Some((program, flags)) => shell_command(&program, flags, &spec.command.join(" ")),
+        None => {
             let mut cmd = std::process::Command::new(&spec.command[0]);
             cmd.args(&spec.command[1..]);
-            cmd
-        }
-        ShellMode::Platform => shell_command(&spec.command.join(" ")),
-        ShellMode::Named(program) => {
-            // Interim: every named shell takes `-c` until the dialect
-            // table arrives with the platform seam rework.
-            let mut cmd = std::process::Command::new(program);
-            cmd.arg("-c").arg(spec.command.join(" "));
             cmd
         }
     };
@@ -4277,18 +4270,79 @@ fn signature(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// The program `ShellMode::Platform` runs — resolved at spawn time,
+/// exactly as `%COMSPEC%` always was.
 #[cfg(unix)]
-fn shell_command(script: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg(script);
-    cmd
+fn platform_shell() -> String {
+    "sh".to_string()
 }
 
 #[cfg(windows)]
-fn shell_command(script: &str) -> std::process::Command {
-    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string());
-    let mut cmd = std::process::Command::new(shell);
-    cmd.arg("/C").arg(script);
+fn platform_shell() -> String {
+    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_string())
+}
+
+/// The platform shell's "run this string" flag. Fixed rather than
+/// looked up in the dialect table: bare `--shell` (and `shell=#true`)
+/// keeps its exact historical bytes even when `%COMSPEC%` names
+/// something exotic — selecting different flags takes an explicit
+/// `--shell=NAME`.
+#[cfg(unix)]
+fn platform_flags() -> &'static [&'static str] {
+    &["-c"]
+}
+
+#[cfg(windows)]
+fn platform_flags() -> &'static [&'static str] {
+    &["/C"]
+}
+
+/// The shell's own flag(s) for "run this string": `cmd` takes `/C`,
+/// PowerShell `-NoProfile -Command`, and everything else `-c` — sh,
+/// bash, zsh, fish, nu, dash, ksh all agree on it. Matched on the file
+/// NAME with a `.exe` stripped and lowercased, so a full path,
+/// `pwsh.exe` and `PWSH.EXE` all land on the same row. An unknown name
+/// is not an error: `-c` is what a program invoked with a script takes,
+/// and a wrong guess surfaces as the child's own diagnostic.
+///
+/// `-NoProfile` because the child respawns every tick: the profile's
+/// load cost would recur at the interval and anything it prints would
+/// land in the frame. A script that wants the profile opts back in
+/// (`--shell=pwsh -- '. $PROFILE; …'`); there would be no way to opt
+/// out.
+fn command_flags(program: &str) -> &'static [&'static str] {
+    let name = std::path::Path::new(program)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    // Windows names a program with its extension; unix never does —
+    // and ONLY `.exe` is stripped, so a wrapper script `cmd.sh` keeps
+    // `-c`.
+    match name.strip_suffix(".exe").unwrap_or(&name) {
+        "cmd" => &["/C"],
+        "powershell" | "pwsh" => &["-NoProfile", "-Command"],
+        _ => &["-c"],
+    }
+}
+
+/// The program and flags a mode spawns, or `None` when there is no
+/// shell. `Platform` NEVER consults the dialect table: bare `--shell`
+/// is frozen bytes even under an exotic `COMSPEC`.
+fn shell_invocation(mode: &ShellMode) -> Option<(String, &'static [&'static str])> {
+    match mode {
+        ShellMode::Direct => None,
+        ShellMode::Platform => Some((platform_shell(), platform_flags())),
+        ShellMode::Named(name) => Some((name.clone(), command_flags(name))),
+    }
+}
+
+/// One shell, one script. No `#[cfg]` — the platform lives in
+/// `platform_shell`/`platform_flags` and the dialect in
+/// `command_flags`.
+fn shell_command(program: &str, flags: &[&str], script: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(flags).arg(script);
     cmd
 }
 
@@ -6689,6 +6743,65 @@ mod tests {
         let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(program_of(&cmd), "fish");
         assert_eq!(argv_of(&cmd), ["-c", "echo hi"]);
+    }
+
+    #[test]
+    fn the_dialect_table_answers_by_file_name() {
+        for sh in [
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "nu",
+            "dash",
+            "ksh",
+            "/opt/homebrew/bin/fish",
+            "/bin/sh",
+            // Only `.exe` is stripped: a wrapper script named after a
+            // shell keeps `-c`.
+            "cmd.sh",
+            // Unknown names are not an error — `-c` is what a program
+            // invoked with a script takes, and a wrong guess surfaces
+            // as the child's own diagnostic.
+            "no-such-shell-xyz",
+        ] {
+            assert_eq!(command_flags(sh), ["-c"], "{sh}");
+        }
+        for sh in ["cmd", "cmd.exe", "CMD.EXE", "/usr/local/bin/cmd"] {
+            assert_eq!(command_flags(sh), ["/C"], "{sh}");
+        }
+        for sh in ["powershell", "pwsh", "pwsh.exe", "PowerShell.exe"] {
+            assert_eq!(command_flags(sh), ["-NoProfile", "-Command"], "{sh}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_path_reaches_the_same_table_row() {
+        // Backslash is a path separator only on Windows, so this
+        // spelling is pinned in the platform arm alone.
+        assert_eq!(command_flags(r"C:\WINDOWS\system32\cmd.exe"), ["/C"]);
+    }
+
+    #[test]
+    fn a_named_cmd_takes_slash_c_on_every_platform() {
+        // The table is platform-free: pinning cmd→/C on unix too stops
+        // a future #[cfg] creeping in.
+        let spec = source_spec(&["set /a 6*7"], ShellMode::Named("cmd".to_string()));
+        let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
+        assert_eq!(argv_of(&cmd), ["/C", "set /a 6*7"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_platform_flags_are_dash_c() {
+        assert_eq!(platform_flags(), ["-c"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_platform_flags_are_slash_c() {
+        assert_eq!(platform_flags(), ["/C"]);
     }
 
     #[test]
