@@ -756,7 +756,7 @@ pub(crate) fn run_registry(
                     // watch has no pane declaration — so there is no
                     // plain arm to mirror here.
                     let spec = registry.spec(source);
-                    let program = spec.command.first().map_or("", String::as_str);
+                    let program = spawn_program(spec);
                     let lines = pane_body(
                         &emission.stdout.concat(),
                         &emission.stderr.concat(),
@@ -764,7 +764,7 @@ pub(crate) fn run_registry(
                         // completion's business and cannot arrive here.
                         None,
                         &spec.id,
-                        program,
+                        &program,
                     );
                     let changed_now = record_pane_body(
                         &mut runtime[source.0],
@@ -802,12 +802,12 @@ pub(crate) fn run_registry(
                         Some(err) if session.once => {
                             return Err(anyhow!(
                                 "running {:?}: {err}",
-                                registry.spec(id).command[0]
+                                spawn_program(registry.spec(id))
                             )
                             .into());
                         }
                         Some(err) => (
-                            watch_spawn_error_text(&registry.spec(id).command[0], &err)
+                            watch_spawn_error_text(&spawn_program(registry.spec(id)), &err)
                                 .into_bytes(),
                             Vec::new(),
                         ),
@@ -859,7 +859,7 @@ pub(crate) fn run_registry(
                     // change. The comparand, marks, and last-change
                     // stamp move only on a distinct output.
                     let spec = registry.spec(id);
-                    let program = spec.command.first().map_or("", String::as_str);
+                    let program = spawn_program(spec);
                     // Concatenated for the same reason as the plain path
                     // above: the body is decoded whole, never per line.
                     let lines = pane_body(
@@ -867,7 +867,7 @@ pub(crate) fn run_registry(
                         &outcome.stderr.concat(),
                         outcome.spawn_error.as_ref(),
                         &spec.id,
-                        program,
+                        &program,
                     );
                     record_pane_body(
                         &mut runtime[id.0],
@@ -4337,6 +4337,16 @@ fn shell_invocation(mode: &ShellMode) -> Option<(String, &'static [&'static str]
     }
 }
 
+/// The program a spec actually spawns — the SHELL under a shell mode,
+/// where `command[0]` is the script rather than a program. A spawn
+/// error must name what failed to start.
+fn spawn_program(spec: &SourceSpec) -> String {
+    match shell_invocation(&spec.shell) {
+        Some((program, _)) => program,
+        None => spec.command[0].clone(),
+    }
+}
+
 /// One shell, one script. No `#[cfg]` — the platform lives in
 /// `platform_shell`/`platform_flags` and the dialect in
 /// `command_flags`.
@@ -6790,6 +6800,20 @@ mod tests {
         let spec = source_spec(&["set /a 6*7"], ShellMode::Named("cmd".to_string()));
         let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(argv_of(&cmd), ["/C", "set /a 6*7"]);
+    }
+
+    #[test]
+    fn a_spawn_error_names_the_shell_not_the_script() {
+        // Under a shell mode `command[0]` is the whole script, so an
+        // error that blames it names the wrong thing entirely.
+        let direct = source_spec(&["definitely-absent-xyz", "--flag"], ShellMode::Direct);
+        assert_eq!(spawn_program(&direct), "definitely-absent-xyz");
+
+        let named = source_spec(&["date; df -h"], ShellMode::Named("fish".to_string()));
+        assert_eq!(spawn_program(&named), "fish");
+
+        let platform = source_spec(&["date; df -h"], ShellMode::Platform);
+        assert_eq!(spawn_program(&platform), platform_shell());
     }
 
     #[cfg(unix)]
