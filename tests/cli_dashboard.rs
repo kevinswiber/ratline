@@ -1059,3 +1059,65 @@ fn a_script_body_with_no_shell_key_falls_back_to_the_platform_shell() {
         .success()
         .stdout(predicates::str::contains("promoted-shell"));
 }
+
+/// The three winvm-measured mechanisms at once: any one missing fails
+/// this — an unstripped `#!` (cmd chokes on the line), a missing `.cmd`
+/// extension ("is not recognized"), or a missing `cmd /C` (the file is
+/// not a PE).
+#[cfg(windows)]
+#[test]
+fn a_cmd_body_runs_as_a_batch_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "defaults height=4 chrome=#false\npane \"batch\" {\n    script \"#!cmd\\n@echo off\\nset /a x=6*7\\necho answer-%x%\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("answer-42"));
+}
+
+/// `.ps1` (pwsh refuses anything else), `env` substitution, and
+/// `-NoProfile` WITHOUT `-Command` (with `-Command` the path would be
+/// evaluated as an expression, not run as a file) — measured working
+/// form: `pwsh -NoProfile <file.ps1>`.
+#[cfg(windows)]
+#[test]
+fn a_pwsh_body_runs_as_a_ps1_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "defaults height=4 chrome=#false\npane \"ps\" {\n    script \"#!/usr/bin/env pwsh\\nWrite-Output (6 * 7)\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("42"));
+}
+
+/// The standard-spawn-does-the-search contract: `env powershell`
+/// resolves the name on PATH (Rust Command's walk with `.exe`
+/// inference; no PATHEXT), and Windows PowerShell answers.
+#[cfg(windows)]
+#[test]
+fn an_env_shebang_finds_its_interpreter_on_the_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "defaults height=4 chrome=#false\npane \"onpath\" {\n    script \"#!/usr/bin/env powershell\\nWrite-Output found-on-path\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("found-on-path"));
+}
