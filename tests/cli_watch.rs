@@ -168,6 +168,18 @@ fn a_shell_name_needs_the_equals_sign() {
         .stderr(predicates::str::contains("fish"));
 }
 
+#[cfg(windows)]
+#[test]
+fn a_named_cmd_computes_through_it() {
+    // The windows twin of the unix `--shell=sh` arm: a NAMED cmd must
+    // actually spawn and compute, not merely build a Command.
+    rat()
+        .args(["watch", "--once", "--shell=cmd", "--", "set /a 6*7"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("42"));
+}
+
 #[test]
 fn a_shell_spawn_failure_names_the_shell() {
     // Under a shell mode the script is command[0]; the error must

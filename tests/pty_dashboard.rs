@@ -2147,3 +2147,29 @@ row {{
         "dashboard should have exited on q"
     );
 }
+
+/// The KDL surface reaching real bytes: a NAMED shell in `defaults`
+/// spawns the pane's script through that shell — the arithmetic only
+/// computes if `sh` actually ran it.
+#[test]
+fn a_named_shell_in_defaults_reaches_the_frame() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "defaults height=5 shell=\"sh\"\npane \"math\" {\n    command \"echo $((6 * 7))\"\n}\n",
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"42", Duration::from_secs(5)),
+        "the named shell's arithmetic never painted"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
