@@ -2,6 +2,21 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.16.0](https://github.com/kevinswiber/ratto/compare/ecca9dcada7ab1f88aa5d4478f6f88597dcec5b7..v0.16.0) - 2026-08-05
+#### Features
+- script bodies resolve with their own rules - ([b734017](https://github.com/kevinswiber/ratto/commit/b7340178b1489e630a6ca61c4c919e604d6c9ad9)) - [@kevinswiber](https://github.com/kevinswiber)
+- the script key joins the pane grammar - ([764a86d](https://github.com/kevinswiber/ratto/commit/764a86d006776a1c12a7691594a87a56fddd6301)) - [@kevinswiber](https://github.com/kevinswiber)
+- shebang bodies materialize once into a private per-run directory - ([38a3285](https://github.com/kevinswiber/ratto/commit/38a32858aa092db191ad9b2e3f1836842368276c)) - [@kevinswiber](https://github.com/kevinswiber)
+- sources carry a program, argv or script body - ([b2c7587](https://github.com/kevinswiber/ratto/commit/b2c7587aab1aa6e7b7e3ca72effd5f36a166af40)) - [@kevinswiber](https://github.com/kevinswiber)
+- the interpreter arm's tables answer name, flags, extension, bytes - ([65fc75a](https://github.com/kevinswiber/ratto/commit/65fc75a7b8ef691927ebf79ed1bd94babba9b4a2)) - [@kevinswiber](https://github.com/kevinswiber)
+- a shebang parser decides a body's route - ([ecca9dc](https://github.com/kevinswiber/ratto/commit/ecca9dcada7ab1f88aa5d4478f6f88597dcec5b7)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- a long pane id no longer overflows the script file name - ([7cb5eca](https://github.com/kevinswiber/ratto/commit/7cb5eca32dd6644296882a49c71858c46f69e282)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the script-body story, dedent rule included - ([fa0a1b7](https://github.com/kevinswiber/ratto/commit/fa0a1b7dd1ab25c70a494669215b7f19a5566bee)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.15.0](https://github.com/kevinswiber/ratto/compare/1c4bfbf011ebc84b659fa7ede959970ae3a1c9b4..v0.15.0) - 2026-08-05
 #### Features
 - the inherit-command guard covers shell dialect changes - ([1b939bb](https://github.com/kevinswiber/ratto/commit/1b939bbfa0da9c93e76fc639246bba184b8d3354)) - [@kevinswiber](https://github.com/kevinswiber)
