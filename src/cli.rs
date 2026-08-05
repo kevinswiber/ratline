@@ -466,9 +466,11 @@ pub struct WatchArgs {
     /// Skip synchronized-output escapes
     #[arg(long)]
     pub no_sync: bool,
-    /// Run the command through `sh -c`
-    #[arg(long)]
-    pub shell: bool,
+    /// Run the command through a shell: `sh` on unix, `%COMSPEC%` on
+    /// Windows. `--shell=NAME` picks another (`--shell=fish`,
+    /// `--shell=pwsh`) — a full path works too
+    #[arg(long, num_args = 0..=1, require_equals = true, value_name = "NAME")]
+    pub shell: Option<Option<String>>,
     /// Bold title line above the output
     #[arg(long)]
     pub title: Option<String>,

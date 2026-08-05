@@ -30,8 +30,6 @@ pub enum ShellMode {
     /// `sh` on unix, `%COMSPEC%` (or `cmd`) on Windows.
     Platform,
     /// The named program, invoked with its dialect's command flag.
-    // Constructed only by tests until the selection surfaces land.
-    #[allow(dead_code)]
     Named(String),
 }
 

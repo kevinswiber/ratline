@@ -131,6 +131,60 @@ fn shell_mode_runs_through_the_platform_shell() {
         .stdout(predicates::str::contains("42"));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_named_shell_runs_the_command_through_it() {
+    // sh exists on every unix, and the arithmetic only works via a
+    // shell. Unix-only: this suite also runs on Windows, where a NAMED
+    // `sh` does not exist — the windows twin names cmd instead.
+    rat()
+        .args(["watch", "--once", "--shell=sh", "--", "echo $((6 * 7))"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("42"));
+}
+
+#[test]
+fn an_empty_shell_name_is_refused() {
+    // An empty value is nearly always a variable that expanded to
+    // nothing; silently taking the platform shell would hide it.
+    for flag in ["--shell=", "--shell=   "] {
+        rat()
+            .args(["watch", "--once", flag, "--", "echo hi"])
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains("names an empty shell"));
+    }
+}
+
+#[test]
+fn a_shell_name_needs_the_equals_sign() {
+    // Without the equals requirement, `--shell fish` would swallow a
+    // free-standing word as the shell name. Pin that it errors instead.
+    rat()
+        .args(["watch", "--once", "--shell", "fish", "--", "echo hi"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("fish"));
+}
+
+#[test]
+fn a_shell_spawn_failure_names_the_shell() {
+    // Under a shell mode the script is command[0]; the error must
+    // blame the program that failed to start, not the script.
+    rat()
+        .args([
+            "watch",
+            "--once",
+            "--shell=definitely-no-such-shell-xyz",
+            "--",
+            "date",
+        ])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("definitely-no-such-shell-xyz"));
+}
+
 #[test]
 fn child_stderr_passes_through_when_piped() {
     rat()

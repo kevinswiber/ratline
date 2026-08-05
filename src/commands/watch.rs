@@ -171,12 +171,7 @@ pub fn run(args: WatchArgs, profile: ColorProfile, palette: Palette) -> AppResul
         .or(triggers.is_empty().then_some("2s"));
     let live_tail = live_suffix(args.once, interval_label, !triggers.is_empty());
     let help_extra = trigger_help(&triggers);
-    // Bridge until the flag learns names: `--shell` still speaks bool.
-    let shell = if args.shell {
-        ShellMode::Platform
-    } else {
-        ShellMode::Direct
-    };
+    let shell = shell_mode(args.shell.as_ref())?;
     let registry = Registry::single(
         SourceSpec {
             id: String::new(),
@@ -4337,6 +4332,23 @@ fn shell_invocation(mode: &ShellMode) -> Option<(String, &'static [&'static str]
     }
 }
 
+/// The `--shell` flag as a mode. Absent is no shell, bare is the
+/// platform's, and a value names the program. An EMPTY value names
+/// nothing — almost always a variable that expanded to nothing — so it
+/// is refused rather than quietly taking the platform's shell.
+fn shell_mode(flag: Option<&Option<String>>) -> anyhow::Result<ShellMode> {
+    match flag {
+        None => Ok(ShellMode::Direct),
+        Some(None) => Ok(ShellMode::Platform),
+        Some(Some(name)) if name.trim().is_empty() => Err(anyhow!(
+            "--shell= names an empty shell — likely a variable that expanded \
+             to nothing; write --shell=NAME (e.g. --shell=fish) or bare \
+             --shell for the platform's shell"
+        )),
+        Some(Some(name)) => Ok(ShellMode::Named(name.clone())),
+    }
+}
+
 /// The program a spec actually spawns — the SHELL under a shell mode,
 /// where `command[0]` is the script rather than a program. A spawn
 /// error must name what failed to start.
@@ -6800,6 +6812,26 @@ mod tests {
         let spec = source_spec(&["set /a 6*7"], ShellMode::Named("cmd".to_string()));
         let cmd = build_source_command(&spec, false, Appearance::Dark, terminal_geom(80, 24));
         assert_eq!(argv_of(&cmd), ["/C", "set /a 6*7"]);
+    }
+
+    #[test]
+    fn the_shell_flag_maps_to_a_mode() {
+        assert_eq!(shell_mode(None).unwrap(), ShellMode::Direct);
+        assert_eq!(shell_mode(Some(&None)).unwrap(), ShellMode::Platform);
+        assert_eq!(
+            shell_mode(Some(&Some("fish".to_string()))).unwrap(),
+            ShellMode::Named("fish".to_string())
+        );
+        // Empty and whitespace-only both refuse, naming the problem
+        // and the fix.
+        for empty in ["", "   "] {
+            let err = format!(
+                "{:#}",
+                shell_mode(Some(&Some(empty.to_string()))).unwrap_err()
+            );
+            assert!(err.contains("names an empty shell"), "{err}");
+            assert!(err.contains("--shell=NAME"), "{err}");
+        }
     }
 
     #[test]
