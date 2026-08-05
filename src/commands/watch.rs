@@ -278,6 +278,13 @@ pub(crate) fn run_registry(
             }
         }
     }
+    // Script bodies are materialized ONCE per run, before the terminal
+    // changes: a body that cannot be written is a load failure, not a
+    // pane that fails forever. The binding is NAMED — `let _ =` would
+    // remove the directory here and now — and it is declared BEFORE the
+    // shutdown guards so it drops after them: children die first, then
+    // the files they were running.
+    let scripts = ScriptFiles::materialize(&registry)?;
     let _raw_guard = if interactive {
         Some(RawModeGuard::enable().context("enabling raw mode")?)
     } else {
@@ -650,8 +657,14 @@ pub(crate) fn run_registry(
                 let retention = retention_for(&registry, id);
                 let mut inline = session.once && plain;
                 if !inline {
-                    let command =
-                        source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
+                    let command = source_command(
+                        &registry,
+                        &scripts,
+                        id,
+                        interactive,
+                        palette.appearance,
+                        geom[id.0],
+                    );
                     inline = match runtime[id.0].emissions.clone() {
                         // A live source is spawned once and never expected
                         // to exit, so its body reaches the loop through the
@@ -686,8 +699,14 @@ pub(crate) fn run_registry(
                     };
                 }
                 if inline {
-                    let command =
-                        source_command(&registry, id, interactive, palette.appearance, geom[id.0]);
+                    let command = source_command(
+                        &registry,
+                        &scripts,
+                        id,
+                        interactive,
+                        palette.appearance,
+                        geom[id.0],
+                    );
                     let _ = runtime[id.0].tx.send(TickEvent::Completed(run_tick(
                         command,
                         id,
@@ -3338,12 +3357,19 @@ fn retention_for(registry: &Registry, id: SourceId) -> Retention {
 /// one, so no RAT_PANE is ever exported to a plain watch child.
 fn source_command(
     registry: &Registry,
+    scripts: &ScriptFiles,
     id: SourceId,
     interactive: bool,
     appearance: Appearance,
     geom: PaneGeometry,
 ) -> std::process::Command {
-    let mut command = build_source_command(registry.spec(id), None, interactive, appearance, geom);
+    let mut command = build_source_command(
+        registry.spec(id),
+        scripts.path(id),
+        interactive,
+        appearance,
+        geom,
+    );
     if registry.pane(id).is_some() {
         command.env("RAT_PANE", &registry.spec(id).id);
     }
@@ -4405,6 +4431,81 @@ fn shell_command(program: &str, flags: &[&str], script: &str) -> std::process::C
     cmd
 }
 
+/// Every source's materialized script, by `SourceId`, and the private
+/// directory holding them. Bodies are static for a run: written ONCE
+/// at load, the path re-executed on every respawn tick, the directory
+/// removed when this drops (children are already down by drop order —
+/// the shutdown guards are declared after this binding). A dashboard
+/// with no `#!` body builds the `Default` — no directory, no syscall,
+/// nothing on disk. Removal failure is silent litter in the OS tmpdir
+/// (`TempDir::drop` ignores errors by design); never a retry, never a
+/// message.
+#[derive(Default)]
+struct ScriptFiles {
+    /// Held for Drop alone: OWNING the TempDir is what removes the
+    /// directory when this drops. Nothing reads it — the paths below
+    /// are the lookups — so the field is dead to the reachability
+    /// analysis on purpose.
+    #[allow(dead_code)]
+    dir: Option<tempfile::TempDir>,
+    paths: Vec<Option<std::path::PathBuf>>,
+}
+
+impl ScriptFiles {
+    /// Write every shebang body once. A no-shebang `Script` body gets
+    /// no file — it runs through the shell fallback route instead, so
+    /// `path` answering `Some` is exactly "this body has a shebang".
+    fn materialize(registry: &Registry) -> anyhow::Result<ScriptFiles> {
+        let bodies: Vec<(SourceId, Shebang, &str)> = registry
+            .ids()
+            .filter_map(|id| match &registry.spec(id).program {
+                SourceProgram::Script(body) => shebang(body).map(|line| (id, line, body.as_str())),
+                SourceProgram::Argv(_) => None,
+            })
+            .collect();
+        if bodies.is_empty() {
+            return Ok(ScriptFiles::default());
+        }
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("rat-script.");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let dir = builder.tempdir().context("creating the script directory")?;
+        let mut paths = vec![None; registry.ids().count()];
+        for (id, line, body) in bodies {
+            let stem = format!("{}-{}", id.0, registry.spec(id).id);
+            let (name, bytes) = script_file(SHEBANG_ARM, &line, &stem, body);
+            let path = dir.path().join(name);
+            // Mode set AT creation — no window where the file lacks it;
+            // the handle drops before any spawn (sidesteps ETXTBSY).
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o700);
+            }
+            use std::io::Write;
+            options
+                .open(&path)
+                .and_then(|mut file| file.write_all(bytes.as_bytes()))
+                .with_context(|| format!("writing the script for {:?}", registry.spec(id).id))?;
+            paths[id.0] = Some(path);
+        }
+        Ok(ScriptFiles {
+            dir: Some(dir),
+            paths,
+        })
+    }
+
+    fn path(&self, id: SourceId) -> Option<&std::path::Path> {
+        self.paths.get(id.0)?.as_deref()
+    }
+}
+
 /// Which half of the platform split executes a `#!` body.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum ShebangArm {
@@ -4527,8 +4628,6 @@ fn script_bytes(arm: ShebangArm, program: &str, body: &str) -> String {
 /// bytes, for one arm. Extension and rewrite both key on the RESOLVED
 /// program (post-`env` substitution), so `#!/usr/bin/env pwsh` gets
 /// `.ps1`.
-// staged(dead_code): consumed by the materializer; see SHEBANG_ARM.
-#[allow(dead_code)]
 fn script_file(arm: ShebangArm, line: &Shebang, stem: &str, body: &str) -> (String, String) {
     let (program, _) = interpreter_invocation(line);
     let name = format!("{stem}{}", script_extension(arm, &program));
@@ -7216,6 +7315,78 @@ mod tests {
         // The fallback body's failure names the shell.
         let spec = script_spec("echo hi", ShellMode::Named("fish".to_string()));
         assert_eq!(spawn_program(&spec), "fish");
+    }
+
+    #[test]
+    fn a_dashboard_without_a_script_body_creates_no_temp_directory() {
+        // No shebang body, no directory, no syscall — the Default.
+        let registry = Registry::single(source_spec(&["true"], ShellMode::Direct), None);
+        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        assert!(scripts.dir.is_none());
+        assert!(scripts.path(SourceId(0)).is_none());
+    }
+
+    #[test]
+    fn a_shebang_body_is_written_once_where_its_source_can_find_it() {
+        let registry =
+            Registry::single(script_spec("#!/bin/sh\necho hi", ShellMode::Platform), None);
+        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let path = scripts
+            .path(SourceId(0))
+            .expect("a shebang body has a path");
+        // Index-prefixed stem: duplicate pane ids are legal (first-win),
+        // so an id-only name would let two panes share one file.
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("0-")
+        );
+        // The author's bytes, verbatim (sh is not the cmd exception).
+        let bytes = std::fs::read_to_string(path).unwrap();
+        assert_eq!(bytes, "#!/bin/sh\necho hi");
+        // A no-shebang Script body gets NO file — it takes the shell
+        // fallback route instead.
+        let registry = Registry::single(script_spec("echo hi", ShellMode::Platform), None);
+        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        assert!(scripts.path(SourceId(0)).is_none());
+        assert!(scripts.dir.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_script_file_is_private_to_its_owner() {
+        // Exists because tempfile's default directory mode is
+        // umask-derived, NOT 0700 (verified in 3.27.0: dir mode is set
+        // only when permissions are given) — omitting the explicit
+        // permission would be silent and invisible in behavior.
+        use std::os::unix::fs::PermissionsExt;
+        let registry =
+            Registry::single(script_spec("#!/bin/sh\necho hi", ShellMode::Platform), None);
+        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let path = scripts.path(SourceId(0)).unwrap().to_path_buf();
+        let dir = path.parent().unwrap().to_path_buf();
+        for p in [&dir, &path] {
+            let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn the_script_directory_leaves_with_the_guard() {
+        let registry =
+            Registry::single(script_spec("#!/bin/sh\necho hi", ShellMode::Platform), None);
+        let scripts = ScriptFiles::materialize(&registry).unwrap();
+        let dir = scripts
+            .path(SourceId(0))
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(dir.exists());
+        drop(scripts);
+        assert!(!dir.exists());
     }
 
     #[cfg(windows)]
