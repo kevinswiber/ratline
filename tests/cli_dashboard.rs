@@ -1004,3 +1004,58 @@ pane "follower" live=#true {{
         "--once must emit exactly one frame: {stdout:?}"
     );
 }
+
+/// The no-shebang fallback, through a NAMED shell — and the tmpdir
+/// stays untouched: a body with no `#!` is never materialized.
+#[cfg(unix)]
+#[test]
+fn a_script_body_with_no_shebang_falls_back_to_the_shell() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tmp = tempfile::tempdir().expect("isolated TMPDIR");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        "defaults height=3 chrome=#false\npane \"fall\" {\n    shell \"sh\"\n    script \"echo fell-back\"\n}\n",
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .env("TMPDIR", tmp.path())
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("fell-back"));
+    let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        .expect("read the isolated tmpdir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("rat-script.")
+        })
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// The no-shebang fallback with NO shell key anywhere: absence promotes
+/// to the platform's shell — the same thing `shell #true` means — so a
+/// plain body just works on every platform. The body invokes the rat
+/// binary, this file's portable-child convention.
+#[test]
+fn a_script_body_with_no_shell_key_falls_back_to_the_platform_shell() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "defaults height=3 chrome=#false\npane \"fall\" {{\n    script \"\\\"{bin}\\\" style promoted-shell\"\n}}\n",
+            bin = rat_bin().replace('\\', "\\\\\\\\")
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("promoted-shell"));
+}

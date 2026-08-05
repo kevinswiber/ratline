@@ -2173,3 +2173,125 @@ fn a_named_shell_in_defaults_reaches_the_frame() {
         "dashboard should have exited on q"
     );
 }
+
+/// The interpreter route, discriminated: under kernel-exec `$0` IS the
+/// materialized path (so the frame carries the private dir's
+/// `rat-script.` prefix); under the shell fallback `$0` would be `sh`.
+#[test]
+fn a_shebang_script_body_paints_through_its_own_interpreter() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        "defaults height=5 chrome=#false\npane \"self\" {\n    script \"\"\"\n        #!/bin/sh\n        echo $0\n        \"\"\"\n}\n",
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"rat-script.",
+            Duration::from_secs(5)
+        ),
+        "the script's own path never painted — the body did not run as a file"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Written once per load, the SAME path re-executed each tick: the body
+/// appends its `$0` to a side file, and every appended line must agree.
+/// Per-tick materialization would show a different random directory.
+#[test]
+fn a_respawn_reuses_the_script_written_at_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("paths.log");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "defaults height=5 interval=\"1s\" chrome=#false\npane \"self\" {{\n    script \"\"\"\n        #!/bin/sh\n        echo $0 >> \"{}\"\n        echo ran\n        \"\"\"\n}}\n",
+            log.display()
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"ran", Duration::from_secs(5)),
+        "the script never painted"
+    );
+    // Wait for the SECOND tick's evidence in the side file — file
+    // bytes, not a drain window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let lines = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        if lines.len() >= 2 {
+            break lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second tick never ran; log so far: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(lines[0].contains("rat-script."), "{lines:?}");
+    assert!(
+        lines.iter().all(|line| line == &lines[0]),
+        "ticks ran different files: {lines:?}"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The whole lifecycle's cheapest strong witness: the private directory
+/// is gone once the dashboard exits.
+#[test]
+fn the_script_directory_is_gone_when_the_dashboard_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = dir.path().join("path.log");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            "defaults height=5 chrome=#false\npane \"self\" {{\n    script \"\"\"\n        #!/bin/sh\n        echo $0 > \"{}\"\n        echo ran\n        \"\"\"\n}}\n",
+            log.display()
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"ran", Duration::from_secs(5)),
+        "the script never painted"
+    );
+    let script_path = std::path::PathBuf::from(
+        std::fs::read_to_string(&log)
+            .expect("the body wrote its path")
+            .trim()
+            .to_string(),
+    );
+    let script_dir = script_path.parent().expect("a parent dir").to_path_buf();
+    assert!(script_dir.exists(), "{script_dir:?}");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+    assert!(
+        !script_dir.exists(),
+        "the private script directory survived exit: {script_dir:?}"
+    );
+}
