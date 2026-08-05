@@ -1044,12 +1044,22 @@ fn a_script_body_with_no_shebang_falls_back_to_the_shell() {
 #[test]
 fn a_script_body_with_no_shell_key_falls_back_to_the_platform_shell() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // The body is UNQUOTED on purpose: the test binary's path carries
+    // no spaces, and a quote inside a `cmd /C` body is mangled by the
+    // spawn path's argument quoting (cmd does not parse `\"`) — a
+    // shipped property of the platform-shell route, not this plan's.
+    // cmd also wants backslash separators for a program path.
+    let bin = if cfg!(windows) {
+        rat_bin().replace('/', "\\")
+    } else {
+        rat_bin()
+    };
     let file = fixture(
         dir.path(),
         "board.kdl",
         &format!(
-            "defaults height=3 chrome=#false\npane \"fall\" {{\n    script \"\\\"{bin}\\\" style promoted-shell\"\n}}\n",
-            bin = rat_bin().replace('\\', "\\\\\\\\")
+            "defaults height=3 chrome=#false\npane \"fall\" {{\n    script \"{bin} style promoted-shell\"\n}}\n",
+            bin = bin.replace('\\', "\\\\")
         ),
     );
     rat()
