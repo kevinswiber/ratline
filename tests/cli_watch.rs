@@ -180,6 +180,42 @@ fn a_named_cmd_computes_through_it() {
         .stdout(predicates::str::contains("42"));
 }
 
+#[cfg(windows)]
+#[test]
+fn a_quoted_program_in_a_platform_shell_body_runs() {
+    // cmd does not parse the `\"` escapes MSVCRT-style argument quoting
+    // writes, so the body must reach `cmd /C` byte-for-byte or a quoted
+    // program name turns to garbage ("'\"C:\…' is not recognized").
+    // Quoting the path is exactly what an author with a spaced path
+    // must write, so the quoted spelling has to survive the trip.
+    let body = format!(
+        "\"{}\" style quoted-platform-ran",
+        rat_bin().replace('/', "\\")
+    );
+    rat()
+        .args(["watch", "--once", "--shell", "--", &body])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("quoted-platform-ran"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_quoted_program_in_a_named_cmd_body_runs() {
+    // The Named twin of the platform arm above: `--shell=cmd` reaches
+    // `/C` through the dialect table rather than `COMSPEC`, and the
+    // same verbatim contract must hold.
+    let body = format!(
+        "\"{}\" style quoted-named-ran",
+        rat_bin().replace('/', "\\")
+    );
+    rat()
+        .args(["watch", "--once", "--shell=cmd", "--", &body])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("quoted-named-ran"));
+}
+
 #[test]
 fn a_shell_spawn_failure_names_the_shell() {
     // Under a shell mode the script is command[0]; the error must

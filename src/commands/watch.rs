@@ -4422,12 +4422,27 @@ fn spawn_program(spec: &SourceSpec) -> String {
     }
 }
 
-/// One shell, one script. No `#[cfg]` — the platform lives in
+/// One shell, one script. The platform lives in
 /// `platform_shell`/`platform_flags` and the dialect in
-/// `command_flags`.
+/// `command_flags`; the one `#[cfg]` here is QUOTING, a concern only
+/// Windows has — unix hands the script over as a real argv element
+/// and never serializes it into a command line.
 fn shell_command(program: &str, flags: &[&str], script: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
-    cmd.args(flags).arg(script);
+    cmd.args(flags);
+    // cmd.exe does not parse the `\"` escapes MSVCRT-style argument
+    // quoting writes, so a body handed to `/C` must be the author's
+    // bytes verbatim — exactly what typing it at a prompt would send.
+    // `/C` marks the dialect: only cmd (and the Windows platform
+    // shell, which is cmd) takes it. The other dialects keep the
+    // quoted form their parsers understand.
+    #[cfg(windows)]
+    if matches!(flags, ["/C"]) {
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg(script);
+        return cmd;
+    }
+    cmd.arg(script);
     cmd
 }
 

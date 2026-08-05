@@ -1044,11 +1044,9 @@ fn a_script_body_with_no_shebang_falls_back_to_the_shell() {
 #[test]
 fn a_script_body_with_no_shell_key_falls_back_to_the_platform_shell() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // The body is UNQUOTED on purpose: the test binary's path carries
-    // no spaces, and a quote inside a `cmd /C` body is mangled by the
-    // spawn path's argument quoting (cmd does not parse `\"`) — a
-    // shipped property of the platform-shell route, not this plan's.
-    // cmd also wants backslash separators for a program path.
+    // cmd wants backslash separators for a program path. The body is
+    // unquoted — the quoted spelling has its own windows arm
+    // (`a_quoted_program_in_a_script_body_runs`).
     let bin = if cfg!(windows) {
         rat_bin().replace('/', "\\")
     } else {
@@ -1068,6 +1066,34 @@ fn a_script_body_with_no_shell_key_falls_back_to_the_platform_shell() {
         .assert()
         .success()
         .stdout(predicates::str::contains("promoted-shell"));
+}
+
+/// A script body that QUOTES its program path, routed through the
+/// promoted platform shell — the spelling an author with a spaced path
+/// must write. The body has to reach `cmd /C` byte-for-byte: cmd does
+/// not parse the `\"` escapes MSVCRT-style argument quoting writes.
+#[cfg(windows)]
+#[test]
+fn a_quoted_program_in_a_script_body_runs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let body = format!(
+        "\"{}\" style quoted-script-ran",
+        rat_bin().replace('/', "\\")
+    );
+    let file = fixture(
+        dir.path(),
+        "board.kdl",
+        &format!(
+            "defaults height=3 chrome=#false\npane \"quoted\" {{\n    script \"{body}\"\n}}\n",
+            body = body.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("quoted-script-ran"));
 }
 
 /// The three winvm-measured mechanisms at once: any one missing fails
