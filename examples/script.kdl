@@ -1,0 +1,37 @@
+// Script bodies: a pane may declare a multi-line `script` instead of a
+// `command`. Four facts an author cannot guess:
+//
+// 1. Multi-line bodies use KDL's `"""` blocks, and KDL removes the
+//    CLOSING quotes' indentation from every line — align the closing
+//    `"""` with the script so the `#!` lands on the body's first byte.
+//    (An indented `#!` is refused with an error naming this rule.)
+// 2. A body whose first two bytes are `#!` runs through its own
+//    interpreter: the body is written once per run to a private file
+//    and re-executed every tick. No `#!` means the body runs through
+//    the pane's shell (the `shell` key, or the platform's) — exactly
+//    the unix no-shebang fallback.
+// 3. On Windows there is no kernel shebang, so rat parses the first
+//    line itself: `cmd` bodies are named `.cmd` (their `#!` line is
+//    stripped — `#` is not batch syntax), PowerShell bodies are named
+//    `.ps1`, and `/usr/bin/env X` resolves `X` on PATH.
+// 4. For a body full of backslashes — sed, awk, regexes — use a raw
+//    block (`#"""` … `"""#`) so the escaping is the interpreter's job
+//    alone.
+
+defaults height=6 interval="5s"
+
+pane "shebang" title="its own interpreter" {
+    script """
+        #!/bin/sh
+        echo "run by: $0"
+        date
+        """
+}
+
+pane "fallback" title="no #! — the pane's shell" {
+    shell "sh"
+    script """
+        n=$(date +%S)
+        echo "seconds now: $n"
+        """
+}

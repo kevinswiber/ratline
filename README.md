@@ -278,6 +278,38 @@ a script with backslashes in it — a `sed` program,
 say — reach for KDL's raw strings (`command #"sed 's/\t/ · /'"#`) so
 the escaping is the shell's job alone.
 
+A pane can also declare a whole `script` instead of a `command` — a
+multi-line body in KDL's `"""` block form:
+
+```kdl
+pane "deps" {
+    script """
+        #!/usr/bin/env python3
+        import json, pathlib
+        lock = json.loads(pathlib.Path("deps.json").read_text())
+        print(len(lock["packages"]), "packages")
+        """
+}
+```
+
+A body whose first two bytes are `#!` runs through its own
+interpreter: rat writes it once per run to a private file and
+re-executes that file every tick, so python, node, ruby — anything —
+works without `-c`/`-e` gymnastics. On unix the kernel does the
+shebang honors; on Windows rat reads the first line itself, resolves
+`/usr/bin/env X` by name on `PATH`, and gives the file the extension
+the interpreter insists on (`.ps1` for PowerShell; `.cmd` for cmd,
+whose `#!` line is stripped — `#` is not batch syntax). A body with
+no `#!` runs through the pane's shell instead — the `shell` key, or
+the platform's — exactly the unix no-shebang fallback.
+
+One alignment rule matters: KDL removes the CLOSING `"""`'s
+indentation from every line, so align the closing quotes with the
+script to land the `#!` on the body's first byte — an indented `#!`
+is refused with an error naming this rule. For regex-heavy bodies the
+raw block form (`#"""` … `"""#`) keeps backslashes untouched. See
+[examples/script.kdl](examples/script.kdl).
+
 Every key a `pane` or `defaults` block accepts holds exactly one value,
 so it may be written either as a property or as a child node —
 `interval="5s"` and `interval "5s"` mean the same thing, and the

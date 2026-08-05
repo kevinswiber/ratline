@@ -37,3 +37,6 @@ row {
         height 4
     }
 }
+
+// A pane can declare a multi-line `script` (with or without a `#!`
+// line) instead of a `command` — see script.kdl.

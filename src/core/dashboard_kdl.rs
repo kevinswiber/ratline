@@ -1395,6 +1395,7 @@ pane "nested" {
             include_str!("../../examples/panes.kdl"),
             include_str!("../../examples/panes-nested.kdl"),
             include_str!("../../examples/follow.kdl"),
+            include_str!("../../examples/script.kdl"),
         ] {
             parse(text)
                 .expect("the example parses")
