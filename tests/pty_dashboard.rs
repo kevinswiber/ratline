@@ -4,7 +4,8 @@ mod common;
 use std::time::Duration;
 
 use common::pty::{
-    FakeTerminal, PtySession, assert_counter_settled_at, counter_cmd, wait_for, wait_for_counter,
+    FakeTerminal, PtySession, assert_counter_settled_at, counter_cmd, first_unmatched_in_order,
+    try_wait_for_in_order, wait_for, wait_for_counter, wait_for_in_order,
 };
 
 /// Path to the rat binary — duplicated from the watch suite's local
@@ -191,29 +192,19 @@ fn a_resize_reflows_the_boxes_before_any_child_returns() {
     // 80 -> 120 columns: each 1fr pane grows past 45 cells, which no
     // 80-column frame can contain.
     session.set_winsize(24, 120);
-    let wide = "─".repeat(45);
-    let bytes = wait_for_bytes(
-        &session,
-        &mut terminal,
-        wide.as_bytes(),
-        Duration::from_secs(5),
-    )
-    .expect("the boxes never reflowed");
     // The reflow came from RETAINED output: a respawn would have
     // produced -2, and the counters only move forward. Both panes are
-    // named so neither can stand in for the other.
-    let first_wide = bytes
-        .windows(wide.len())
-        .position(|w| w == wide.as_bytes())
-        .expect("the wide border");
-    let reflowed = &bytes[first_wide..];
-    for still_at_one in [b"left-1".as_slice(), b"right-1".as_slice()] {
-        assert!(
-            contains(reflowed, still_at_one),
-            "the wide frame must carry retained output, not a re-run: {:?}",
-            String::from_utf8_lossy(reflowed)
-        );
-    }
+    // named so neither can stand in for the other. ONE ordered
+    // capture: the retained bodies paint BELOW the wide border and can
+    // legally miss the read chunk that carried it — the in-order match
+    // encodes "after the border" without a slice.
+    let wide = "─".repeat(45);
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-1", b"right-1"],
+        Duration::from_secs(5),
+    );
 
     // …and then, once the window closes, exactly one respawn of EVERY
     // source: child-side evidence, value-based, never a sleep.
@@ -289,7 +280,7 @@ fn a_resize_reaches_the_panes_that_were_not_due() {
 fn wait_for_bytes_verbose(
     session: &PtySession,
     terminal: &mut FakeTerminal,
-    needle: &[u8],
+    needles: &[&[u8]],
     timeout: Duration,
 ) -> (bool, Vec<u8>, Vec<(f64, usize)>) {
     let start = std::time::Instant::now();
@@ -308,7 +299,7 @@ fn wait_for_bytes_verbose(
         terminal.respond(session, &chunk);
         seen.extend_from_slice(&chunk);
         chunks.push((start.elapsed().as_secs_f64(), chunk.len()));
-        if contains(&seen, needle) {
+        if first_unmatched_in_order(&seen, needles).is_none() {
             return (true, seen, chunks);
         }
     }
@@ -1008,10 +999,18 @@ fn a_cycle_of_two_panes_earns_its_badge_and_its_notice() {
     // nothing, so a generous-looking number buys no tolerance and costs
     // the evidence. Subtracting what has already elapsed means a slow
     // first paint eats its own margin instead of this wait's.
-    let seen = wait_for_bytes(
+    // The stop condition carries the notice's TAIL as well: "file:"
+    // and "? help" follow the needle inside the same line, and a
+    // capture returned at the prefix can legally end mid-notice. The
+    // try-variant so the session still shuts down before judging.
+    let seen = try_wait_for_in_order(
         &session,
         &mut terminal,
-        "a, b: trigger loop suspected:".as_bytes(),
+        &[
+            "a, b: trigger loop suspected:".as_bytes(),
+            b"file:",
+            b"? help",
+        ],
         REPORT_BUDGET
             .saturating_sub(started.elapsed())
             .max(Duration::from_secs(1)),
@@ -1129,8 +1128,12 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     // appears in the declaration this test wrote — so a startup error quoting
     // the command would satisfy this wait without a frame ever existing. That
     // has to be answerable from the log, not from argument.
-    let (painted, first_paint, _) =
-        wait_for_bytes_verbose(&session, &mut terminal, b"cycle-b", Duration::from_secs(5));
+    let (painted, first_paint, _) = wait_for_bytes_verbose(
+        &session,
+        &mut terminal,
+        &[b"cycle-b"],
+        Duration::from_secs(5),
+    );
     let paint_at = started.elapsed().as_secs_f64();
     // DIAGNOSTIC BOUND. A wait past `HARNESS_KILL` can only ever be KILLED —
     // and a terminated test prints nothing, which is why four failing CI runs
@@ -1139,10 +1142,17 @@ fn a_fifo_cycle_earns_its_badge_and_its_notice_too() {
     // the report's: every second the wait does not need is a second the wait
     // gets.
     let (found, seen, chunks) = if painted {
+        // The stop condition carries the notice's TAIL: "fifo:" and
+        // "? help" follow the needle inside the same line, and a
+        // capture returned at the prefix can legally end mid-notice.
         wait_for_bytes_verbose(
             &session,
             &mut terminal,
-            "a, b: trigger loop suspected:".as_bytes(),
+            &[
+                "a, b: trigger loop suspected:".as_bytes(),
+                b"fifo:",
+                b"? help",
+            ],
             REPORT_BUDGET
                 .saturating_sub(started.elapsed())
                 .max(Duration::from_secs(1)),
@@ -1487,8 +1497,11 @@ fn a_live_pane_that_stops_moving_stops_painting() {
     );
     // Drain the tail of the first composition, then require silence.
     // The follower keeps polling its file throughout — the claim is that
-    // a poll finding nothing writes nothing.
-    let _ = session.read_available(Duration::from_millis(500));
+    // a poll finding nothing writes nothing. `drain_for`, not a single
+    // `read_available`: the latter returns after its FIRST read, and a
+    // first-composition tail larger than one read would land in the
+    // silence window as a false repaint.
+    let _ = drain_for(&session, Duration::from_millis(500));
     let quiet = session.read_available(Duration::from_millis(800));
     assert!(
         quiet.is_empty(),
@@ -1526,28 +1539,31 @@ fn a_live_pane_that_exits_and_respawns_drops_the_old_exit_badge() {
     let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
         .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
-    assert!(
-        wait_for(&session, &mut terminal, b"exit 3", Duration::from_secs(5)),
-        "the first run's exit badge never appeared"
-    );
-    assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            b"second-run-content",
-            Duration::from_secs(5)
-        ),
-        "the respawned follower never emitted"
-    );
-    session.set_winsize(24, 120);
-    let wide = "─".repeat(45);
-    let bytes = wait_for_bytes(
+    // ONE ordered capture for the badge and the replacement: run 2's
+    // spawn is the schedule's doing, not this test's, so its content
+    // can share a read chunk with the badge frame — a second, fresh
+    // wait would lose a consumed paint for good (the follower emits
+    // `second-run-content` exactly once).
+    wait_for_in_order(
         &session,
         &mut terminal,
-        wide.as_bytes(),
+        &[b"exit 3", b"second-run-content"],
+        Duration::from_secs(10),
+    );
+    session.set_winsize(24, 120);
+    // 90 cells: a needle no 80-column border can contain, so the match
+    // IS the post-resize frame — at 80 columns this single pane's top
+    // border already runs past 45. `╰` closes the box BELOW the chrome
+    // row, so the capture provably includes the row a surviving badge
+    // would occupy; stopped at the top border, the absence would be
+    // asserted against bytes that never reached the badge's row.
+    let wide = "─".repeat(90);
+    let bytes = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), "╰".as_bytes()],
         Duration::from_secs(5),
-    )
-    .expect("the resize never repainted at the new width");
+    );
     assert!(
         !contains(&bytes, b"exit 3"),
         "the replacement child inherited the dead child's exit badge"
@@ -1844,17 +1860,17 @@ fn a_syntax_error_on_a_tty_paints_its_snippet() {
     )
     .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
-    let bytes = wait_for_bytes(
+    // ONE ordered capture: the head line is the locator, but the color
+    // evidence is the block that FOLLOWS it — a capture stopped at the
+    // head can legally end before the escapes arrive (a read may
+    // return at any byte), so wait until an escape has appeared AFTER
+    // the head rather than asserting on whatever the read boundary
+    // happened to deliver.
+    wait_for_in_order(
         &session,
         &mut terminal,
-        b"line 1, column",
+        &[b"line 1, column", b"\x1b["],
         Duration::from_secs(5),
-    )
-    .expect("the load error never printed");
-    assert!(
-        bytes.windows(2).any(|w| w == b"\x1b["),
-        "the snippet is colored on a tty: {:?}",
-        String::from_utf8_lossy(&bytes)
     );
 }
 
@@ -1971,27 +1987,19 @@ fn a_pane_sourced_tab_title_follows_the_panes_output() {
     )
     .expect("spawn rat dashboard under a pty");
     let mut terminal = FakeTerminal::dark();
-    let mut collected: Vec<u8> = Vec::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(6);
-    while std::time::Instant::now() < deadline
-        && find(&collected, b"\x1b]2;\xe2\x96\x9e count-1\x07").is_none()
-    {
-        let chunk = session.read_available(Duration::from_millis(50));
-        terminal.respond(&session, &chunk);
-        collected.extend_from_slice(&chunk);
-    }
-    assert!(
-        find(&collected, b"\x1b]2;\xe2\x96\x9e count-1\x07").is_some(),
-        "the tab follows the pane's first output: {:?}",
-        String::from_utf8_lossy(&collected)
-    );
-    let second = wait_for_bytes(
+    // ONE ordered capture for both titles: the pane free-runs at 1s
+    // and the emitter is idempotent per text, so a `count-2` title
+    // consumed alongside the `count-1` wait would never be re-emitted
+    // — the next change says count-3.
+    wait_for_in_order(
         &session,
         &mut terminal,
-        b"\x1b]2;\xe2\x96\x9e count-2\x07",
-        Duration::from_secs(5),
+        &[
+            b"\x1b]2;\xe2\x96\x9e count-1\x07",
+            b"\x1b]2;\xe2\x96\x9e count-2\x07",
+        ],
+        Duration::from_secs(11),
     );
-    assert!(second.is_some(), "the tab follows the change");
     session.write_bytes(b"q");
     session.kill_if_alive(Duration::from_secs(3));
 }
@@ -2051,14 +2059,20 @@ row {{
     session.write_bytes(b"c");
     std::fs::write(&value, "1-abcdefghijk-BBB").expect("the change");
     // The digit flip is the positive control: highlights were live on
-    // the very repaint that carried the hidden-tail change.
-    let seen = wait_for_bytes(
+    // the very repaint that carried the hidden-tail change. ONE
+    // ordered capture through the NEIGHBOUR'S OWN CELLS: the differ
+    // rewrites whole rows, and both panes share this row, so every
+    // paint that carries the highlight carries `zebra-static` after it
+    // — a capture stopped at the highlight could end before the
+    // neighbour's columns and pass the absence vacuously. (A leak that
+    // splices reverse video INTO the neighbour breaks the contiguous
+    // needle and times out — still a failure, seen in the dump.)
+    let seen = wait_for_in_order(
         &session,
         &mut terminal,
-        b"\x1b[7m1\x1b[0m",
+        &[b"\x1b[7m1\x1b[0m", b"zebra-static"],
         Duration::from_secs(5),
-    )
-    .expect("the visible change never got its highlight");
+    );
     assert!(
         !contains(&seen, b"\x1b[7mzeb"),
         "the hidden tail's run leaked onto the neighbour: {:?}",

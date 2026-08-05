@@ -3,7 +3,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::pty::{FakeTerminal, PtySession, wait_for};
+use common::pty::{
+    FakeTerminal, PtySession, first_unmatched_in_order, wait_for, wait_for_in_order,
+};
 
 /// Path to the rat binary, used as a portable child process — mirrors
 /// `tests/cli_watch.rs`'s own local `rat_bin()` rather than adding one to
@@ -1714,17 +1716,20 @@ fn resuming_from_a_pause_paints_at_once_and_still_refreshes() {
         "expected p to freeze"
     );
     session.write_bytes(b"F");
+    // One F answers with TWO paints — the immediate collapse and,
+    // later, the fresh child's frame — so the exact `v000002` can
+    // share a read chunk with the collapse and would never recur.
+    // Keep the collapse capture and check it before waiting further.
+    let collapse = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"since ",
+        Duration::from_millis(500),
+    )
+    .expect("expected the collapse to paint without waiting out the child");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            b"since ",
-            Duration::from_millis(500)
-        ),
-        "expected the collapse to paint without waiting out the child"
-    );
-    assert!(
-        wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(4)),
+        contains(&collapse, b"v000002")
+            || wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(4)),
         "expected the fresh-tick self-heal to deliver"
     );
     // A settle before reading child-side evidence: one startup child,
@@ -1796,17 +1801,19 @@ fn resuming_while_a_child_is_in_flight_collapses_at_once_and_never_doubles() {
         "expected p to freeze while the child runs"
     );
     session.write_bytes(b"F");
+    // Same two-paint seam as the idle-at-F twin: the in-flight
+    // completion's `v000002` can share a read chunk with the collapse
+    // paint and would never recur — keep the capture, check it first.
+    let collapse = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"since ",
+        Duration::from_millis(500),
+    )
+    .expect("expected the collapse to paint while the child is still running");
     assert!(
-        wait_for(
-            &session,
-            &mut terminal,
-            b"since ",
-            Duration::from_millis(500)
-        ),
-        "expected the collapse to paint while the child is still running"
-    );
-    assert!(
-        wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(6)),
+        contains(&collapse, b"v000002")
+            || wait_for(&session, &mut terminal, b"v000002", Duration::from_secs(6)),
         "expected the in-flight completion to deliver the fresh frame"
     );
     // Inside the quiet gap before the next natural tick: the
@@ -1847,6 +1854,20 @@ fn question_mark_pages_the_key_reference() {
     // user would — press ? again — instead of asserting a one-shot
     // success the design never promised.
     session.write_bytes(b"?");
+    // ONE ordered walk over ONE accumulator, for both the reference
+    // and the post-pager repaint. The repaint is part of the same `?`
+    // press's multi-part response, so a fresh wait for it could find
+    // it already consumed — and `hi` is a substring of "highlights"
+    // inside the reference itself, so a fresh `hi` wait could also
+    // pass on reference text without a frame ever painting. The
+    // second needle is the live FOOTER, which only a frame paints,
+    // required to arrive AFTER the reference: the first frame's own
+    // footer sits in this accumulator BEFORE the reference, where the
+    // ordered walk cannot mistake it for the repaint.
+    let needles: [&[u8]; 2] = [
+        b"freeze the frame in place",
+        "· every 50ms · ? help".as_bytes(),
+    ];
     let mut seen: Vec<u8> = Vec::new();
     let mut presses = 1;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1854,27 +1875,27 @@ fn question_mark_pages_the_key_reference() {
     loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "expected the key reference in the pager (after {presses} presses)"
+            "expected the key reference and the frame back (after {presses} presses): {:?}",
+            String::from_utf8_lossy(&seen)
         );
         let chunk = session.read_available(Duration::from_millis(50));
         terminal.respond(&session, &chunk);
         seen.extend_from_slice(&chunk);
-        if contains(&seen, b"freeze the frame in place") {
+        let missing = first_unmatched_in_order(&seen, &needles);
+        if missing.is_none() {
             break;
         }
         // A REPEATED refusal repaints an identical frame — zero bytes
         // through the differ — so the retry rides a timer, never the
-        // notice text.
-        if std::time::Instant::now() >= next_retry && presses < 6 {
+        // notice text. Retry only while the REFERENCE is missing: once
+        // it paged, another `?` would page again instead of letting
+        // the repaint land.
+        if missing == Some(0) && std::time::Instant::now() >= next_retry && presses < 6 {
             presses += 1;
             session.write_bytes(b"?");
             next_retry = std::time::Instant::now() + Duration::from_secs(2);
         }
     }
-    assert!(
-        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(5)),
-        "expected the frame back after the pager"
-    );
     session.write_bytes(b"q");
     assert!(
         !session.kill_if_alive(Duration::from_secs(2)),
@@ -1937,13 +1958,16 @@ fn the_gutter_marks_the_changed_line_only() {
         "expected a first counter frame"
     );
     session.write_bytes(b"D");
-    let bytes = wait_for_bytes(
+    // ONE ordered capture: the gutter cell is a row PREFIX, so the
+    // counter value trails the mark on the same row — a capture
+    // stopped at the mark could end before it, and `row_containing`
+    // would fall back to an earlier, unmarked pre-`D` row.
+    let bytes = wait_for_in_order(
         &session,
         &mut terminal,
-        "▌".as_bytes(),
+        &["▌".as_bytes(), b"v0"],
         Duration::from_secs(2),
-    )
-    .expect("expected a gutter mark after D");
+    );
     let counter_row = row_containing(&bytes, b"v0").expect("a counter row");
     assert!(
         contains(counter_row, "▌".as_bytes()),
@@ -1999,13 +2023,16 @@ fn the_gutter_column_survives_a_shift() {
         "expected a gutter mark after D"
     );
     session.write_bytes(b"l");
-    let bytes = wait_for_bytes(
+    // ONE ordered capture through the counter row: it paints BELOW the
+    // shifted steady row, so a capture stopped at `-steady-remainder`
+    // could end before it — and `row_containing`'s rfind would settle
+    // on a PRE-shift counter row, passing without testing the shift.
+    let bytes = wait_for_in_order(
         &session,
         &mut terminal,
-        b"-steady-remainder",
+        &[b"-steady-remainder", b"v0"],
         Duration::from_secs(2),
-    )
-    .expect("expected the shifted frame");
+    );
     let steady_row = row_containing(&bytes, b"-steady-remainder").expect("the shifted row");
     assert!(
         !contains(steady_row, b"12345678"),
@@ -2129,8 +2156,13 @@ fn toggling_the_highlight_off_restores_plain_rows() {
     session.write_bytes(b"c");
     // Swallow the transition — a spliced frame may still be in flight.
     let _ = drain_for(&session, Duration::from_millis(400));
-    let bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
+    let mut bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
         .expect("expected a plain counter row after toggling off");
+    // A surviving splice lands on the TRAILING digits, after `v0` —
+    // a capture stopped at `v0` could end before the very bytes the
+    // absence forbids. Extend over three tick intervals so the row
+    // that matched completes inside the judged window.
+    bytes.extend(drain_for(&session, Duration::from_millis(150)));
     assert!(
         !contains(&bytes, b"\x1b[7m"),
         "no reverse-video mark may survive the toggle: {:?}",
@@ -2214,13 +2246,17 @@ fn the_highlight_survives_a_shift() {
         "expected a reverse-video mark after c"
     );
     session.write_bytes(b"l");
-    let bytes = wait_for_bytes(
+    // ONE ordered capture through a COMPLETE splice after the steady
+    // row: the splice rides the trailing digits, AFTER `v0`, so any
+    // chain stopping at `v0` can end before the very bytes the assert
+    // needs — while a chain stopping at the steady row lets rfind
+    // settle on a pre-shift counter row and pass vacuously.
+    let bytes = wait_for_in_order(
         &session,
         &mut terminal,
-        b"-steady-remainder",
+        &[b"-steady-remainder", b"\x1b[7m", b"\x1b[0m"],
         Duration::from_secs(2),
-    )
-    .expect("expected the shifted frame");
+    );
     let counter_row = row_containing(&bytes, b"v0").expect("a counter row");
     assert!(
         contains(counter_row, b"\x1b[7m"),
@@ -2255,8 +2291,11 @@ fn no_color_keeps_the_highlight_out_of_the_bytes() {
     // Swallow the transition, then capture fresh frames: a profile that
     // forbids SGR gets none from the highlighter either.
     let _ = drain_for(&session, Duration::from_millis(400));
-    let bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
+    let mut bytes = wait_for_bytes(&session, &mut terminal, b"v0", Duration::from_secs(2))
         .expect("expected counter rows under NO_COLOR");
+    // The splice would land AFTER `v0` on the same row — extend the
+    // capture so the judged window reaches the trailing digits.
+    bytes.extend(drain_for(&session, Duration::from_millis(150)));
     assert!(
         !contains(&bytes, b"\x1b[7m"),
         "the highlighter must stay silent under an ascii profile: {:?}",
@@ -2329,8 +2368,17 @@ fn the_paused_row_shows_a_wall_clock_and_t_makes_it_count() {
     );
     session.write_bytes(b"p");
     let needle = "paused · at ".as_bytes();
-    let bytes = wait_for_bytes(&session, &mut terminal, needle, Duration::from_secs(2))
-        .expect("expected the default wall-clock paused row");
+    // ONE ordered capture through the row's own tail: the 8-byte stamp
+    // slice below indexes PAST the needle, and a capture stopped at
+    // the needle can legally end inside the stamp — an index panic
+    // instead of an assertion. "Esc resumes" ends the paused row, so
+    // its arrival puts the whole stamp in hand.
+    let bytes = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[needle, b"Esc resumes"],
+        Duration::from_secs(2),
+    );
     let pos = bytes
         .windows(needle.len())
         .rposition(|w| w == needle)
@@ -2761,17 +2809,15 @@ fn a_scrolled_counting_row_keeps_counting() {
         "expected the counting live row"
     );
     session.write_bytes(b"j");
-    let seen = wait_for_bytes(
+    // ONE ordered capture: the range trails the time segment inside
+    // the same row (`live · {time} · lines a-b of N`), and this is a
+    // ~2KB 22-row frame that genuinely spans several reads — a capture
+    // stopped at the stamp can end inside that 20-byte window.
+    wait_for_in_order(
         &session,
         &mut terminal,
-        "live · changed ".as_bytes(),
+        &["live · changed ".as_bytes(), b"lines 2-23 of 30"],
         Duration::from_secs(2),
-    )
-    .expect("expected the scrolled row to carry the counting stamp");
-    assert!(
-        contains(&seen, b"lines 2-23 of 30"),
-        "the range still names the window: {:?}",
-        String::from_utf8_lossy(&seen)
     );
     assert!(
         wait_for(&session, &mut terminal, b"s ago", Duration::from_secs(15)),
@@ -2905,21 +2951,16 @@ fn the_fullscreen_pager_round_trip_re_enters_the_alternate_screen() {
     );
     let _ = drain_for(&session, Duration::from_millis(100));
     session.write_bytes(b"v");
-    let seen = wait_for_bytes(
+    // ONE capture for the whole round trip: leave, re-enter, repaint,
+    // in order. The repaint can share a read chunk with the re-entry
+    // escape on a slow runner, and a consumed paint is never repainted
+    // (the differ writes nothing for an identical frame) — a second,
+    // fresh wait for `hi` here is a race the runner's load decides.
+    wait_for_in_order(
         &session,
         &mut terminal,
-        b"\x1b[?1049h",
-        Duration::from_secs(3),
-    )
-    .expect("rat must re-enter the alternate screen after the pager");
-    assert!(
-        position(&seen, b"\x1b[?1049l").is_some(),
-        "rat must leave the alternate screen before the pager: {:?}",
-        String::from_utf8_lossy(&seen)
-    );
-    assert!(
-        wait_for(&session, &mut terminal, b"hi", Duration::from_secs(2)),
-        "the frame must repaint onto the blank re-entered screen"
+        &[b"\x1b[?1049l", b"\x1b[?1049h", b"hi"],
+        Duration::from_secs(5),
     );
     session.write_bytes(b"q");
     assert!(
@@ -3011,14 +3052,24 @@ fn an_x10_click_payload_never_quits_the_session() {
     )
     .expect("spawn under a pty");
     let mut terminal = FakeTerminal::dark();
-    assert!(
-        wait_for(&session, &mut terminal, b"v0000", Duration::from_secs(2)),
-        "expected a first counter frame"
-    );
+    // Keep the first capture: the payload is a deliberate no-op, so
+    // the counter that proves survival is the free-running tick's — a
+    // fixed target like `v000004` could already be batched into (and
+    // consumed with) this capture, never to recur. Derive the target
+    // from the last value actually seen instead.
+    let seen = wait_for_bytes(&session, &mut terminal, b"v0000", Duration::from_secs(2))
+        .expect("expected a first counter frame");
+    let start = counter_values(&seen).last().copied().unwrap_or(0);
     session.write_bytes(b"\x1b[M q!");
     // The counter keeps advancing: the payload's q did not quit.
+    let target = format!("v{:06}", start + 3);
     assert!(
-        wait_for(&session, &mut terminal, b"v000004", Duration::from_secs(3)),
+        wait_for(
+            &session,
+            &mut terminal,
+            target.as_bytes(),
+            Duration::from_secs(3)
+        ),
         "the session must keep running after an X10 payload"
     );
     session.write_bytes(b"q");
@@ -3190,8 +3241,16 @@ fn an_identical_frame_appends_nothing() {
     )
     .expect("spawn");
     let mut terminal = FakeTerminal::dark();
-    let first = wait_for_bytes(&session, &mut terminal, b"steady", Duration::from_secs(5))
-        .expect("first frame");
+    // The needle carries the row terminator: a capture stopped at
+    // `steady` leaves its `\r\n` in the buffer, where the emptiness
+    // drain below would read it back as a phantom append.
+    let first = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"steady\r\n",
+        Duration::from_secs(5),
+    )
+    .expect("first frame");
     assert_no_forbidden_escapes(&first, "first frame");
     // The child keeps running (counter is the evidence) while the
     // byte-identical frames write nothing.
@@ -3222,7 +3281,13 @@ fn a_changed_frame_appends_the_whole_frame_in_order() {
     )
     .expect("spawn");
     let mut terminal = FakeTerminal::dark();
-    wait_for(&session, &mut terminal, b"head-1", Duration::from_secs(5));
+    // Asserted: an unnoticed timeout here would silently consume up to
+    // 5s of stream — possibly the head-2 burst — and the ordered loop
+    // below would then report the wrong failure.
+    assert!(
+        wait_for(&session, &mut terminal, b"head-1", Duration::from_secs(5)),
+        "expected the first appended burst"
+    );
     // The SECOND burst arrives whole and ordered — whole-frame
     // appending is the settled shape. One accumulate loop: a burst can
     // land in one chunk, so sequential waits could eat their own needle.
@@ -3264,7 +3329,16 @@ fn a_resize_appends_nothing() {
     )
     .expect("spawn");
     let mut terminal = FakeTerminal::dark();
-    wait_for(&session, &mut terminal, b"steady", Duration::from_secs(5));
+    // `steady\r\n`: leave no row tail behind for the emptiness drain.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady\r\n",
+            Duration::from_secs(5)
+        ),
+        "expected the first appended frame"
+    );
     let before = std::fs::read_to_string(&count)
         .map(|s| s.lines().count())
         .unwrap_or(0);
@@ -3300,13 +3374,16 @@ fn an_open_color_never_leaks_past_an_appended_row() {
     )
     .expect("spawn");
     let mut terminal = FakeTerminal::dark();
-    let seen =
-        wait_for_bytes(&session, &mut terminal, b"red", Duration::from_secs(5)).expect("frame");
-    assert!(
-        contains(&seen, b"red\x1b[0m"),
-        "the child's open SGR must close before the row ends: {:?}",
-        String::from_utf8_lossy(&seen)
-    );
+    // The seal trails `red` by four bytes, so the needle carries it:
+    // a capture stopped at `red` alone can legally end before the
+    // reset it exists to assert.
+    let seen = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"red\x1b[0m",
+        Duration::from_secs(5),
+    )
+    .expect("the child's open SGR must close before the row ends");
     assert_no_forbidden_escapes(&seen, "sealed frame");
     session.write_bytes(b"q");
     assert!(!session.kill_if_alive(Duration::from_secs(2)));
@@ -3382,7 +3459,16 @@ fn the_viewport_keys_append_nothing() {
     )
     .expect("spawn");
     let mut terminal = FakeTerminal::dark();
-    wait_for(&session, &mut terminal, b"steady", Duration::from_secs(5));
+    // `steady\r\n`: leave no row tail behind for the emptiness drain.
+    assert!(
+        wait_for(
+            &session,
+            &mut terminal,
+            b"steady\r\n",
+            Duration::from_secs(5)
+        ),
+        "expected the first appended frame"
+    );
     // Every viewport key, including `t` — the counting-footer metronome
     // must be unarmable here.
     session.write_bytes(b"jGptv<");
@@ -3513,7 +3599,14 @@ fn the_banner_names_the_cadence_and_the_way_out() {
         "the banner carries the cadence and the way out: {:?}",
         String::from_utf8_lossy(&seen)
     );
-    let tail = &seen[banner + 1..];
+    // "Never repeats" judged over a window that actually holds later
+    // frames: the capture above ends at the FIRST frame, where a
+    // per-frame banner bug could not yet have said anything twice.
+    // Two cadences of drain put frames 2-3's window in evidence (an
+    // identical frame appends nothing, so a correct run drains empty).
+    let mut all = seen.clone();
+    all.extend(drain_for(&session, Duration::from_millis(2500)));
+    let tail = &all[banner + 1..];
     assert!(
         find_at(tail, b"rat watch: appending").is_none(),
         "the banner never repeats"

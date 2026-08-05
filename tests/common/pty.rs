@@ -361,6 +361,81 @@ pub fn wait_for(
     }
 }
 
+/// `wait_for` with an ordered needle chain: read until every needle has
+/// appeared IN ORDER (each match starting after the previous needle's
+/// end), and return the accumulated bytes. One capture, one stream —
+/// this is the shape for asserting bytes that FOLLOW an event marker.
+/// Two sequential waits race twice over: bytes past the first needle
+/// land in its final chunk and the second wait never sees them (a
+/// consumed paint is never repainted — the differ writes nothing for
+/// an identical frame), and a capture stopped at a needle may end
+/// before evidence that trails it (a read may return at any byte).
+/// Panics on timeout naming the first needle that never arrived, with
+/// the stream so far.
+pub fn wait_for_in_order(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needles: &[&[u8]],
+    timeout: Duration,
+) -> Vec<u8> {
+    match try_wait_for_in_order(session, terminal, needles, timeout) {
+        Ok(seen) => seen,
+        Err(msg) => panic!("{msg}"),
+    }
+}
+
+/// `wait_for_in_order` for tests that must clean up before judging:
+/// `Err` carries the timeout diagnostic instead of panicking, so the
+/// caller can shut the session down first and `expect` after.
+pub fn try_wait_for_in_order(
+    session: &PtySession,
+    terminal: &mut FakeTerminal,
+    needles: &[&[u8]],
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    loop {
+        match first_unmatched_in_order(&seen, needles) {
+            None => return Ok(seen),
+            Some(missing) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "needle {:?} never arrived in order; stream so far: {:?}",
+                        String::from_utf8_lossy(needles[missing]),
+                        String::from_utf8_lossy(&seen)
+                    ));
+                }
+                let slice = (deadline - now).min(Duration::from_millis(50));
+                let chunk = session.read_available(slice);
+                if chunk.is_empty() {
+                    continue;
+                }
+                terminal.respond(session, &chunk);
+                seen.extend_from_slice(&chunk);
+            }
+        }
+    }
+}
+
+/// The index of the first needle the ordered walk cannot place, or
+/// `None` when the whole chain matches. Greedy earliest-match is
+/// complete here: if any ordered assignment exists, taking each
+/// earliest occurrence never blocks a later needle. Public so a
+/// suite's own diagnostic wait (the fifo wedge report) can share the
+/// walk instead of reimplementing it.
+pub fn first_unmatched_in_order(seen: &[u8], needles: &[&[u8]]) -> Option<usize> {
+    let mut pos = 0;
+    for (i, needle) in needles.iter().enumerate() {
+        match find(&seen[pos..], needle) {
+            Some(at) => pos += at + needle.len(),
+            None => return Some(i),
+        }
+    }
+    None
+}
+
 /// Create a named pipe — trigger tests drive watch through one.
 pub fn mkfifo_at(path: &std::path::Path) {
     let cpath =

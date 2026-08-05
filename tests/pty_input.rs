@@ -3,7 +3,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::pty::{FakeTerminal, PtySession, wait_for};
+use common::pty::{FakeTerminal, PtySession, wait_for, wait_for_in_order};
 
 /// Path to the rat binary — mirrors `tests/pty_watch.rs`'s local
 /// `rat_bin()` per that file's precedent.
@@ -13,13 +13,6 @@ fn rat_bin() -> String {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Accumulate everything the session writes within `total`.
@@ -106,15 +99,18 @@ fn a_wide_prompt_glyph_does_not_shift_the_value() {
     .expect("spawn rat input under a pty");
     let mut terminal = FakeTerminal::dark();
 
-    // The value follows the prompt's reset with no padding between.
+    // The value follows the prompt's reset with no padding between,
+    // and the caret parks after it — 日 spans columns 0-1 and abc
+    // columns 2-4, so the caret belongs at 5. ONE ordered capture:
+    // the park bytes trail the paint inside the same frame write, and
+    // a read may return at any byte, so a capture stopped at the text
+    // can legally end before the park arrives.
     let adjacent = "日\x1b[0mabc".as_bytes();
-    let seen = wait_for_bytes(&session, &mut terminal, adjacent, Duration::from_secs(5))
-        .expect("the value must sit immediately after the wide prompt");
-    // 日 spans columns 0-1 and abc columns 2-4, so the caret belongs at 5.
-    assert!(
-        contains(&seen, b"\x1b[5C"),
-        "the caret must park after the value, not on its last cell: {:?}",
-        String::from_utf8_lossy(&seen)
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[adjacent, b"\x1b[5C"],
+        Duration::from_secs(5),
     );
 
     session.write_bytes(b"\r");
@@ -150,13 +146,16 @@ fn a_full_field_scrolls_and_keeps_the_caret_past_the_text() {
     // edge, but its text always still starts at 'a'. A frame whose text
     // begins at 'b' exists only once the window has slid.
     let scrolled = b"\x1b[0mbcdefghijklmnopqr";
-    let seen = wait_for_bytes(&session, &mut terminal, scrolled, Duration::from_secs(5))
-        .expect("the field must scroll, dropping the leading 'a'");
-    let after_frame = &seen[find(&seen, scrolled).expect("just matched") + scrolled.len()..];
-    assert!(
-        contains(after_frame, b"\x1b[19C"),
-        "the caret must park one past the scrolled text, not on it: {:?}",
-        String::from_utf8_lossy(after_frame)
+    // ONE ordered capture: the park bytes trail the paint inside the
+    // same frame write, so a capture stopped at the scrolled text can
+    // legally end before them. The ordered match pins `\x1b[19C` AFTER
+    // the slid window's text — an unscrolled field passing through the
+    // edge column cannot satisfy it.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[scrolled, b"\x1b[19C"],
+        Duration::from_secs(5),
     );
 
     session.write_bytes(b"\r");
