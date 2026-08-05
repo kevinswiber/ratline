@@ -226,20 +226,35 @@ fn at(name: &str) -> String {
     format!("pane {name:?}")
 }
 
+/// How a mode reads inside an error: the thing the author would
+/// recognise from what they wrote.
+fn shell_label(mode: &ShellMode) -> String {
+    match mode {
+        ShellMode::Direct => "no shell".to_string(),
+        ShellMode::Platform => "the platform shell".to_string(),
+        ShellMode::Named(name) => format!("`{name}`"),
+    }
+}
+
 fn resolve_source(decl: &PaneDecl, defaults: &PaneDecl, id: &str) -> anyhow::Result<SourceSpec> {
     let defaults_shell = defaults.shell.clone().unwrap_or_default();
     let shell = decl.shell.clone().unwrap_or_else(|| defaults_shell.clone());
     let live = decl.live.or(defaults.live).unwrap_or(false);
     // A command string is word-split (or kept verbatim) at PARSE time,
-    // under the shell mode in force where it was written. A pane that
-    // inherits the defaults' command while flipping `shell` would
-    // execute a wrongly-shaped argv — fail with the fix instead.
-    if decl.command.is_none() && shell.runs_a_shell() != defaults_shell.runs_a_shell() {
+    // under the shell mode in force where it was written — and its
+    // SYNTAX belongs to that shell too. A pane that inherits the
+    // defaults' command while changing `shell`, in either direction or
+    // to a different shell, would run a command nobody wrote for it.
+    // Fail with the fix instead.
+    if decl.command.is_none() && shell != defaults_shell {
         bail!(
             "{}: inherits `command` from `defaults` but overrides `shell` — \
-             the inherited command was read under the defaults' shell mode; \
-             declare the pane's own `command`",
-            at(id)
+             the inherited command was read and written under the defaults' \
+             shell mode ({}), not this pane's ({}); declare the pane's own \
+             `command`",
+            at(id),
+            shell_label(&defaults_shell),
+            shell_label(&shell),
         );
     }
     let command = decl
@@ -900,6 +915,105 @@ mod tests {
         let spec = registry.spec(SourceId(0));
         assert_eq!(spec.shell, ShellMode::Platform);
         assert_eq!(spec.command, vec![script.to_string()]);
+    }
+
+    #[test]
+    fn an_inherited_command_with_a_changed_shell_dialect_is_rejected() {
+        // The syntax of the defaults' script belongs to the defaults'
+        // SHELL, not just to "a shell": running it under a different
+        // one executes a command nobody wrote. The error names both
+        // modes so the author sees the mismatch, and the fix.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Platform),
+                command: Some(vec!["printf inherited".to_string()]),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                id: Some("fishy".to_string()),
+                shell: Some(ShellMode::Named("fish".to_string())),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let err = format!("{:#}", decl.into_registry().unwrap_err());
+        assert!(err.contains("fishy"), "{err}");
+        assert!(err.contains("the platform shell"), "{err}");
+        assert!(err.contains("`fish`"), "{err}");
+        assert!(err.contains("declare the pane's own `command`"), "{err}");
+    }
+
+    #[test]
+    fn an_inherited_command_under_the_same_named_shell_is_accepted() {
+        // Restating the defaults' own mode changes nothing the script
+        // was written under.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Named("fish".to_string())),
+                command: Some(vec!["printf inherited".to_string()]),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                id: Some("same".to_string()),
+                shell: Some(ShellMode::Named("fish".to_string())),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let registry = decl.into_registry().expect("same mode inherits fine");
+        assert_eq!(
+            registry.spec(SourceId(0)).shell,
+            ShellMode::Named("fish".to_string())
+        );
+    }
+
+    #[test]
+    fn the_platform_shell_is_not_the_named_sh() {
+        // Platform is cmd on Windows, so "the same thing" is only true
+        // on unix — the guard treats them as different modes
+        // everywhere. This is the arm someone will later "fix" as a
+        // bug; it is not one.
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Platform),
+                command: Some(vec!["printf inherited".to_string()]),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                id: Some("pedantic".to_string()),
+                shell: Some(ShellMode::Named("sh".to_string())),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let err = format!("{:#}", decl.into_registry().unwrap_err());
+        assert!(err.contains("pedantic"), "{err}");
+        assert!(err.contains("`sh`"), "{err}");
+    }
+
+    #[test]
+    fn a_named_shell_in_defaults_reaches_a_pane_with_its_own_command() {
+        let decl = DashboardFile {
+            defaults: PaneDecl {
+                shell: Some(ShellMode::Named("fish".to_string())),
+                height: Some(3),
+                ..PaneDecl::default()
+            },
+            panes: vec![PaneDecl {
+                id: Some("own".to_string()),
+                command: Some(vec!["date".to_string()]),
+                ..PaneDecl::default()
+            }],
+            ..DashboardFile::default()
+        };
+        let registry = decl.into_registry().expect("plain inheritance");
+        assert_eq!(
+            registry.spec(SourceId(0)).shell,
+            ShellMode::Named("fish".to_string())
+        );
     }
 
     #[test]
