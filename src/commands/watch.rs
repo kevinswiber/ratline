@@ -28,7 +28,7 @@ use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{
-    Composition, Overflow, PaneGeometry, Registry, ShellMode, SourceId, SourceSpec,
+    Composition, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId, SourceSpec,
 };
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
@@ -4306,19 +4306,26 @@ fn platform_flags() -> &'static [&'static str] {
 /// (`--shell=pwsh -- '. $PROFILE; …'`); there would be no way to opt
 /// out.
 fn command_flags(program: &str) -> &'static [&'static str] {
+    match interpreter_name(program).as_str() {
+        "cmd" => &["/C"],
+        "powershell" | "pwsh" => &["-NoProfile", "-Command"],
+        _ => &["-c"],
+    }
+}
+
+/// A program's dialect key: the file name, `.exe` stripped, lowercased.
+/// `command_flags` and the interpreter tables must agree on what a
+/// program is CALLED, or a full path would answer one table and not
+/// the other. Windows names a program with its extension; unix never
+/// does — and ONLY `.exe` is stripped, so a wrapper script `cmd.sh`
+/// keeps its own row.
+fn interpreter_name(program: &str) -> String {
     let name = std::path::Path::new(program)
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_ascii_lowercase();
-    // Windows names a program with its extension; unix never does —
-    // and ONLY `.exe` is stripped, so a wrapper script `cmd.sh` keeps
-    // `-c`.
-    match name.strip_suffix(".exe").unwrap_or(&name) {
-        "cmd" => &["/C"],
-        "powershell" | "pwsh" => &["-NoProfile", "-Command"],
-        _ => &["-c"],
-    }
+    name.strip_suffix(".exe").unwrap_or(&name).to_string()
 }
 
 /// The program and flags a mode spawns, or `None` when there is no
@@ -4366,6 +4373,175 @@ fn shell_command(program: &str, flags: &[&str], script: &str) -> std::process::C
     let mut cmd = std::process::Command::new(program);
     cmd.args(flags).arg(script);
     cmd
+}
+
+/// Which half of the platform split executes a `#!` body.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ShebangArm {
+    /// The kernel re-executes a `#!` file itself, so the file may be
+    /// called anything, every byte is the author's, and all it needs
+    /// is the exec bit.
+    Kernel,
+    /// No kernel shebang: WE name the interpreter, and some
+    /// interpreters insist on an extension before they will read the
+    /// file.
+    Interpreter,
+}
+
+/// The arm this build runs. A `const`, not a `#[cfg]` item: BOTH arms
+/// stay compiled and unit-tested on every platform, and the branch
+/// this build does not take is folded away.
+// staged(dead_code): consumed by the spawn routes; the allows on this
+// block leave with the first production caller.
+#[allow(dead_code)]
+const SHEBANG_ARM: ShebangArm = if cfg!(windows) {
+    ShebangArm::Interpreter
+} else {
+    ShebangArm::Kernel
+};
+
+/// What the interpreter arm spawns, and the arguments that precede the
+/// script path.
+///
+/// `#!/usr/bin/env X` has no `env` on Windows to delegate to, so `X` is
+/// what runs — and the standard spawn path then does the search `env`
+/// would have done (Rust's `Command` resolves a bare name on Windows
+/// PATH itself, inferring only `.exe`, before `CreateProcessW`; PATHEXT
+/// is a cmd.exe concept and does not apply), which is why nothing here
+/// walks PATH by hand. A unix-absolute interpreter path means nothing
+/// on Windows either, so it is reduced to its file name: `#!/bin/bash`
+/// runs whatever `bash` the PATH answers with (Git Bash, if installed),
+/// and a name nothing answers surfaces as the spawn error naming it.
+/// No WSL routing, no `py.exe -3` alias, no validation list.
+///
+/// `env -S` is approximated by `shell_words::split`, whose quoting
+/// differs from `env -S`'s own (`\_`, `${VAR}`, `#` comments). A
+/// malformed `-S` remainder (an unbalanced quote) is a ROUTE, not an
+/// error: the whole remainder becomes the program name verbatim and
+/// the spawn error names it — on unix the kernel runs `env -S` natively
+/// and rat never parses it, so only this arm can even see the
+/// malformation.
+fn interpreter_invocation(line: &Shebang) -> (String, Vec<String>) {
+    let interpreter = match line.interpreter.rsplit_once('/') {
+        Some((_, name)) if line.interpreter.starts_with('/') => name.to_string(),
+        _ => line.interpreter.clone(),
+    };
+    if interpreter_name(&interpreter) != "env" {
+        return (interpreter, line.arg.iter().cloned().collect());
+    }
+    match line.arg.as_deref() {
+        None => (interpreter, Vec::new()),
+        Some(arg) => match arg.strip_prefix("-S") {
+            Some(rest) => {
+                let rest = rest.trim_start_matches([' ', '\t']);
+                match shell_words::split(rest) {
+                    Ok(mut words) if !words.is_empty() => {
+                        let program = words.remove(0);
+                        (program, words)
+                    }
+                    _ => (rest.to_string(), Vec::new()),
+                }
+            }
+            None => (arg.to_string(), Vec::new()),
+        },
+    }
+}
+
+/// The flags the interpreter arm puts before the script PATH — a
+/// different question from `command_flags`, which answers "run this
+/// STRING". `cmd` needs `/C` either way; PowerShell needs `-NoProfile`
+/// but NOT `-Command`, which takes an expression rather than a file;
+/// every other interpreter takes the path bare.
+fn interpreter_flags(program: &str) -> &'static [&'static str] {
+    match interpreter_name(program).as_str() {
+        "cmd" => &["/C"],
+        "powershell" | "pwsh" => &["-NoProfile"],
+        _ => &[],
+    }
+}
+
+/// The extension the interpreter arm must give the tempfile. Measured
+/// on Windows: `cmd /C` refuses an extensionless file ("is not
+/// recognized as an internal or external command") and runs the
+/// identical bytes named `.cmd`; pwsh refuses anything that is not
+/// `.ps1` ("does not have a '.ps1' extension"). Python, node and the
+/// sh-likes do not care. The kernel arm needs none of it — a 0700 file
+/// with a `#!` line runs whatever it is called, pwsh included
+/// (measured on macOS).
+fn script_extension(arm: ShebangArm, program: &str) -> &'static str {
+    if arm == ShebangArm::Kernel {
+        return "";
+    }
+    match interpreter_name(program).as_str() {
+        "cmd" => ".cmd",
+        "powershell" | "pwsh" => ".ps1",
+        _ => "",
+    }
+}
+
+/// The bytes the tempfile gets: the AUTHOR'S, verbatim — with exactly
+/// one exception. On the interpreter arm a `cmd` body loses its `#!`
+/// line (`#` is not batch syntax; cmd would try to run it) and gains a
+/// guaranteed single trailing newline (cmd may skip a final line that
+/// has none). Everywhere else no byte moves: the kernel READS the `#!`
+/// line, and it is a harmless comment to sh, python and PowerShell.
+fn script_bytes(arm: ShebangArm, program: &str, body: &str) -> String {
+    if arm != ShebangArm::Interpreter || interpreter_name(program) != "cmd" {
+        return body.to_string();
+    }
+    let rest = match body.split_once('\n') {
+        Some((_, rest)) => rest,
+        None => "",
+    };
+    format!("{}\n", rest.trim_end_matches('\n'))
+}
+
+/// The one seam the materializer calls: a body's file name and its
+/// bytes, for one arm. Extension and rewrite both key on the RESOLVED
+/// program (post-`env` substitution), so `#!/usr/bin/env pwsh` gets
+/// `.ps1`.
+// staged(dead_code): consumed by the materializer; see SHEBANG_ARM.
+#[allow(dead_code)]
+fn script_file(arm: ShebangArm, line: &Shebang, stem: &str, body: &str) -> (String, String) {
+    let (program, _) = interpreter_invocation(line);
+    let name = format!("{stem}{}", script_extension(arm, &program));
+    (name, script_bytes(arm, &program, body))
+}
+
+/// The Command a `#!` body spawns. The kernel arm execs the FILE — the
+/// kernel parses the `#!` line itself. The interpreter arm invokes the
+/// resolved interpreter: our flags, then the author's shebang
+/// argument(s), then the path.
+// staged(dead_code): consumed by the spawn routes; see SHEBANG_ARM.
+#[allow(dead_code)]
+fn interpreter_command(
+    arm: ShebangArm,
+    line: &Shebang,
+    path: &std::path::Path,
+) -> std::process::Command {
+    match arm {
+        ShebangArm::Kernel => std::process::Command::new(path),
+        ShebangArm::Interpreter => {
+            let (program, args) = interpreter_invocation(line);
+            let mut cmd = std::process::Command::new(&program);
+            cmd.args(interpreter_flags(&program)).args(args).arg(path);
+            cmd
+        }
+    }
+}
+
+/// The program THIS arm asks the OS to start, for the spawn error. On
+/// the kernel arm `execve` re-executes the `#!` line's own path, so
+/// ENOENT names that; on the interpreter arm it names the program we
+/// resolved. Never the tempfile — the file is ours and we just wrote
+/// it; what can fail to start is the interpreter.
+// staged(dead_code): consumed by spawn_program; see SHEBANG_ARM.
+#[allow(dead_code)]
+fn shebang_program(arm: ShebangArm, line: &Shebang) -> String {
+    match arm {
+        ShebangArm::Kernel => line.interpreter.clone(),
+        ShebangArm::Interpreter => interpreter_invocation(line).0,
+    }
 }
 
 #[cfg(test)]
@@ -6795,6 +6971,173 @@ mod tests {
         for sh in ["powershell", "pwsh", "pwsh.exe", "PowerShell.exe"] {
             assert_eq!(command_flags(sh), ["-NoProfile", "-Command"], "{sh}");
         }
+    }
+
+    fn shebang_line(interpreter: &str, arg: Option<&str>) -> Shebang {
+        Shebang {
+            interpreter: interpreter.to_string(),
+            arg: arg.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_env_shebang_resolves_the_program_it_names() {
+        // env X → X, no args.
+        assert_eq!(
+            interpreter_invocation(&shebang_line("/usr/bin/env", Some("fish"))),
+            ("fish".to_string(), vec![])
+        );
+        // env -S splits the remainder shell-words-style.
+        assert_eq!(
+            interpreter_invocation(&shebang_line("/usr/bin/env", Some("-S deno run -A"))),
+            (
+                "deno".to_string(),
+                vec!["run".to_string(), "-A".to_string()]
+            )
+        );
+        // env's real contract: the WHOLE argument is the program name,
+        // so `env python3 -u` fails naming "python3 -u" — the same
+        // content as unix env's own error, different channel.
+        assert_eq!(
+            interpreter_invocation(&shebang_line("/usr/bin/env", Some("python3 -u"))),
+            ("python3 -u".to_string(), vec![])
+        );
+        // Malformed -S quoting is a ROUTE, not a panic: the remainder
+        // becomes the program verbatim and the spawn error names it.
+        assert_eq!(
+            interpreter_invocation(&shebang_line(
+                "/usr/bin/env",
+                Some(r#"-S deno run "unclosed"#)
+            )),
+            (r#"deno run "unclosed"#.to_string(), vec![])
+        );
+    }
+
+    #[test]
+    fn a_unix_absolute_interpreter_is_reduced_to_its_name() {
+        // /bin/bash means nothing on Windows; the NAME is what PATH
+        // answers. A Windows-native path survives verbatim.
+        assert_eq!(
+            interpreter_invocation(&shebang_line("/bin/bash", None)),
+            ("bash".to_string(), vec![])
+        );
+        assert_eq!(
+            interpreter_invocation(&shebang_line(r"C:\Py\python.exe", None)),
+            (r"C:\Py\python.exe".to_string(), vec![])
+        );
+    }
+
+    #[test]
+    fn the_interpreter_arm_names_the_extension_each_interpreter_insists_on() {
+        use ShebangArm::{Interpreter, Kernel};
+        // Measured on the winvm: cmd refuses an extensionless file; pwsh
+        // refuses anything that is not `.ps1`.
+        assert_eq!(script_extension(Interpreter, "cmd"), ".cmd");
+        assert_eq!(script_extension(Interpreter, "pwsh"), ".ps1");
+        assert_eq!(script_extension(Interpreter, "powershell"), ".ps1");
+        assert_eq!(script_extension(Interpreter, "pwsh.exe"), ".ps1");
+        for p in ["python3", "node", "sh", "bash"] {
+            assert_eq!(script_extension(Interpreter, p), "", "{p}");
+        }
+        // The kernel arm needs none of it — pwsh included (measured on
+        // macOS: an extensionless 0700 `#!/usr/bin/env pwsh` file runs).
+        for p in ["cmd", "pwsh", "powershell", "python3"] {
+            assert_eq!(script_extension(Kernel, p), "", "{p}");
+        }
+    }
+
+    #[test]
+    fn a_cmd_body_loses_its_shebang_line_only_on_the_interpreter_arm() {
+        use ShebangArm::{Interpreter, Kernel};
+        let body = "#!cmd\nset /a 6*7";
+        // `#` is not batch syntax; cmd would try to run the #! line —
+        // and cmd may skip a final line with no newline, so the cmd
+        // route also guarantees exactly one trailing newline.
+        assert_eq!(script_bytes(Interpreter, "cmd", body), "set /a 6*7\n");
+        // Everywhere else the bytes are the AUTHOR'S, verbatim: the
+        // kernel READS the #! line, and it is a harmless comment to sh,
+        // python and PowerShell. No newline is added or removed.
+        assert_eq!(script_bytes(Kernel, "cmd", body), "#!cmd\nset /a 6*7");
+        assert_eq!(
+            script_bytes(Interpreter, "pwsh", "#!/usr/bin/env pwsh\n1+1"),
+            "#!/usr/bin/env pwsh\n1+1"
+        );
+    }
+
+    #[test]
+    fn every_arm_but_interpreter_cmd_writes_the_authors_bytes_verbatim() {
+        use ShebangArm::{Interpreter, Kernel};
+        // One rewrite exists (Interpreter+cmd); every other cell of the
+        // arm × interpreter space is identity — trailing-newline shape
+        // included (none added, none removed).
+        for (arm, program) in [
+            (Kernel, "sh"),
+            (Kernel, "cmd"),
+            (Kernel, "pwsh"),
+            (Interpreter, "sh"),
+            (Interpreter, "pwsh"),
+            (Interpreter, "python3"),
+        ] {
+            for body in ["#!/x\necho hi", "#!/x\necho hi\n", "#!/x\necho hi\n\n"] {
+                assert_eq!(script_bytes(arm, program, body), body, "{arm:?} {program}");
+            }
+        }
+        // The exception's newline guarantee: exactly one, idempotently.
+        assert_eq!(script_bytes(Interpreter, "cmd", "#!cmd\nx\n\n"), "x\n");
+        assert_eq!(script_bytes(Interpreter, "cmd", "#!cmd\nx\n"), "x\n");
+    }
+
+    #[test]
+    fn interpreter_flags_are_not_the_command_flags() {
+        // -Command takes an EXPRESSION; a file invocation must not get
+        // it. The measured working form is `pwsh -NoProfile <file.ps1>`.
+        assert_eq!(interpreter_flags("pwsh"), ["-NoProfile"]);
+        assert_eq!(interpreter_flags("powershell"), ["-NoProfile"]);
+        assert_eq!(interpreter_flags("cmd"), ["/C"]);
+        assert_eq!(interpreter_flags("python3"), [] as [&str; 0]);
+        // And the string-table stays what it was.
+        assert_eq!(command_flags("pwsh"), ["-NoProfile", "-Command"]);
+    }
+
+    #[test]
+    fn an_interpreter_command_puts_our_flags_then_the_authors_arg_then_the_path() {
+        use ShebangArm::{Interpreter, Kernel};
+        let line = shebang_line("/usr/bin/awk", Some("-f"));
+        let path = std::path::Path::new("/tmp/rat-script/0-log");
+        let cmd = interpreter_command(Interpreter, &line, path);
+        assert_eq!(cmd.get_program(), "awk");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-f", "/tmp/rat-script/0-log"]);
+        // The kernel arm execs the FILE; the kernel does the rest.
+        let cmd = interpreter_command(Kernel, &line, path);
+        assert_eq!(cmd.get_program(), path.as_os_str());
+        assert_eq!(cmd.get_args().count(), 0);
+    }
+
+    #[test]
+    fn the_spawn_error_program_is_the_arms_own_answer() {
+        use ShebangArm::{Interpreter, Kernel};
+        // Kernel: execve re-executes the `#!` line's own path, so that
+        // is what fails to start. Interpreter: the program we resolved.
+        let line = shebang_line("/usr/bin/env", Some("python3"));
+        assert_eq!(shebang_program(Kernel, &line), "/usr/bin/env");
+        assert_eq!(shebang_program(Interpreter, &line), "python3");
+    }
+
+    #[test]
+    fn a_script_file_names_its_stem_with_the_arms_extension() {
+        use ShebangArm::{Interpreter, Kernel};
+        let line = shebang_line("/usr/bin/env", Some("pwsh"));
+        let (name, bytes) = script_file(Interpreter, &line, "0-log", "#!/usr/bin/env pwsh\n1+1");
+        assert_eq!(name, "0-log.ps1");
+        assert_eq!(bytes, "#!/usr/bin/env pwsh\n1+1");
+        let (name, _) = script_file(Kernel, &line, "0-log", "#!/usr/bin/env pwsh\n1+1");
+        assert_eq!(name, "0-log");
+        // The cmd route: extension AND the strip, through the one seam.
+        let line = shebang_line("cmd", None);
+        let (name, bytes) = script_file(Interpreter, &line, "1-build", "#!cmd\nset /a 6*7");
+        assert_eq!(name, "1-build.cmd");
+        assert_eq!(bytes, "set /a 6*7\n");
     }
 
     #[cfg(windows)]
