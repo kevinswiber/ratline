@@ -4476,7 +4476,14 @@ impl ScriptFiles {
         let dir = builder.tempdir().context("creating the script directory")?;
         let mut paths = vec![None; registry.ids().count()];
         for (id, line, body) in bodies {
-            let stem = format!("{}-{}", id.0, registry.spec(id).id);
+            // The INDEX is what makes the name unique (duplicate ids
+            // are legal, first-win); the id part is a debugging
+            // courtesy, BOUNDED so a legal but long id cannot push the
+            // file name past the filesystem's NAME_MAX. Ids are ASCII
+            // (RFC 3986 unreserved), so char truncation is byte
+            // truncation.
+            let id_part: String = registry.spec(id).id.chars().take(40).collect();
+            let stem = format!("{}-{}", id.0, id_part);
             let (name, bytes) = script_file(SHEBANG_ARM, &line, &stem, body);
             let path = dir.path().join(name);
             // Mode set AT creation — no window where the file lacks it;
@@ -7371,6 +7378,28 @@ mod tests {
             let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{p:?}");
         }
+    }
+
+    #[test]
+    fn a_very_long_pane_id_still_materializes() {
+        // Ids have no declared length cap, and the file name embeds the
+        // id. The INDEX carries uniqueness; the id part is a debugging
+        // courtesy and must be bounded, or a legal id overflows the
+        // filesystem's NAME_MAX while the same id works fine as a
+        // non-materialized body.
+        let mut spec = script_spec("#!/bin/sh\necho hi", ShellMode::Platform);
+        spec.id = "p".repeat(254);
+        let registry = Registry::single(spec, None);
+        let scripts = ScriptFiles::materialize(&registry).expect("a long id still materializes");
+        let name = scripts
+            .path(SourceId(0))
+            .expect("a shebang body has a path")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.len() < 255, "{} bytes: {name}", name.len());
+        assert!(name.starts_with("0-"), "{name}");
     }
 
     #[test]
