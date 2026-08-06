@@ -419,9 +419,6 @@ fn beside(parts: &[PaneBlock], gap: usize) -> PaneBlock {
 /// cannot act on. The facts follow the pane's own `chrome`
 /// declaration: `chrome = #false` asked never to see the cadence row,
 /// and a collapsed row is not the place to overrule it.
-// Staged: the collapse gesture's compose branch is the consumer; the
-// allow leaves with it.
-#[allow(dead_code)]
 pub fn render_pane_collapsed(
     pane: &PaneBox,
     geom: PaneGeometry,

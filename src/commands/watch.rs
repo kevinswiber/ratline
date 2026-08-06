@@ -25,7 +25,7 @@ use crate::core::child::{
 use crate::core::duration::parse_interval;
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
-    scroll_badge,
+    render_pane_collapsed, scroll_badge,
 };
 use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
@@ -1776,6 +1776,14 @@ pub(crate) fn run_registry(
                             if let Some(id) =
                                 scroll_target(mode_of(pause.as_ref(), live_scroll), &panes)
                             {
+                                // A focused pane owns the keys even while
+                                // collapsed; its window is not on screen
+                                // to move, so the step declines HERE —
+                                // never by falling back to the whole
+                                // frame (INV-7).
+                                if panes.collapsed[id.0] {
+                                    continue;
+                                }
                                 let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
                                 let window = geom[id.0].inner_rows as usize;
                                 for _ in 0..n {
@@ -2010,6 +2018,60 @@ pub(crate) fn run_registry(
                                 history_seq: Some(entry.seq),
                             });
                             live_scroll = None;
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
+                        WatchAction::ToggleCollapse => {
+                            // With no focus there is no pane to act on,
+                            // and no repaint to spend saying so (INV-12).
+                            let Some(id) = panes.focus else { continue };
+                            if live.is_none() {
+                                continue;
+                            }
+                            // Render-only (INV-8): `geom` is NOT
+                            // re-derived, the pane's spawn env and
+                            // schedule are untouched, and the child
+                            // keeps its width and its cadence. That
+                            // non-event is the point — the next
+                            // iteration's detect_resize derives the same
+                            // geometry from the same state, compares
+                            // equal, and never arms the 250ms gate.
+                            panes.collapsed[id.0] = !panes.collapsed[id.0];
+                            // INV-7 lists collapse/expand as a reanchor
+                            // site. The clamp is a no-op in value here BY
+                            // CONSTRUCTION — the window it reads is
+                            // `geom[i].inner_rows`, which collapse leaves
+                            // alone — and that is exactly why an expanded
+                            // pane returns to the viewport it left.
+                            reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                            recompose_live(
+                                &mut live,
+                                &registry,
+                                &runtime,
+                                &geom,
+                                &panes,
+                                view.alt_time,
+                                &palette,
+                                profile,
+                            );
+                            let Some(live) = live.as_ref() else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
                             previous_key = Some(repaint(
                                 &mut renderer,
                                 pause.as_ref(),
@@ -2649,6 +2711,7 @@ enum WatchAction {
     FocusMove(FocusDir),
     ClearFocus,
     ToggleZoom,
+    ToggleCollapse,
     Ignore,
 }
 
@@ -2788,6 +2851,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Alt('k') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Up),
         Key::Alt('l') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Right),
         Key::Char('z') if mode == FrameMode::Live => WatchAction::ToggleZoom,
+        Key::Space if mode == FrameMode::Live => WatchAction::ToggleCollapse,
         Key::Esc if mode == FrameMode::Live => WatchAction::ClearFocus,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
@@ -4780,6 +4844,12 @@ fn compose_sources(
                 focused: view.focus == Some(id),
                 zoomed: view.zoomed == Some(id),
             };
+            if view.collapsed[id.0] && view.zoomed != Some(id) {
+                // Collapse hides the body; zoom overrules it (INV-12),
+                // so a zoomed pane composes its full content and the
+                // bit survives to restore the row on unzoom.
+                return render_pane_collapsed(pane, geom[id.0], &chrome, palette, profile);
+            }
             render_pane(
                 body,
                 &source.marks,
@@ -5443,6 +5513,7 @@ mod tests {
             Key::Alt('k'),
             Key::Alt('l'),
             Key::Char('z'),
+            Key::Space,
         ];
         for key in bound {
             let expect = match key {
@@ -7801,6 +7872,111 @@ mod tests {
         assert!(
             !step.geom_moved,
             "a view toggle under a zoom must still compare equal, or every child restarts"
+        );
+    }
+
+    #[test]
+    fn space_toggles_collapse_only_while_live() {
+        assert_eq!(
+            action_for(Key::Space, FrameMode::Live),
+            WatchAction::ToggleCollapse
+        );
+        // Per-pane gestures are Live-only (INV-3): a frozen or scrolled
+        // frame is a composed string with no pane identity left in it.
+        for mode in [FrameMode::LiveScrolled, FrameMode::Paused] {
+            assert_eq!(
+                action_for(Key::Space, mode),
+                WatchAction::Ignore,
+                "{mode:?}"
+            );
+        }
+        // Not a second spelling: both input paths deliver 0x20 as
+        // Key::Space (the crossterm map and the scanner), so the space
+        // CHARACTER stays unbound and cannot drift into a second binding.
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char(' '), mode), WatchAction::Ignore);
+        }
+    }
+
+    #[test]
+    fn a_collapsed_pane_composes_one_row_and_a_zoom_still_shows_its_body() {
+        let registry = once_registry(&[("logs", false), ("metrics", false)]);
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let mut runtime: Vec<SourceRuntime> = (0..2).map(|_| SourceRuntime::for_test()).collect();
+        runtime[0].output = Some(vec!["alpha-body".to_string()]);
+        runtime[0].posted = true;
+        runtime[1].output = Some(vec!["beta-body".to_string()]);
+        runtime[1].posted = true;
+        let geom = registry.geometry((40, 12));
+        let mut panes = PaneView::new(registry.len());
+
+        let full = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        panes.collapsed[0] = true;
+        let collapsed = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        // Three declared rows, one rendered — the column shortens (INV-8).
+        assert_eq!(full.lines.len() - collapsed.lines.len(), 2);
+        assert_eq!(collapsed.marks.len(), collapsed.lines.len());
+        assert!(
+            !collapsed.lines.iter().any(|l| l.contains("alpha-body")),
+            "a collapsed pane composes no body: {:?}",
+            collapsed.lines
+        );
+        assert!(
+            collapsed.lines[0].contains("logs"),
+            "the row names its pane"
+        );
+        assert!(
+            collapsed.lines.iter().any(|l| l.contains("beta-body")),
+            "its sibling is untouched"
+        );
+
+        // INV-12: zoom composes the pane's FULL content even while its
+        // collapsed bit is set, and the bit survives to restore it.
+        panes.zoomed = Some(SourceId(0));
+        let zoomed = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        assert!(
+            zoomed.lines.iter().any(|l| l.contains("alpha-body")),
+            "a zoomed pane shows its body regardless of collapse: {:?}",
+            zoomed.lines
+        );
+        assert!(panes.collapsed[0], "zoom never clears the bit");
+    }
+
+    #[test]
+    fn a_collapsed_pane_measures_one_row_for_the_directional_walk() {
+        let registry = once_registry(&[("a", false), ("b", false)]);
+        let geom = registry.geometry((40, 12));
+        let mut panes = PaneView::new(registry.len());
+        assert_eq!(pane_block_sizes(&geom, &panes), vec![(3, 40), (3, 40)]);
+        panes.collapsed[0] = true;
+        assert_eq!(
+            pane_block_sizes(&geom, &panes),
+            vec![(1, 40), (3, 40)],
+            "Alt-j must aim at the row the screen has, not the one declared"
         );
     }
 

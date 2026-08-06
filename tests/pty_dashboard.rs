@@ -3351,3 +3351,347 @@ fn a_zoomed_pane_scrolls_its_own_body_and_wears_the_badge() {
         "the dashboard should have exited on q"
     );
 }
+
+/// Collapse's fixture: a column of two borderless panes, the first one
+/// TITLED. On a borderless pane the title has nowhere else to appear,
+/// so `ALPHA-ROW` on screen means exactly one thing — the collapsed row
+/// rendered. Distinct intervals so each pane's facts are identifiable.
+fn titled_column(a_cmd: &str, a_interval: &str, b_cmd: &str, b_interval: &str) -> String {
+    format!(
+        r#"
+row-gap 0
+
+defaults {{
+    height 4
+    border "none"
+    chrome #true
+    shell #true
+}}
+
+pane "aaa" {{
+    interval "{a_interval}"
+    title "ALPHA-ROW"
+    command "{a_cmd}"
+}}
+
+pane "bbb" {{
+    interval "{b_interval}"
+    command "{b_cmd}"
+}}
+"#
+    )
+}
+
+fn runs(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+/// Space collapses the focused pane to its one title row — and the
+/// collapsed state survives focus leaving and returning (D2: focusing a
+/// collapsed pane must NOT expand it).
+#[test]
+fn space_collapses_the_focused_pane_to_its_title_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aaa = dir.path().join("aaa");
+    let bbb = dir.path().join("bbb");
+    let decl = write_dashboard(
+        dir.path(),
+        &titled_column(
+            &labeled_counter_cmd(&aaa, "aaa"),
+            "1h",
+            &labeled_counter_cmd(&bbb, "bbb"),
+            "2h",
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let first = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"aaa-1", b"bbb-1"],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&first, b"ALPHA-ROW"),
+        "an expanded borderless pane has nowhere to show its title"
+    );
+
+    // Tab focuses the first pane in reading order, Space collapses it,
+    // two more Tabs take focus away and bring it back (D2), and D turns
+    // the gutter on — the one shipped gesture that rewrites EVERY row,
+    // so the capture below is a whole frame and the absence in it is a
+    // statement about the frame rather than about the differ.
+    session.write_bytes(b"\t \t\tD");
+    // The capture ends BELOW where alpha's body would be — `bbb-1` sits
+    // under it — so the absence asserted next is a statement about the
+    // frame rather than about a capture that stopped too early.
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"ALPHA-ROW", b"bbb-1"],
+        Duration::from_secs(3),
+    );
+    assert!(
+        !contains(&seen, b"aaa-1"),
+        "a collapsed pane composes no body: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // `every 1h` belongs to this pane alone (its sibling says 2h, the
+    // footer says `2 sources`), so this row IS the collapsed row and
+    // not the footer's focus segment.
+    let row = row_containing(&seen, b"every 1h").expect("the collapsed row");
+    assert!(
+        contains(row, b"ALPHA-ROW"),
+        "the collapsed row names its pane: {:?}",
+        String::from_utf8_lossy(row)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// INV-8's honesty core: collapse hides output, it does not stop
+/// producing it.
+#[test]
+fn a_collapsed_panes_child_keeps_ticking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tick = dir.path().join("tick");
+    let decl = write_dashboard(
+        dir.path(),
+        &titled_column(
+            &labeled_counter_cmd(&tick, "aaa"),
+            "300ms",
+            "printf 'bbb-static'",
+            "2h",
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let _first = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"aaa-1", b"bbb-static"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\t ");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"ALPHA-ROW"],
+        Duration::from_secs(3),
+    );
+
+    // Child-side evidence across real cadence, DRAINING while waiting:
+    // an undrained master blocks the loop's writer and stalls every
+    // schedule. The drained bytes are the screen-side half of the claim.
+    let before = runs(&tick);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut drained: Vec<u8> = Vec::new();
+    loop {
+        drained.extend(session.read_available(Duration::from_millis(50)));
+        if runs(&tick) >= before + 3 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a collapsed pane's child stopped ticking at {}",
+            runs(&tick)
+        );
+    }
+    assert!(
+        !contains(&drained, b"aaa-"),
+        "three ticks reached the file and none reached the frame: {:?}",
+        String::from_utf8_lossy(&drained)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Expand returns the retained body — and neither gesture restarts a
+/// child (the negative respawn pin, on both halves of the toggle).
+#[test]
+fn space_expands_the_pane_and_its_retained_body_returns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let aaa = dir.path().join("aaa");
+    let bbb = dir.path().join("bbb");
+    let decl = write_dashboard(
+        dir.path(),
+        &titled_column(
+            &labeled_counter_cmd(&aaa, "aaa"),
+            "1h",
+            &labeled_counter_cmd(&bbb, "bbb"),
+            "2h",
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let _first = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"aaa-1", b"bbb-1"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\t ");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"ALPHA-ROW"],
+        Duration::from_secs(3),
+    );
+    // Past the 250ms resize debounce: a collapse that moved geometry
+    // would have respawned EVERY child and both counters would read 2.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    assert_eq!(runs(&aaa), 1, "collapse must never restart a child");
+    assert_eq!(runs(&bbb), 1, "least of all a pane it never touched");
+
+    session.write_bytes(b" ");
+    let seen = wait_for_in_order(&session, &mut terminal, &[b"aaa-1"], Duration::from_secs(3));
+    assert!(
+        !contains(&seen, b"aaa-2"),
+        "the body came back from RETENTION, not from a re-run"
+    );
+    let _ = drain_for(&session, Duration::from_millis(700));
+    assert_eq!(runs(&aaa), 1, "expand must never restart a child either");
+    assert_eq!(runs(&bbb), 1);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// A collapsed pane ignores the scroll keys (INV-7), and the pager still
+/// reaches its whole retained body — the honest escape hatch a collapsed
+/// pane needs most.
+#[test]
+fn a_collapsed_pane_ignores_the_scroll_keys_and_still_pages() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 5
+    border "none"
+    chrome #false
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 40); do echo L$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"L01", b"L05"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\tj");
+    // Focus retargets the scroll keys at this pane: the window is now
+    // L02..L06.
+    let _ = wait_for_in_order(&session, &mut terminal, &[b"L06"], Duration::from_secs(3));
+
+    // Collapse, three scroll steps that must land nowhere, expand.
+    session.write_bytes(b" jjj ");
+    let seen = wait_for_in_order(&session, &mut terminal, &[b"L06"], Duration::from_secs(3));
+    assert!(
+        !contains(&seen, b"L09"),
+        "a collapsed pane ignores scroll steps (INV-7): {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // Collapse again and page: the pager reads the retained body, which
+    // collapse never touched, so every line is still reachable.
+    session.write_bytes(b" v");
+    let _ = wait_for_in_order(&session, &mut terminal, &[b"L40"], Duration::from_secs(5));
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Zoom shows a collapsed pane's body; unzoom returns the row (INV-12).
+#[test]
+fn zoom_shows_a_collapsed_panes_body_and_unzoom_returns_the_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        &titled_column(
+            "for i in $(seq -w 1 40); do echo L$i; done",
+            "1h",
+            "printf 'bbb-static'",
+            "2h",
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"L01", b"bbb-static"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\t ");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"ALPHA-ROW"],
+        Duration::from_secs(3),
+    );
+
+    session.write_bytes(b"z");
+    // The zoomed box is the window's row budget (~21 content rows at
+    // 24x80), so L10 is reachable only under the zoom — and only if the
+    // zoom overrides the collapsed bit.
+    let _ = wait_for_in_order(&session, &mut terminal, &[b"L10"], Duration::from_secs(3));
+
+    // Unzoom, then D for the whole-frame repaint. The capture must END
+    // BELOW where alpha's body would be, or its absence proves nothing:
+    // `bbb-static` sits under alpha, so the span between the two
+    // needles is exactly the region a body would have been written in.
+    session.write_bytes(b"zD");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"ALPHA-ROW", b"bbb-static"],
+        Duration::from_secs(3),
+    );
+    assert!(
+        !contains(&seen, b"L01"),
+        "unzoom returns the pane to its collapsed row (INV-12): {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
