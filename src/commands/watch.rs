@@ -1645,6 +1645,15 @@ pub(crate) fn run_registry(
                             let content: &[String] = if action == WatchAction::Help {
                                 help = help_lines(session.help_heading, &session.help_extra);
                                 &help
+                            } else if let Some(id) =
+                                pager_target(mode_of(pause.as_ref(), live_scroll), &panes)
+                            {
+                                // The pane's WHOLE retained body, not its
+                                // window: the honest answer to a KeepTop
+                                // pane whose retention gate shut, to a
+                                // body too long to step through, and to a
+                                // collapsed pane.
+                                runtime[id.0].output.as_deref().unwrap_or(&[])
                             } else {
                                 let Some(live) = live.as_ref() else { continue };
                                 pause.as_ref().map_or(&live.lines, |p| &p.frozen)
@@ -3307,6 +3316,15 @@ fn pane_scroll_badge(
 fn scroll_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
     let id = panes.focus?;
     (mode == FrameMode::Live).then_some(id)
+}
+
+/// Which body `v`/Enter hands to the pager: the focused pane's while
+/// Live, else the whole frame (live, frozen, or scrubbed). The same
+/// predicate as the scroll retarget — the two gestures diverge at their
+/// ARMS (a collapsed pane's scroll step declines; its page serves the
+/// body a reader has no other way to see), never here.
+fn pager_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
+    scroll_target(mode, panes)
 }
 
 /// THE reanchor. Every site that changes a pane's body or its window
@@ -7596,6 +7614,30 @@ mod tests {
         // An empty body has no position to report, whatever its pin bit.
         let empty = initial_pane_scroll(Overflow::KeepBottom, 0, 4).step(ScrollStep::Top, 0, 4);
         assert_eq!(pane_scroll_badge(empty, Overflow::KeepBottom, 0, 4), None);
+    }
+
+    #[test]
+    fn the_pager_follows_focus_only_while_live_and_serves_a_collapsed_pane() {
+        let mut panes = PaneView::new(2);
+        assert_eq!(
+            pager_target(FrameMode::Live, &panes),
+            None,
+            "no focus, whole frame"
+        );
+        panes.focus = Some(SourceId(0));
+        assert_eq!(pager_target(FrameMode::Live, &panes), Some(SourceId(0)));
+        // Paused and scrubbed frames are composed strings with no pane
+        // identity: they keep paging their frozen snapshot (INV-3).
+        assert_eq!(pager_target(FrameMode::Paused, &panes), None);
+        assert_eq!(pager_target(FrameMode::LiveScrolled, &panes), None);
+        // A collapsed pane keeps BOTH targets: the gestures diverge at
+        // their arms, never here — a collapsed pane's scroll step
+        // declines in the arm (its window is not on screen to move),
+        // while its page serves the body a reader has no other way to
+        // see.
+        panes.collapsed[0] = true;
+        assert_eq!(pager_target(FrameMode::Live, &panes), Some(SourceId(0)));
+        assert_eq!(scroll_target(FrameMode::Live, &panes), Some(SourceId(0)));
     }
 
     #[test]

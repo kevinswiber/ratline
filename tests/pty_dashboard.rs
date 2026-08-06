@@ -2699,3 +2699,127 @@ pane "a" {
         "dashboard should have exited on q"
     );
 }
+
+/// `v` with a pane focused pages that pane's WHOLE retained body — the
+/// lines its window clips are exactly what the escape hatch is for.
+#[test]
+fn v_pages_the_focused_panes_whole_retained_body() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    border "none"
+    chrome #false
+    shell #true
+}
+
+pane "a" {
+    height 4
+    interval "1h"
+    command "printf 'L%s\\n' 01 02 03 04 05 06 07 08 09 10 11 12"
+}
+
+pane "b" {
+    height 1
+    interval "1h"
+    command "printf 'BEE'"
+}
+"#,
+    );
+
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // Pane a's window is 4 rows over a 12-line body: L05..L12 are
+    // retained and have never been painted.
+    let first = wait_for_bytes(&session, &mut terminal, b"L04", Duration::from_secs(5))
+        .expect("the first composition never painted");
+    assert!(!contains(&first, b"L12"), "L12 must not be on screen");
+
+    session.write_bytes(b"\t"); // focus pane a
+    session.write_bytes(b"v");
+    assert!(
+        wait_for(&session, &mut terminal, b"L12", Duration::from_secs(5)),
+        "the pager never received the pane's retained tail"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The explicit guard: `Page` is bound in every mode, and a frozen frame
+/// is a literal copy of composed strings with no pane identity in it. A
+/// pane may be focused when `p` lands, and `v` must still hand the pager
+/// the frozen WHOLE frame.
+#[test]
+fn a_paused_frame_pages_the_frozen_frame_even_with_a_pane_focused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    border "none"
+    chrome #false
+    shell #true
+}
+
+pane "a" {
+    height 4
+    interval "1h"
+    command "printf 'L%s\\n' 01 02 03 04 05 06 07 08 09 10 11 12"
+}
+
+pane "b" {
+    height 1
+    interval "1h"
+    command "printf 'BEE'"
+}
+"#,
+    );
+
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let mut seen = wait_for_bytes(&session, &mut terminal, b"BEE", Duration::from_secs(5))
+        .expect("the first composition never painted");
+    session.write_bytes(b"\t"); // focus pane a
+    session.write_bytes(b"p"); // then freeze it
+    seen.extend(
+        wait_for_bytes(&session, &mut terminal, b"paused", Duration::from_secs(5))
+            .expect("the frame never froze"),
+    );
+    session.write_bytes(b"v");
+    // The pager clobbers the screen, so the return repaints the FULL
+    // frame — pane b's row is rewritten, which no other event does for a
+    // 1h pane. That second `BEE` is the evidence the round trip happened.
+    seen.extend(
+        wait_for_bytes(&session, &mut terminal, b"BEE", Duration::from_secs(5))
+            .expect("the pager never returned"),
+    );
+    assert!(
+        !contains(&seen, b"L12"),
+        "a paused v must page the frozen frame, never a pane's body"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
