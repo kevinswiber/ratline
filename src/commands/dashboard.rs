@@ -120,8 +120,9 @@ fn pane_help(registry: &Registry) -> Vec<String> {
 }
 
 /// The per-pane gestures, gated to a live frame. "live" here is the
-/// FRAME state (not paused, not scrolled) — a different word from the
-/// `live` pane label the next section defines, and the heading says so
+/// FRAME state (not paused — a scrolled live frame counts, and the
+/// frame window follows the focus) — a different word from the `live`
+/// pane label the next section defines, and the heading says so
 /// because the two share a spelling and nothing else.
 ///
 /// Wrapped by hand, like every section here: `?` pages plain grouped
@@ -129,13 +130,16 @@ fn pane_help(registry: &Registry) -> Vec<String> {
 const PANE_GESTURE_HELP: &[&str] = &[
     "",
     "  pane gestures (while the frame is live — not the `live` label):",
-    "    Tab, BackTab     cycle focus between panes",
+    "    Tab, BackTab     cycle focus between panes — a zoom rides along",
     "    Alt-h/j/k/l      move focus directionally",
-    "    Esc              clear focus (unzoom first, if zoomed)",
+    "    Esc              unzoom, then drop focus, then the frame scroll",
+    "    Enter            zoom the focused pane; zoomed, page its body",
     "    z                zoom the focused pane to the full frame",
     "    Space            collapse the focused pane to its title row",
     "    With a pane focused, the scroll keys and the wheel drive that",
-    "    pane's own window instead of the whole frame.",
+    "    pane's own window instead of the whole frame, and focusing a",
+    "    pane below the fold scrolls the frame to it. h/l shift",
+    "    nothing here: pane content is clipped to its box.",
 ];
 
 /// What the `live` label means, and what `interval` means under it.
@@ -430,13 +434,16 @@ mod tests {
                 "    b  every 5s".to_string(),
                 String::new(),
                 "  pane gestures (while the frame is live — not the `live` label):".to_string(),
-                "    Tab, BackTab     cycle focus between panes".to_string(),
+                "    Tab, BackTab     cycle focus between panes — a zoom rides along".to_string(),
                 "    Alt-h/j/k/l      move focus directionally".to_string(),
-                "    Esc              clear focus (unzoom first, if zoomed)".to_string(),
+                "    Esc              unzoom, then drop focus, then the frame scroll".to_string(),
+                "    Enter            zoom the focused pane; zoomed, page its body".to_string(),
                 "    z                zoom the focused pane to the full frame".to_string(),
                 "    Space            collapse the focused pane to its title row".to_string(),
                 "    With a pane focused, the scroll keys and the wheel drive that".to_string(),
-                "    pane's own window instead of the whole frame.".to_string(),
+                "    pane's own window instead of the whole frame, and focusing a".to_string(),
+                "    pane below the fold scrolls the frame to it. h/l shift".to_string(),
+                "    nothing here: pane content is clipped to its box.".to_string(),
             ]
         );
     }
@@ -452,6 +459,7 @@ mod tests {
             "BackTab",
             "Alt-h/j/k/l",
             "Esc",
+            "Enter",
             "z ",
             "Space",
             "focus",

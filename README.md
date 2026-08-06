@@ -396,25 +396,34 @@ with an empty stdout rather than printing a partial frame.
 `Tab` and `BackTab` cycle the focus through the panes in layout
 reading order, wrapping; `Alt-h/j/k/l` moves it directionally, and a
 direction with no candidate pane is a no-op rather than a wrap. The
-focused pane wears the accent border and the footer names it. `Esc`
-clears the focus — or leaves a zoom first, if one is active. All of it
-is live-frame only: while the frame is paused or scrubbed these keys do
-nothing, and freeze/scrub/pager stay whole-frame, unchanged.
+focused pane wears the accent border and the footer names it. On a
+board taller than the window the frame viewport follows the focus:
+focusing a pane below the fold scrolls it into view, and the gestures
+work from a scrolled frame too. `Esc` peels one layer at a time — the
+zoom, then the focus (the frame scroll holds its place), then the
+frame scroll itself. Only a paused or scrubbed frame ignores the pane
+keys; freeze/scrub stay whole-frame, unchanged.
 
 With a pane focused, the scroll keys (`j/k`, `d/u`, `f/b`, `g/G`) and
 the wheel drive that pane's own window over its retained lines instead
 of the whole frame; the chrome row gains a `lines a-b of N` badge while
 the window is off its declared rest, and `v` pages the focused pane's
-whole retained body. The window holds its place when the pane's next
-run replaces the body — clamped into the new shape, never reset.
+whole retained body. `Enter` zooms the focused pane first; a second
+`Enter`, zoomed, hands that body to the pager. The window holds its
+place when the pane's next run replaces the body — clamped into the
+new shape, never reset. The horizontal shift (`h/l`) is a plain-watch
+affair: pane content is clipped to its box, so on a board those keys
+are inert.
 
 `z` zooms the focused pane to the full frame and back. A live pane
 just re-clips to the new width — a view gesture never restarts a
 long-lived child, the same rule the gutter toggle and a resize already
 follow. A batch pane's content was rendered at its old declared width,
 so it re-runs once, debounced, to arrive at the zoomed width honestly —
-on zoom-in and zoom-out alike. The hidden panes keep running
-underneath, and per-pane scroll stays active over the zoomed body.
+on zoom-in and zoom-out alike. While zoomed, `Tab` and `BackTab` carry
+the zoom from pane to pane along the reading order. The hidden panes
+keep running underneath, and per-pane scroll stays active over the
+zoomed body.
 
 `Space` collapses the focused pane to a one-row title line; the child
 keeps running and being captured underneath — only what is rendered
