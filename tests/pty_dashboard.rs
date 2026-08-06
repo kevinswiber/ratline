@@ -2700,6 +2700,75 @@ pane "a" {
     );
 }
 
+/// A pane clips its own content at compose time, so a horizontal shift
+/// over a board could only reveal blank cells, without bound: `h`/`l`
+/// are inert on panes. Plain watch keeps less's unclamped shift.
+#[test]
+fn a_horizontal_shift_is_inert_on_a_pane_board() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+row-gap 0
+
+defaults {{
+    height 3
+    border "none"
+    chrome #false
+    shell #true
+}}
+
+pane "a" {{
+    interval "1h"
+    command "echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-REMNANT"
+}}
+pane "b" {{
+    interval "250ms"
+    command "{counter}"
+}}
+"#,
+            counter = labeled_counter_cmd(&count, "b"),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"REMNANT", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let ticks = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+
+    // Three shifts, then the neighbour's later tick as the sentinel:
+    // if any shift repainted, pane a's chopped row — whose tail still
+    // carries the marker at every step of the shift — lands in this
+    // same drained window before the sentinel does.
+    session.write_bytes(b"lll");
+    let advanced = format!("b-{}", ticks + 2);
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[advanced.as_bytes()],
+        Duration::from_secs(5),
+    );
+    assert!(
+        !contains(&seen, b"REMNANT"),
+        "a shift must not repaint a board: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// `v` with a pane focused pages that pane's WHOLE retained body — the
 /// lines its window clips are exactly what the escape hatch is for.
 #[test]

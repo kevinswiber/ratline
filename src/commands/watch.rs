@@ -2296,6 +2296,19 @@ pub(crate) fn run_registry(
                             if live.is_none() {
                                 continue;
                             }
+                            // A pane clips its own content at compose
+                            // time (the two-column ellipsis), so a
+                            // composed board row never extends past the
+                            // frame: a shift could only reveal blank
+                            // cells, without bound. Plain watch keeps
+                            // less's unclamped shift.
+                            if matches!(
+                                action,
+                                WatchAction::ShiftLeft | WatchAction::ShiftRight
+                            ) && matches!(registry.composition(), Composition::Panes { .. })
+                            {
+                                continue;
+                            }
                             // View state, not scrollback state: applies to
                             // live and frozen frames alike, never freezes
                             // the tail, repaints in place. Right shift is
