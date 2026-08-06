@@ -2,6 +2,40 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.17.0](https://github.com/kevinswiber/ratto/compare/99f0a6016defd672b98c977b4c4afeea8d3ae5c8..v0.17.0) - 2026-08-06
+#### Features
+- the zoomed badge carries its place in the cycle - ([e6cb2b7](https://github.com/kevinswiber/ratto/commit/e6cb2b7542eff7d6b7baeb2fe93abbcedbb5fc8e)) - [@kevinswiber](https://github.com/kevinswiber)
+- esc drops the focus before it drops the frame scroll - ([a382c80](https://github.com/kevinswiber/ratto/commit/a382c806bae567db8e3c1e6f46a47659a93cc3b6)) - [@kevinswiber](https://github.com/kevinswiber)
+- tab carries the zoom along the reading order - ([55b5274](https://github.com/kevinswiber/ratto/commit/55b52744b23efa158d657985fca7117dd62292a7)) - [@kevinswiber](https://github.com/kevinswiber)
+- enter zooms a focused pane and pages it once zoomed - ([2ab974f](https://github.com/kevinswiber/ratto/commit/2ab974f9ae706e5a0e5aa3d15aa6b4ddcaa7948e)) - [@kevinswiber](https://github.com/kevinswiber)
+- focus works from the scrolled frame and the viewport follows it - ([44c90c9](https://github.com/kevinswiber/ratto/commit/44c90c996e4b76e016b3810a61a9817d00a5d54f)) - [@kevinswiber](https://github.com/kevinswiber)
+- space collapses the focused pane to one row that keeps its child - ([43ca239](https://github.com/kevinswiber/ratto/commit/43ca2399566c90459854fd3155af09290bdcc056)) - [@kevinswiber](https://github.com/kevinswiber)
+- a collapsed pane renders as one row naming itself - ([0bc7f57](https://github.com/kevinswiber/ratto/commit/0bc7f574d0ba505642007fdf2f3cb55bb0a97584)) - [@kevinswiber](https://github.com/kevinswiber)
+- a zoomed pane keeps its viewport and wears the badge - ([31d54bc](https://github.com/kevinswiber/ratto/commit/31d54bc0975bc5fa2fa62ee66af5b061322b2bef)) - [@kevinswiber](https://github.com/kevinswiber)
+- a zoomed batch pane earns an honest width within one debounced run - ([bda7113](https://github.com/kevinswiber/ratto/commit/bda711396ec114276df419d6cf3b41595abee81b)) - [@kevinswiber](https://github.com/kevinswiber)
+- z zooms the focused pane to the frame and back - ([6edb6bf](https://github.com/kevinswiber/ratto/commit/6edb6bf1994058bf5e0190a253b82609a7cb36bc)) - [@kevinswiber](https://github.com/kevinswiber)
+- the geometry derivation answers a zoom without reading as a resize - ([ab441da](https://github.com/kevinswiber/ratto/commit/ab441dac4e2b32749f805834ffbb38e996b96099)) - [@kevinswiber](https://github.com/kevinswiber)
+- v pages the focused pane's whole retained body - ([d00c94f](https://github.com/kevinswiber/ratto/commit/d00c94f160773322e9ae5b49630358edd35f9d52)) - [@kevinswiber](https://github.com/kevinswiber)
+- a scrolled pane says where its window is - ([a68b34c](https://github.com/kevinswiber/ratto/commit/a68b34cdd0a99d1fbd7e27d44176cde3a8697901)) - [@kevinswiber](https://github.com/kevinswiber)
+- the scroll keys drive the focused pane's own window - ([4c33c9f](https://github.com/kevinswiber/ratto/commit/4c33c9fb54e845a8e9aa7f96521f52374e2f60d1)) - [@kevinswiber](https://github.com/kevinswiber)
+- a pane renders through a viewport its caller hands it - ([34a82f8](https://github.com/kevinswiber/ratto/commit/34a82f81162e66a28a5bc341172bb041bc345e86)) - [@kevinswiber](https://github.com/kevinswiber)
+- a pane window knows its pin and its declared rest - ([8487d55](https://github.com/kevinswiber/ratto/commit/8487d55af0a6b27c4d0f547f61ec0b6f567ea835)) - [@kevinswiber](https://github.com/kevinswiber)
+- the focused pane wears the accent border and the footer names it - ([ad99437](https://github.com/kevinswiber/ratto/commit/ad99437be342d1d7b45934dd3f4af9b4ede81059)) - [@kevinswiber](https://github.com/kevinswiber)
+- tab cycles and alt-hjkl moves a pane focus the loop now holds - ([e1a3105](https://github.com/kevinswiber/ratto/commit/e1a3105caff1ac9f1e256bfa34f81be9e2f55ed3)) - [@kevinswiber](https://github.com/kevinswiber)
+- one geometry derivation, and the repaint gate sees the per-pane view - ([1148557](https://github.com/kevinswiber/ratto/commit/1148557b31fb0c963998023eb012b2ea1dce3c80)) - [@kevinswiber](https://github.com/kevinswiber)
+- the layout tree answers where each pane lands and in what order - ([2e128dc](https://github.com/kevinswiber/ratto/commit/2e128dc85466cad44a28610b33d18e47c88cf82d)) - [@kevinswiber](https://github.com/kevinswiber)
+- the unix scanner decodes tab, backtab, space, and the meta encoding - ([a4a400d](https://github.com/kevinswiber/ratto/commit/a4a400d021ea9775cebf89af9ef45e11e5dccfda)) - [@kevinswiber](https://github.com/kevinswiber)
+- alt-modified printables arrive as their own key - ([9abd7ff](https://github.com/kevinswiber/ratto/commit/9abd7ff85da00f207aa60a938b313aa75b736ded)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- a horizontal shift is inert on a pane board - ([6793506](https://github.com/kevinswiber/ratto/commit/67935069d681a3fa6d57ced50e749becb75fc295)) - [@kevinswiber](https://github.com/kevinswiber)
+- expand tabs before dashboard layout - ([5b9a7f0](https://github.com/kevinswiber/ratto/commit/5b9a7f06e6c04f7dff2c1bdeac2a56e39106f465)) - [@kevinswiber](https://github.com/kevinswiber)
+- a quoted word in a platform-shell body reaches cmd verbatim - ([99f0a60](https://github.com/kevinswiber/ratto/commit/99f0a6016defd672b98c977b4c4afeea8d3ae5c8)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the esc ladder, the enter ladder, and the zoom carry reach the help - ([8f3823a](https://github.com/kevinswiber/ratto/commit/8f3823aa13b170897071ffe4dd9a46386f72e7c6)) - [@kevinswiber](https://github.com/kevinswiber)
+- the pane gestures reach the key reference, the readme, and the examples - ([04397f9](https://github.com/kevinswiber/ratto/commit/04397f9609148f70501f61b48342d548b668d69f)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.16.0](https://github.com/kevinswiber/ratto/compare/ecca9dcada7ab1f88aa5d4478f6f88597dcec5b7..v0.16.0) - 2026-08-05
 #### Features
 - script bodies resolve with their own rules - ([b734017](https://github.com/kevinswiber/ratto/commit/b7340178b1489e630a6ca61c4c919e604d6c9ad9)) - [@kevinswiber](https://github.com/kevinswiber)
