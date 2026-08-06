@@ -2774,6 +2774,7 @@ impl PaneView {
         for (collapsed, scroll) in self.collapsed.iter().zip(&self.scroll) {
             collapsed.hash(&mut hasher);
             scroll.offset().hash(&mut hasher);
+            scroll.pinned().hash(&mut hasher);
         }
         PaneViewKey {
             focus: self.focus,
@@ -3200,6 +3201,33 @@ fn repaint(
 /// on; zero otherwise. One spelling, used by every geometry site.
 fn gutter_reserve(gutter: bool) -> u16 {
     if gutter { GUTTER_COLS as u16 } else { 0 }
+}
+
+/// A pane's window as its declaration asks for it: `KeepTop` is the head,
+/// held; `KeepBottom` is the tail, pinned. These are the SAME two states
+/// the shipped `render_pane` clip had — which is what lets the viewport
+/// replace that clip with an offset and change no bytes.
+// Staged: the scroll retarget consumes both helpers; the allows leave
+// with that consumer.
+#[allow(dead_code)]
+fn initial_pane_scroll(overflow: Overflow, total: usize, window: usize) -> LiveScroll {
+    match overflow {
+        Overflow::KeepTop => LiveScroll::at(0, total, window),
+        Overflow::KeepBottom => LiveScroll::start(ScrollStep::Bottom, total, window),
+    }
+}
+
+/// Whether a pane's window is where its declaration puts it — the one
+/// test for "show no position badge" and "the reader has taken over".
+/// NEVER `LiveScroll::at_top()`: that is the whole-frame collapse rule
+/// (offset 0 means the live view), and a KeepBottom pane at rest sits at
+/// its tail with a nonzero offset.
+#[allow(dead_code)]
+fn pane_at_rest(scroll: LiveScroll, overflow: Overflow) -> bool {
+    match overflow {
+        Overflow::KeepTop => scroll.offset() == 0 && !scroll.pinned(),
+        Overflow::KeepBottom => scroll.pinned(),
+    }
 }
 
 /// The ONE geometry derivation. The gesture arms, the resize arm, and
@@ -5049,6 +5077,7 @@ mod tests {
     use ratatui::style::Color;
 
     use super::*;
+    use crate::term::scroll::max_offset;
 
     const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
 
@@ -7298,6 +7327,74 @@ mod tests {
         let mut scrolled = PaneView::new(3);
         scrolled.scroll[0] = LiveScroll::at(2, 50, 10);
         assert_ne!(base.key(), scrolled.key());
+    }
+
+    #[test]
+    fn a_pin_flip_alone_moves_the_view_key() {
+        // A KeepBottom pane stepped off its tail and re-pinned at the same
+        // offset differs ONLY in the pin bit; the gate must see it or the
+        // badge/footer change it implies paints nothing.
+        let mut a = PaneView::new(1);
+        let mut b = PaneView::new(1);
+        a.scroll[0] = LiveScroll::at(3, 10, 4);
+        b.scroll[0] = LiveScroll::start(ScrollStep::Bottom, 7, 4);
+        assert_eq!(
+            a.scroll[0].offset(),
+            b.scroll[0].offset(),
+            "fixture premise"
+        );
+        assert_ne!(a.key(), b.key(), "the pin bit is a gate term (INV-2)");
+    }
+
+    #[test]
+    fn a_keep_bottom_pane_is_at_rest_while_it_is_pinned() {
+        // The declared clip: KeepBottom's rest state is the tail, and
+        // `initial_pane_scroll` must produce exactly the offset the shipped
+        // `render_pane` match produced for the same body.
+        let rest = initial_pane_scroll(Overflow::KeepBottom, 46, 22);
+        assert_eq!(rest.offset(), max_offset(46, 22));
+        assert!(rest.pinned());
+        assert!(pane_at_rest(rest, Overflow::KeepBottom));
+        // And it keeps riding the tail across a tick, still at rest.
+        let grown = rest.reanchor(60, 22);
+        assert_eq!(grown.offset(), max_offset(60, 22));
+        assert!(pane_at_rest(grown, Overflow::KeepBottom));
+    }
+
+    #[test]
+    fn a_keep_top_pane_is_at_rest_at_offset_zero_unpinned() {
+        let rest = initial_pane_scroll(Overflow::KeepTop, 46, 22);
+        assert_eq!(rest.offset(), 0);
+        assert!(!rest.pinned());
+        assert!(pane_at_rest(rest, Overflow::KeepTop));
+        // Stepped away, then back: `g` returns a KeepTop pane to rest.
+        let moved = rest.step(ScrollStep::LineDown, 46, 22);
+        assert!(!pane_at_rest(moved, Overflow::KeepTop));
+        assert!(pane_at_rest(
+            moved.step(ScrollStep::Top, 46, 22),
+            Overflow::KeepTop
+        ));
+        // `G` on a KeepTop pane is NOT rest: it pinned the window to a tail
+        // its declaration never asked for, and the badge must say so.
+        let pinned = rest.step(ScrollStep::Bottom, 46, 22);
+        assert!(!pane_at_rest(pinned, Overflow::KeepTop));
+    }
+
+    #[test]
+    fn at_top_would_lie_in_both_directions_at_pane_scope() {
+        // Why `pane_at_rest` exists at all (grounding §5). `at_top()` is the
+        // whole-frame idiom — offset 0 collapses the mode — and at pane scope
+        // it is wrong BOTH ways for a KeepBottom pane.
+        let rest = initial_pane_scroll(Overflow::KeepBottom, 46, 22);
+        assert!(!rest.at_top(), "at rest, and at_top() calls it scrolled");
+        assert!(pane_at_rest(rest, Overflow::KeepBottom));
+
+        let scrolled_to_head = rest.step(ScrollStep::Top, 46, 22);
+        assert!(scrolled_to_head.at_top(), "at_top() calls this one at rest");
+        assert!(
+            !pane_at_rest(scrolled_to_head, Overflow::KeepBottom),
+            "a KeepBottom pane parked at its head is scrolled, and the badge must show it"
+        );
     }
 
     #[test]

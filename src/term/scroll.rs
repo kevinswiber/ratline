@@ -120,6 +120,13 @@ impl LiveScroll {
         self.offset
     }
 
+    /// Whether the window rides the tail. At frame scope this is `G`'s
+    /// latch; at pane scope it IS `Overflow::KeepBottom`'s rest state,
+    /// which `at_top()` cannot express.
+    pub fn pinned(self) -> bool {
+        self.pinned
+    }
+
     /// Offset 0 means the window is the live view: collapse the mode.
     pub fn at_top(self) -> bool {
         self.offset == 0
@@ -348,6 +355,23 @@ mod tests {
         assert_eq!(
             paused_notice("14s ago", 5, 0, 30),
             "paused · 14s ago · line 6 of 30 · Esc resumes"
+        );
+    }
+
+    #[test]
+    fn the_pin_bit_is_readable_without_reanchoring_to_see_it() {
+        // Today the pin is observable only by watching `reanchor` chase a
+        // growing tail. At pane scope it IS the declared rest state
+        // (`Overflow::KeepBottom`), so it has to be askable.
+        assert!(LiveScroll::start(ScrollStep::Bottom, 46, 22).pinned());
+        assert!(!LiveScroll::at(9, 46, 22).pinned());
+        assert!(!LiveScroll::start(ScrollStep::LineDown, 46, 22).pinned());
+        let unpinned =
+            LiveScroll::start(ScrollStep::Bottom, 46, 22).step(ScrollStep::LineUp, 46, 22);
+        assert!(!unpinned.pinned(), "any step but Bottom unpins");
+        assert!(
+            unpinned.step(ScrollStep::Bottom, 46, 22).pinned(),
+            "G re-pins"
         );
     }
 }
