@@ -421,7 +421,8 @@ long-lived child, the same rule the gutter toggle and a resize already
 follow. A batch pane's content was rendered at its old declared width,
 so it re-runs once, debounced, to arrive at the zoomed width honestly —
 on zoom-in and zoom-out alike. While zoomed, `Tab` and `BackTab` carry
-the zoom from pane to pane along the reading order. The hidden panes
+the zoom from pane to pane along the reading order, and the chrome
+row's `zoomed 2/4` badge names the pane's place in that cycle. The hidden panes
 keep running underneath, and per-pane scroll stays active over the
 zoomed body.
 

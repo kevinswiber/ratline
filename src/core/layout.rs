@@ -54,10 +54,12 @@ pub struct PaneChrome<'a> {
     /// focused pane gets: the border recolors and costs no display
     /// cell, which is why a borderless pane needs the footer too.
     pub focused: bool,
-    /// This pane is currently filling the frame. LAST of the badges:
-    /// the ones before it are conditions the pane is in, this one is
-    /// what the reader did.
-    pub zoomed: bool,
+    /// This pane is currently filling the frame, pre-formatted with
+    /// its place in the reading order (`zoomed 2/4`) — the other panes
+    /// are invisible, so Tab-cycling needs the cursor to orient by.
+    /// LAST of the badges: the ones before it are conditions the pane
+    /// is in, this one is what the reader did.
+    pub zoomed: Option<&'a str>,
 }
 
 /// The viewport a pane's declared `Overflow` asks for: how many leading
@@ -482,7 +484,7 @@ fn chrome_facts(chrome: &PaneChrome<'_>) -> String {
 fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> String {
     let mut text = chrome_facts(chrome);
     push_badge(&mut text, chrome.scrolled);
-    push_badge(&mut text, chrome.zoomed.then_some("zoomed"));
+    push_badge(&mut text, chrome.zoomed);
     let faint = StyleSpec {
         faint: true,
         ..StyleSpec::default()
@@ -551,7 +553,7 @@ mod tests {
             truncated: None,
             scrolled: None,
             focused: false,
-            zoomed: false,
+            zoomed: None,
         }
     }
 
@@ -1549,7 +1551,7 @@ mod tests {
         let mut chrome = chrome(Some("exit 3"));
         chrome.looping = true;
         chrome.truncated = Some("2 lines dropped");
-        chrome.zoomed = true;
+        chrome.zoomed = Some("zoomed 2/4");
         // Wide enough that no badge is truncated from the right.
         let block = render_pane(
             &lines(&["body"]),
@@ -1567,13 +1569,17 @@ mod tests {
             .find(|l| l.contains("zoomed"))
             .expect("the chrome row carries the badge");
         let at = row.find("zoomed").expect("badge");
+        assert!(
+            row.contains("zoomed 2/4"),
+            "the badge carries the cycle cursor: {row:?}"
+        );
         for earlier in ["every 5s", "exit 3", "looping", "2 lines dropped"] {
             assert!(
                 row.find(earlier).expect(earlier) < at,
                 "`zoomed` is the last badge: {row:?}"
             );
         }
-        chrome.zoomed = false;
+        chrome.zoomed = None;
         let plain = render_pane(
             &lines(&["body"]),
             &[],

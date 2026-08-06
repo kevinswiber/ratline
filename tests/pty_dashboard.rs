@@ -3357,7 +3357,7 @@ fn tab_cycles_the_zoomed_pane_and_a_directional_move_declines() {
     wait_for_in_order(
         &session,
         &mut terminal,
-        &[b"right-2"],
+        &[b"zoomed 2/2", b"right-2"],
         Duration::from_secs(5),
     );
     // The pane that LEFT the zoom owes its declared-width run too;
@@ -3371,7 +3371,7 @@ fn tab_cycles_the_zoomed_pane_and_a_directional_move_declines() {
     wait_for_in_order(
         &session,
         &mut terminal,
-        &[b"left-4"],
+        &[b"zoomed 1/2", b"left-4"],
         Duration::from_secs(5),
     );
     assert_counter_settled_at(&right, 3);

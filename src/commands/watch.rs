@@ -5008,6 +5008,14 @@ fn pane_display_name(registry: &Registry, id: SourceId) -> &str {
 /// the run-constant tail rule — and this one is admissible exactly
 /// because `PaneViewKey.focus` is IN the key. A counter here would not
 /// be, and would go silently stale.
+/// The zoom cursor: this pane's place in the reading order while it
+/// fills the frame. Tab carries the zoom from pane to pane and the
+/// others are invisible, so "2/4" is the only orientation there is.
+fn zoom_badge(order: &[SourceId], id: SourceId) -> String {
+    let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
+    format!("zoomed {at}/{}", order.len())
+}
+
 fn focus_segment(
     registry: &Registry,
     runtime: &[SourceRuntime],
@@ -5031,6 +5039,16 @@ fn focus_segment(
     {
         seg.push_str(" · ");
         seg.push_str(&badge);
+    }
+    // The same D5 rule for the zoom cursor: a chrome-less pane has
+    // nowhere on itself to say where the zoom cycle stands.
+    if view.zoomed == Some(id)
+        && let Some(pane) = registry.pane(id)
+        && !pane.chrome
+        && let Composition::Panes { layout, .. } = registry.composition()
+    {
+        seg.push_str(" · ");
+        seg.push_str(&zoom_badge(&pane_order(layout), id));
     }
     Some(seg)
 }
@@ -5083,11 +5101,13 @@ fn compose_sources(
     else {
         return PaneBlock::default();
     };
+    let order = pane_order(layout);
     let blocks: Vec<PaneBlock> = registry
         .ids()
         .map(|id| {
             let source = &runtime[id.0];
             let spec = registry.spec(id);
+            let zoom_cursor = (view.zoomed == Some(id)).then(|| zoom_badge(&order, id));
             let pane = registry
                 .pane(id)
                 .expect("a Panes registry boxes every source");
@@ -5120,7 +5140,7 @@ fn compose_sources(
                 truncated: source.truncated.as_deref(),
                 scrolled: scrolled.as_deref(),
                 focused: view.focus == Some(id),
-                zoomed: view.zoomed == Some(id),
+                zoomed: zoom_cursor.as_deref(),
             };
             if view.collapsed[id.0] && view.zoomed != Some(id) {
                 // Collapse hides the body; zoom overrules it (INV-12),
@@ -8047,6 +8067,10 @@ mod tests {
         assert!(
             !zoomed.lines.iter().any(|l| l.contains("beta")),
             "the hidden pane's block is never joined"
+        );
+        assert!(
+            zoomed.lines.iter().any(|l| l.contains("zoomed 1/2")),
+            "the chrome row carries the cycle cursor"
         );
         assert_eq!(
             zoomed.lines.len(),
