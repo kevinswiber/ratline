@@ -2976,6 +2976,85 @@ pane "b" {
     );
 }
 
+/// Enter's ladder: the first Enter on a focused pane zooms it — the
+/// glance gesture — and the second, zoomed, hands the pager its whole
+/// retained body. `v` stays the direct pager route either way.
+#[test]
+fn enter_zooms_a_focused_pane_and_the_second_enter_pages_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "aaa" {
+    height 4
+    interval "1h"
+    command "for i in $(seq -w 1 40); do echo L$i; done"
+}
+
+pane "bbb" {
+    height 3
+    interval "2h"
+    command "printf 'bbb-static'"
+}
+"#,
+    );
+    let session = PtySession::spawn(
+        &rat_bin(),
+        &["dashboard", &decl.display().to_string()],
+        &[("RAT_PAGER", "/bin/cat")],
+    )
+    .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let first = wait_for_bytes(
+        &session,
+        &mut terminal,
+        b"bbb-static",
+        Duration::from_secs(5),
+    )
+    .expect("the first composition never painted");
+    assert!(!contains(&first, b"L15"), "L15 must start off screen");
+
+    session.write_bytes(b"\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"focus aaa"],
+        Duration::from_secs(3),
+    );
+
+    // First Enter: zoom, not pager — the full-frame window reaches
+    // L15, and the chrome row wears the badge.
+    session.write_bytes(b"\r");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"L15", b"zoomed"],
+        Duration::from_secs(5),
+    );
+
+    // Second Enter, zoomed: into the pager with the retained tail the
+    // screen has never shown.
+    session.write_bytes(b"\r");
+    assert!(
+        wait_for(&session, &mut terminal, b"L40", Duration::from_secs(5)),
+        "the second Enter never reached the pager"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// The explicit guard: `Page` is bound in every mode, and a frozen frame
 /// is a literal copy of composed strings with no pane identity in it. A
 /// pane may be focused when `p` lands, and `v` must still hand the pager

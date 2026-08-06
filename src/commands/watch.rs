@@ -1638,7 +1638,10 @@ pub(crate) fn run_registry(
             match event {
                 TapEvent::Key(_) | TapEvent::Mouse(_) => {
                     let action = match event {
-                        TapEvent::Key(key) => action_for(key, mode_of(pause.as_ref(), live_scroll)),
+                        TapEvent::Key(key) => {
+                            let mode = mode_of(pause.as_ref(), live_scroll);
+                            resolve_page_or_zoom(action_for(key, mode), mode, &panes)
+                        }
                         // Gated on LIVE capture, not just the flag: a
                         // terminal that keeps reporting after a release
                         // (or that was never asked) must change nothing.
@@ -1657,7 +1660,12 @@ pub(crate) fn run_registry(
                             renderer.finish().context("restoring terminal")?;
                             return Ok(());
                         }
-                        action @ (WatchAction::Page | WatchAction::Help) => {
+                        action @ (WatchAction::Page
+                        | WatchAction::PageOrZoom
+                        | WatchAction::Help) => {
+                            // `PageOrZoom` is resolved before dispatch;
+                            // a stray one takes its fallback meaning
+                            // and pages.
                             // ? pages the key reference through the same
                             // ritual v pages the frame — one handoff path,
                             // and search over the bindings comes free. The
@@ -2749,6 +2757,10 @@ enum WatchAction {
     Abort,
     Quit,
     Page,
+    /// Enter: zoom a focused, unzoomed pane; page everything else.
+    /// The table cannot see pane state, so `resolve_page_or_zoom`
+    /// turns this into `ToggleZoom` or `Page` at the dispatch.
+    PageOrZoom,
     Help,
     Snapshot,
     Resume,
@@ -2889,7 +2901,8 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
     match key {
         Key::CtrlC => WatchAction::Abort,
         Key::Char('q') => WatchAction::Quit,
-        Key::Char('v') | Key::Enter => WatchAction::Page,
+        Key::Char('v') => WatchAction::Page,
+        Key::Enter => WatchAction::PageOrZoom,
         Key::Char('?') => WatchAction::Help,
         Key::Char('S') => WatchAction::Snapshot,
         Key::Char('j') | Key::Down => WatchAction::Scroll(ScrollStep::LineDown),
@@ -2921,6 +2934,21 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
         Key::Char('>') | Key::Char('.') if mode == FrameMode::Paused => WatchAction::ScrubForward,
         _ => WatchAction::Ignore,
+    }
+}
+
+/// Enter's meaning, resolved where the pane state is visible: a
+/// focused, unzoomed pane on the live frame zooms first — the reader's
+/// next Enter pages it, zoomed. Everything else pages, exactly as `v`
+/// does. `scroll_target` is the shared live-frame-and-focused
+/// predicate; reusing it keeps the three gestures aligned.
+fn resolve_page_or_zoom(action: WatchAction, mode: FrameMode, panes: &PaneView) -> WatchAction {
+    if action != WatchAction::PageOrZoom {
+        return action;
+    }
+    match scroll_target(mode, panes) {
+        Some(id) if panes.zoomed != Some(id) => WatchAction::ToggleZoom,
+        _ => WatchAction::Page,
     }
 }
 
@@ -5809,8 +5837,50 @@ mod tests {
             assert_eq!(action_for(Key::CtrlC, mode), WatchAction::Abort);
             assert_eq!(action_for(Key::Char('q'), mode), WatchAction::Quit);
             assert_eq!(action_for(Key::Char('v'), mode), WatchAction::Page);
-            assert_eq!(action_for(Key::Enter, mode), WatchAction::Page);
+            // Enter's meaning depends on pane state the table cannot
+            // see: the dispatch resolves it (`resolve_page_or_zoom`).
+            assert_eq!(action_for(Key::Enter, mode), WatchAction::PageOrZoom);
         }
+    }
+
+    #[test]
+    fn enter_zooms_a_focused_pane_first_and_pages_everything_else() {
+        let mut panes = PaneView::new(2);
+        // No focus: Enter pages the frame, exactly as v does.
+        assert_eq!(
+            resolve_page_or_zoom(WatchAction::PageOrZoom, FrameMode::Live, &panes),
+            WatchAction::Page
+        );
+        panes.focus = Some(SourceId(1));
+        // A focused, unzoomed pane on the live frame zooms first —
+        // scrolled or not.
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(
+                resolve_page_or_zoom(WatchAction::PageOrZoom, mode, &panes),
+                WatchAction::ToggleZoom,
+                "{mode:?}"
+            );
+        }
+        // A frozen frame has no pane identity: Enter pages it.
+        assert_eq!(
+            resolve_page_or_zoom(WatchAction::PageOrZoom, FrameMode::Paused, &panes),
+            WatchAction::Page
+        );
+        // The second Enter, zoomed: into the pager with the pane body.
+        panes.zoomed = Some(SourceId(1));
+        assert_eq!(
+            resolve_page_or_zoom(WatchAction::PageOrZoom, FrameMode::Live, &panes),
+            WatchAction::Page
+        );
+        // Every other action passes through untouched.
+        assert_eq!(
+            resolve_page_or_zoom(WatchAction::Page, FrameMode::Live, &panes),
+            WatchAction::Page
+        );
+        assert_eq!(
+            resolve_page_or_zoom(WatchAction::ToggleZoom, FrameMode::Paused, &panes),
+            WatchAction::ToggleZoom
+        );
     }
 
     #[test]
