@@ -2726,6 +2726,78 @@ pane "ccc" {
     );
 }
 
+/// The numbers are navigation chrome: they appear on every border
+/// title the moment any pane takes the focus, and leave when the
+/// focus does — at rest the board is unnumbered.
+#[test]
+fn pane_titles_wear_their_numbers_only_while_a_focus_is_held() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+gap 1
+row-gap 0
+
+defaults {
+    height 4
+    border "rounded"
+    shell #true
+}
+
+row {
+    pane "aaa" {
+        interval "1h"
+        command "printf 'body-a'"
+    }
+    pane "bbb" {
+        interval "1h"
+        command "printf 'body-b'"
+    }
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    let first = wait_for_bytes(&session, &mut terminal, b"body-b", Duration::from_secs(5))
+        .expect("the first composition never painted");
+    assert!(
+        !contains(&first, "1 · aaa".as_bytes()),
+        "at rest the board is unnumbered"
+    );
+
+    // Tab: BOTH titles count themselves, then the footer names the
+    // focus — one repainted frame, top to bottom.
+    session.write_bytes(b"\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &["1 · aaa".as_bytes(), "2 · bbb".as_bytes(), b"focus aaa"],
+        Duration::from_secs(3),
+    );
+
+    // Esc drops the focus and the numbers with it: the title row
+    // repaints plain.
+    session.write_bytes(b"\x1b");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[" aaa ".as_bytes()],
+        Duration::from_secs(3),
+    );
+    assert!(
+        !contains(&seen, "1 · aaa".as_bytes()),
+        "the numbers must leave with the focus: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// While zoomed, Alt-digit carries the zoom straight to its number —
 /// the same both-panes-owe-a-run contract Tab's carry keeps.
 #[test]

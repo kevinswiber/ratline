@@ -5123,6 +5123,13 @@ fn compose_sources(
             let source = &runtime[id.0];
             let spec = registry.spec(id);
             let zoom_cursor = (view.zoomed == Some(id)).then(|| zoom_badge(&order, id));
+            // Navigation numbers: while ANY pane holds the focus,
+            // every title counts itself in reading order — the label
+            // Alt-digit jumps by. At rest the board stays unnumbered.
+            let numbered = view.focus.is_some().then(|| {
+                let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
+                format!("{at} · {}", pane_display_name(registry, id))
+            });
             let pane = registry
                 .pane(id)
                 .expect("a Panes registry boxes every source");
@@ -5147,7 +5154,9 @@ fn compose_sources(
                 geom[id.0].inner_rows as usize,
             );
             let chrome = PaneChrome {
-                title: pane_display_name(registry, id),
+                title: numbered
+                    .as_deref()
+                    .unwrap_or_else(|| pane_display_name(registry, id)),
                 cadence: &cadence,
                 stamp: &stamp,
                 failure: source.failure.as_deref(),
@@ -8024,6 +8033,50 @@ mod tests {
             0,
         )
         .expect("a valid two-pane row registry")
+    }
+
+    #[test]
+    fn pane_titles_count_themselves_while_a_focus_is_held() {
+        let registry = zoom_row_registry();
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        for (i, text) in ["alpha", "beta"].iter().enumerate() {
+            runtime[i].output = Some(vec![(*text).to_string()]);
+            runtime[i].posted = true;
+        }
+        // At rest the board is unnumbered — the numbers are navigation
+        // chrome, and nothing is navigating.
+        let rest = PaneView::new(registry.len());
+        let geom = derive_geometry(&registry, (80, 24), None, false, &rest);
+        let quiet = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &rest,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        assert!(!quiet.lines.iter().any(|l| l.contains("1 · ")));
+
+        // While ANY pane holds the focus, EVERY title counts itself in
+        // reading order — the label Alt-digit jumps by.
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(1));
+        let focused = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        assert!(
+            focused.lines.iter().any(|l| l.contains("1 · left")),
+            "the unfocused pane counts itself too"
+        );
+        assert!(focused.lines.iter().any(|l| l.contains("2 · right")));
     }
 
     /// A `PaneView` for the geometry tests. Only `zoomed` is read by
