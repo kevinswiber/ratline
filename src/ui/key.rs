@@ -19,6 +19,10 @@ pub enum Key {
     Backspace,
     Delete,
     Space,
+    /// An ALT-modified printable. A separate spelling, never a
+    /// modifier flag on `Char`: a reducer that ignores it must not
+    /// accidentally fire the unmodified key's binding.
+    Alt(char),
     CtrlC,
     CtrlA,
     CtrlE,
@@ -32,6 +36,16 @@ pub enum Key {
 pub fn from_crossterm(ev: KeyEvent) -> Option<Key> {
     if ev.kind == KeyEventKind::Release {
         return None;
+    }
+    if ev.modifiers.contains(KeyModifiers::ALT) {
+        // Alt-and-Control is a third chord, bound to neither table.
+        if ev.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        return match ev.code {
+            KeyCode::Char(c) => Some(Key::Alt(c)),
+            _ => None,
+        };
     }
     if ev.modifiers.contains(KeyModifiers::CONTROL) {
         return match ev.code {
@@ -181,6 +195,60 @@ mod tests {
                 Some(Key::Char(ch))
             );
         }
+        // The pane gestures: the cycle keys, the toggle key, and the
+        // directional keys the unix scanner decodes from ESC <printable>.
+        for (code, key) in [
+            (KeyCode::Tab, Key::Tab),
+            (KeyCode::BackTab, Key::BackTab),
+            (KeyCode::Char(' '), Key::Space),
+        ] {
+            assert_eq!(from_crossterm(press(code, KeyModifiers::NONE)), Some(key));
+        }
+        for c in ['h', 'j', 'k', 'l'] {
+            assert_eq!(
+                from_crossterm(press(KeyCode::Char(c), KeyModifiers::ALT)),
+                Some(Key::Alt(c))
+            );
+        }
+    }
+
+    #[test]
+    fn alt_chars_become_alt_keys() {
+        for c in ['h', 'j', 'k', 'l'] {
+            assert_eq!(
+                from_crossterm(press(KeyCode::Char(c), KeyModifiers::ALT)),
+                Some(Key::Alt(c))
+            );
+        }
+    }
+
+    #[test]
+    fn alt_h_no_longer_shifts_the_frame_left() {
+        // A deliberate behavior change, not an addition: ALT was
+        // silently ignored, so Alt-h arrived as Char('h') — watch's
+        // left-shift key. The parity test's whole point is that the two
+        // input paths mean the same thing, and the unix scanner has
+        // never produced Char('h') for these bytes.
+        let alt_h = from_crossterm(press(KeyCode::Char('h'), KeyModifiers::ALT));
+        assert_ne!(alt_h, Some(Key::Char('h')));
+        assert_eq!(alt_h, Some(Key::Alt('h')));
+    }
+
+    #[test]
+    fn alt_on_anything_but_a_char_is_unbound() {
+        // Nothing binds Alt-arrow or Alt-Esc, and mapping them to their
+        // unmodified spelling would fire the plain binding.
+        for code in [KeyCode::Up, KeyCode::Esc, KeyCode::Enter, KeyCode::PageDown] {
+            assert_eq!(from_crossterm(press(code, KeyModifiers::ALT)), None);
+        }
+        // Both modifiers at once is a third thing, bound to neither.
+        assert_eq!(
+            from_crossterm(press(
+                KeyCode::Char('c'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )),
+            None
+        );
     }
 
     #[test]
