@@ -141,8 +141,9 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "    pane's own window instead of the whole frame, and focusing a",
     "    pane below the fold scrolls the frame to it. h/l shift",
     "    nothing here: pane content is clipped to its box. While a",
-    "    focus is held, every title counts itself — the number",
-    "    Alt-1..9 jumps by (and it works from rest, too).",
+    "    focus is held, the first nine titles count themselves — the",
+    "    number Alt-1..9 jumps by (it works from rest, too; Tab",
+    "    reaches the rest of a larger board).",
 ];
 
 /// What the `live` label means, and what `interval` means under it.
@@ -448,8 +449,9 @@ mod tests {
                 "    pane's own window instead of the whole frame, and focusing a".to_string(),
                 "    pane below the fold scrolls the frame to it. h/l shift".to_string(),
                 "    nothing here: pane content is clipped to its box. While a".to_string(),
-                "    focus is held, every title counts itself — the number".to_string(),
-                "    Alt-1..9 jumps by (and it works from rest, too).".to_string(),
+                "    focus is held, the first nine titles count themselves — the".to_string(),
+                "    number Alt-1..9 jumps by (it works from rest, too; Tab".to_string(),
+                "    reaches the rest of a larger board).".to_string(),
             ]
         );
     }
