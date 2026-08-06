@@ -32,7 +32,7 @@ use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{
     Composition, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId, SourceProgram,
-    SourceSpec, shebang,
+    SourceSpec, TitleSource, shebang,
 };
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
@@ -3354,10 +3354,34 @@ fn derive_geometry(
     gutter: bool,
     panes: &PaneView,
 ) -> Vec<PaneGeometry> {
-    // Nothing in the per-pane view carries an allocation term: every
-    // pane takes its declared share of the reserved width.
-    let _ = (max_height, panes);
-    registry.geometry_reserving(size, gutter_reserve(gutter))
+    let mut geom = registry.geometry_reserving(size, gutter_reserve(gutter));
+    // Everything below is the zoom override, applied AFTER the declared
+    // derivation and never instead of it: the hidden panes' boxes are
+    // exactly what an unzoomed frame would give them, which is what makes
+    // unzoom a plain re-derivation with nothing saved (INV-5).
+    let Some(id) = panes.zoomed else {
+        return geom;
+    };
+    let Composition::Panes { title, .. } = registry.composition() else {
+        return geom;
+    };
+    let Some(pane) = registry.pane(id) else {
+        return geom;
+    };
+    // The same destructure compose_sources performs at its head — the
+    // title row it prepends is a row the zoomed box cannot also have.
+    let title_rows = u16::from(matches!(title, TitleSource::Static(_)));
+    let cells = size.0.saturating_sub(gutter_reserve(gutter));
+    let rows = window_rows(max_height, size.1).saturating_sub(title_rows);
+    if let Some(slot) = geom.get_mut(id.0) {
+        *slot = PaneGeometry {
+            cells,
+            rows,
+            inner_cols: cells.saturating_sub(pane.frame_cols()),
+            inner_rows: rows.saturating_sub(pane.frame_rows()),
+        };
+    }
+    geom
 }
 
 /// The painted body: `max_height`, else terminal rows − 2 (one row for the
@@ -7271,6 +7295,181 @@ mod tests {
             schedules[1].poll(t),
             Due::Wait,
             "its neighbour stays parked"
+        );
+    }
+
+    /// Two bordered, chrome-bearing panes side by side, gap 1.
+    fn zoom_row_registry() -> Registry {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        let spec = |id: &str| SourceSpec {
+            id: id.to_string(),
+            program: SourceProgram::Argv(vec!["true".to_string()]),
+            shell: ShellMode::Direct,
+            interval: Some(Duration::from_secs(3600)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+            live: false,
+        };
+        let pane = || PaneBox {
+            height: 5,
+            width: PaneWidth::Weight(1),
+            overflow: Overflow::KeepTop,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: true,
+        };
+        Registry::panes(
+            vec![spec("left"), spec("right")],
+            vec![pane(), pane()],
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            1,
+            0,
+        )
+        .expect("a valid two-pane row registry")
+    }
+
+    /// A `PaneView` for the geometry tests. Only `zoomed` is read by
+    /// `derive_geometry`; the other fields are INV-2's shape.
+    fn view_zooming(registry: &Registry, zoomed: Option<SourceId>) -> PaneView {
+        let n = registry.len();
+        PaneView {
+            focus: zoomed,
+            zoomed,
+            collapsed: vec![false; n],
+            scroll: vec![initial_pane_scroll(Overflow::KeepTop, 0, 0); n],
+        }
+    }
+
+    #[test]
+    fn a_zoomed_pane_takes_the_frame_and_its_neighbour_keeps_its_box() {
+        let registry = zoom_row_registry();
+        let declared = derive_geometry(
+            &registry,
+            (80, 24),
+            None,
+            false,
+            &view_zooming(&registry, None),
+        );
+        let zoomed = derive_geometry(
+            &registry,
+            (80, 24),
+            None,
+            false,
+            &view_zooming(&registry, Some(SourceId(0))),
+        );
+        // cells = size.0 - gutter_reserve(false); rows =
+        // window_rows(None, 24) with no static title row to pay for.
+        assert_eq!(zoomed[0].cells, 80);
+        assert_eq!(zoomed[0].rows, 22);
+        // inner_* are the box arithmetic, not a second rule: rounded
+        // border + chrome row.
+        assert_eq!(
+            zoomed[0].inner_cols,
+            80 - registry.pane(SourceId(0)).unwrap().frame_cols()
+        );
+        assert_eq!(
+            zoomed[0].inner_rows,
+            22 - registry.pane(SourceId(0)).unwrap().frame_rows()
+        );
+        assert!(
+            declared[0].cells < zoomed[0].cells && declared[0].rows < zoomed[0].rows,
+            "the override must actually move the box: {:?} vs {:?}",
+            declared[0],
+            zoomed[0]
+        );
+        // Hidden panes keep their DECLARED geometry — they are simply not
+        // composed (INV-5; Zellij's invariant stated positively).
+        assert_eq!(zoomed[1], declared[1]);
+    }
+
+    #[test]
+    fn the_zoom_override_pays_for_the_gutter_and_a_static_title() {
+        let registry = zoom_row_registry();
+        let panes = view_zooming(&registry, Some(SourceId(0)));
+        let gutter = derive_geometry(&registry, (80, 24), None, true, &panes);
+        assert_eq!(
+            gutter[0].cells,
+            80 - gutter_reserve(true),
+            "the gutter is a region, not an overlay"
+        );
+
+        use crate::core::registry::TitleSource;
+        let titled = zoom_row_registry().with_title(TitleSource::Static("board".to_string()));
+        assert_eq!(
+            derive_geometry(&titled, (80, 24), None, false, &panes)[0].rows,
+            21,
+            "a static title costs the zoomed pane exactly the row compose_sources prepends"
+        );
+        // A pane-sourced title renders no extra line, so it costs no row.
+        let referred = zoom_row_registry().with_title(TitleSource::Pane {
+            source: SourceId(1),
+            fallback: None,
+        });
+        assert_eq!(
+            derive_geometry(&referred, (80, 24), None, false, &panes)[0].rows,
+            22
+        );
+        // max_height is the row authority when it is set.
+        assert_eq!(
+            derive_geometry(&registry, (80, 24), Some(10), false, &panes)[0].rows,
+            10
+        );
+    }
+
+    #[test]
+    fn a_borderless_pane_zooms_to_the_whole_budget_and_a_tiny_terminal_saturates() {
+        // once_registry's boxes are border=none, chrome=true, height 3.
+        let bare = once_registry(&[("a", false), ("b", false)]);
+        let panes = view_zooming(&bare, Some(SourceId(0)));
+        let geom = derive_geometry(&bare, (80, 24), None, false, &panes);
+        assert_eq!(
+            geom[0].inner_cols, 80,
+            "no border, no padding: inner IS the box"
+        );
+        assert_eq!(geom[0].inner_rows, 22 - 1, "only the chrome row is owed");
+
+        // Nothing panics and nothing wraps at a terminal smaller than the
+        // reservations: every subtraction saturates.
+        let tiny = derive_geometry(&bare, (1, 1), None, true, &panes);
+        assert_eq!(tiny[0].cells, 0);
+        assert_eq!(tiny[0].rows, 0);
+        assert_eq!(tiny[0].inner_cols, 0);
+        assert_eq!(tiny[0].inner_rows, 0);
+    }
+
+    #[test]
+    fn a_zoom_is_not_a_resize() {
+        let registry = zoom_row_registry();
+        let panes = view_zooming(&registry, Some(SourceId(0)));
+        let mut size = (80u16, 24u16);
+        let mut geom = derive_geometry(&registry, size, None, false, &panes);
+        // Without this the test is vacuous: a derivation that ignored
+        // `zoomed` would also compare equal below.
+        assert_eq!(geom[0].cells, 80, "the stored geom is the ZOOMED geom");
+
+        let step = detect_resize(size, None, false, &panes, &mut size, &mut geom, &registry);
+        assert!(!step.size_moved);
+        assert!(
+            !step.geom_moved,
+            "a view gesture that re-derived unequal arms the 250ms gate and \
+             restarts every child — live ones included"
+        );
+
+        // The falsification arm: the equality above is a property of the
+        // SHARED PaneView, not of the comparison. A detect_resize handed a
+        // different view sees a real difference.
+        let unzoomed = view_zooming(&registry, None);
+        let moved = detect_resize(
+            size, None, false, &unzoomed, &mut size, &mut geom, &registry,
+        );
+        assert!(
+            moved.geom_moved,
+            "the same geom under a different view MUST move"
         );
     }
 
