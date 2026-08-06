@@ -2073,6 +2073,18 @@ pub(crate) fn run_registry(
                             );
                             let Some(live) = live.as_ref() else { continue };
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            // A collapse moved every block below it; an
+                            // expand pushed them back down. Either way
+                            // the focused pane stays on screen.
+                            let window = usize::from(window_rows(session.max_height, size.1));
+                            live_scroll = refollow(
+                                &registry,
+                                &geom,
+                                &panes,
+                                live_scroll,
+                                live.lines.len(),
+                                window,
+                            );
                             previous_key = Some(repaint(
                                 &mut renderer,
                                 pause.as_ref(),
@@ -2131,6 +2143,19 @@ pub(crate) fn run_registry(
                             );
                             let Some(live) = live.as_ref() else { continue };
                             let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            // The composition changed shape under the
+                            // frame window: zooming in re-clamps a held
+                            // offset (the zoomed frame fits the window),
+                            // zooming out follows the retained focus.
+                            let window = usize::from(window_rows(session.max_height, size.1));
+                            live_scroll = refollow(
+                                &registry,
+                                &geom,
+                                &panes,
+                                live_scroll,
+                                live.lines.len(),
+                                window,
+                            );
                             previous_key = Some(repaint(
                                 &mut renderer,
                                 pause.as_ref(),
@@ -2199,6 +2224,18 @@ pub(crate) fn run_registry(
                                 );
                                 let Some(live) = live.as_ref() else { continue };
                                 let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                // The frame regained its full height and
+                                // the focus is retained: keep its pane on
+                                // screen through the restore.
+                                let window = usize::from(window_rows(session.max_height, size.1));
+                                live_scroll = refollow(
+                                    &registry,
+                                    &geom,
+                                    &panes,
+                                    live_scroll,
+                                    live.lines.len(),
+                                    window,
+                                );
                                 previous_key = Some(repaint(
                                     &mut renderer,
                                     pause.as_ref(),
@@ -2268,6 +2305,19 @@ pub(crate) fn run_registry(
                                 profile,
                             );
                             let Some(live) = live.as_ref() else { continue };
+                            // The other half of the gesture: bring the
+                            // pane the focus landed on into view — a
+                            // below-the-fold pane would otherwise take
+                            // the scroll keys while off screen.
+                            let window = usize::from(window_rows(session.max_height, size.1));
+                            live_scroll = refollow(
+                                &registry,
+                                &geom,
+                                &panes,
+                                live_scroll,
+                                live.lines.len(),
+                                window,
+                            );
                             previous_key = Some(repaint(
                                 &mut renderer,
                                 pause.as_ref(),
@@ -2302,10 +2352,8 @@ pub(crate) fn run_registry(
                             // frame: a shift could only reveal blank
                             // cells, without bound. Plain watch keeps
                             // less's unclamped shift.
-                            if matches!(
-                                action,
-                                WatchAction::ShiftLeft | WatchAction::ShiftRight
-                            ) && matches!(registry.composition(), Composition::Panes { .. })
+                            if matches!(action, WatchAction::ShiftLeft | WatchAction::ShiftRight)
+                                && matches!(registry.composition(), Composition::Panes { .. })
                             {
                                 continue;
                             }
@@ -2859,14 +2907,14 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('c') => WatchAction::ToggleHighlight,
         Key::Char('t') => WatchAction::ToggleTime,
         Key::Char('m') => WatchAction::ToggleMouse,
-        Key::Tab if mode == FrameMode::Live => WatchAction::FocusNext,
-        Key::BackTab if mode == FrameMode::Live => WatchAction::FocusPrev,
-        Key::Alt('h') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Left),
-        Key::Alt('j') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Down),
-        Key::Alt('k') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Up),
-        Key::Alt('l') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Right),
-        Key::Char('z') if mode == FrameMode::Live => WatchAction::ToggleZoom,
-        Key::Space if mode == FrameMode::Live => WatchAction::ToggleCollapse,
+        Key::Tab if mode != FrameMode::Paused => WatchAction::FocusNext,
+        Key::BackTab if mode != FrameMode::Paused => WatchAction::FocusPrev,
+        Key::Alt('h') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Left),
+        Key::Alt('j') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Down),
+        Key::Alt('k') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Up),
+        Key::Alt('l') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Right),
+        Key::Char('z') if mode != FrameMode::Paused => WatchAction::ToggleZoom,
+        Key::Space if mode != FrameMode::Paused => WatchAction::ToggleCollapse,
         Key::Esc if mode == FrameMode::Live => WatchAction::ClearFocus,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
@@ -3527,13 +3575,99 @@ fn pane_scroll_badge(
 }
 
 /// Which pane a scroll step addresses, or `None` for the whole frame.
-/// Live-only (INV-3): `Paused`/`LiveScrolled` are composed strings with no
-/// pane identity left in them. A focused pane owns the keys even while
-/// collapsed — the arm declines the step rather than handing the keys
-/// back to the whole frame.
+/// The live frame only (INV-3), scrolled or not — the scrolled view is
+/// an offset over the SAME composition; `Paused` is a composed string
+/// with no pane identity left in it. A focused pane owns the keys even
+/// while collapsed — the arm declines the step rather than handing the
+/// keys back to the whole frame.
 fn scroll_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
     let id = panes.focus?;
-    (mode == FrameMode::Live).then_some(id)
+    matches!(mode, FrameMode::Live | FrameMode::LiveScrolled).then_some(id)
+}
+
+/// The viewport follows the focus: the smallest adjustment of the
+/// frame window that shows the focused pane's block, in composed-frame
+/// rows (`top` already carries the title row when the board has one).
+/// A visible block holds the offset — pin bit included, so a tail ride
+/// survives focusing a pane that is already on screen. A block taller
+/// than the window anchors its head; offset zero IS the live view, so
+/// the mode collapses there.
+fn follow_focus(
+    current: Option<LiveScroll>,
+    top: usize,
+    rows: usize,
+    total: usize,
+    window: usize,
+) -> Option<LiveScroll> {
+    let window = window.max(1);
+    let offset = current.map_or(0, LiveScroll::offset);
+    let target = if top < offset {
+        top
+    } else if top + rows > offset + window {
+        (top + rows).saturating_sub(window).min(top)
+    } else {
+        return current;
+    };
+    (target > 0).then(|| LiveScroll::at(target, total, window))
+}
+
+/// Re-clamp the frame window after the composition changed shape under
+/// it — a zoom composes a frame that fits the window, a collapse
+/// shortens a column. Reaching the top collapses the mode; a pinned
+/// ride keeps chasing the tail (the `reanchor` contract).
+fn clamp_frame_scroll(
+    scroll: Option<LiveScroll>,
+    total: usize,
+    window: usize,
+) -> Option<LiveScroll> {
+    let clamped = scroll?.reanchor(total, window.max(1));
+    (!clamped.at_top()).then_some(clamped)
+}
+
+/// The focused pane's composed block — `(top, rows)` in frame rows,
+/// title row included — or `None` when there is nothing to follow: no
+/// focus, a zoomed frame (whose one block IS the frame), or no pane
+/// composition at all.
+fn focus_block(
+    registry: &Registry,
+    geom: &[PaneGeometry],
+    panes: &PaneView,
+) -> Option<(usize, usize)> {
+    let id = panes.focus?;
+    if panes.zoomed.is_some() {
+        return None;
+    }
+    let Composition::Panes {
+        layout,
+        gap,
+        row_gap,
+        title,
+    } = registry.composition()
+    else {
+        return None;
+    };
+    let sizes = pane_block_sizes(geom, panes);
+    let mut rects = vec![PaneRect::default(); registry.len()];
+    pane_rects(layout, &sizes, *gap, *row_gap, (0, 0), &mut rects);
+    let title_rows = usize::from(matches!(title, TitleSource::Static(_)));
+    Some((title_rows + rects[id.0].row, rects[id.0].rows))
+}
+
+/// One rule for every gesture arm that recomposed the frame: the
+/// window re-clamps to the new shape, and when an unzoomed focus
+/// exists the viewport follows it into view.
+fn refollow(
+    registry: &Registry,
+    geom: &[PaneGeometry],
+    panes: &PaneView,
+    live_scroll: Option<LiveScroll>,
+    total: usize,
+    window: usize,
+) -> Option<LiveScroll> {
+    match focus_block(registry, geom, panes) {
+        Some((top, rows)) => follow_focus(live_scroll, top, rows, total, window),
+        None => clamp_frame_scroll(live_scroll, total, window),
+    }
 }
 
 /// Which body `v`/Enter hands to the pager: the focused pane's while
@@ -3821,7 +3955,15 @@ fn frame_rows(
     let status = match mode {
         FrameMode::Paused => paused_notice(time_paused, offset, kept.len(), lines.len()),
         FrameMode::LiveScrolled => {
-            scrolled_notice(time_seg_live, live_tail, offset, kept.len(), lines.len())
+            // The scrolled view keeps its focus, so its row says so —
+            // in the same trailing position the live row uses.
+            let mut row =
+                scrolled_notice(time_seg_live, live_tail, offset, kept.len(), lines.len());
+            if let Some(focus) = focus_seg {
+                row.push_str(" · ");
+                row.push_str(focus);
+            }
+            row
         }
         FrameMode::Live => live_notice(
             hidden,
@@ -5715,35 +5857,35 @@ mod tests {
     }
 
     #[test]
-    fn the_focus_keys_bind_only_while_live() {
-        // Per-pane gestures address a pane in the composed frame. A
+    fn the_focus_keys_bind_on_the_live_frame() {
+        // Per-pane gestures address a pane in the composed frame. The
+        // scrolled live view is an offset over that SAME composition,
+        // so the keys reach it there too — otherwise one whole-frame
+        // scroll on a board taller than the window locks focus out. A
         // frozen or scrubbed frame is a literal copy with no pane
         // identity in it, so the keys are inert there.
-        assert_eq!(
-            action_for(Key::Tab, FrameMode::Live),
-            WatchAction::FocusNext
-        );
-        assert_eq!(
-            action_for(Key::BackTab, FrameMode::Live),
-            WatchAction::FocusPrev
-        );
-        for (c, dir) in [
-            ('h', FocusDir::Left),
-            ('j', FocusDir::Down),
-            ('k', FocusDir::Up),
-            ('l', FocusDir::Right),
-        ] {
-            assert_eq!(
-                action_for(Key::Alt(c), FrameMode::Live),
-                WatchAction::FocusMove(dir)
-            );
-        }
-        for mode in [FrameMode::LiveScrolled, FrameMode::Paused] {
-            assert_eq!(action_for(Key::Tab, mode), WatchAction::Ignore);
-            assert_eq!(action_for(Key::BackTab, mode), WatchAction::Ignore);
-            for c in ['h', 'j', 'k', 'l'] {
-                assert_eq!(action_for(Key::Alt(c), mode), WatchAction::Ignore);
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(action_for(Key::Tab, mode), WatchAction::FocusNext);
+            assert_eq!(action_for(Key::BackTab, mode), WatchAction::FocusPrev);
+            for (c, dir) in [
+                ('h', FocusDir::Left),
+                ('j', FocusDir::Down),
+                ('k', FocusDir::Up),
+                ('l', FocusDir::Right),
+            ] {
+                assert_eq!(action_for(Key::Alt(c), mode), WatchAction::FocusMove(dir));
             }
+        }
+        assert_eq!(action_for(Key::Tab, FrameMode::Paused), WatchAction::Ignore);
+        assert_eq!(
+            action_for(Key::BackTab, FrameMode::Paused),
+            WatchAction::Ignore
+        );
+        for c in ['h', 'j', 'k', 'l'] {
+            assert_eq!(
+                action_for(Key::Alt(c), FrameMode::Paused),
+                WatchAction::Ignore
+            );
         }
         for mode in ALL_MODES {
             // An unbound meta spelling stays inert, and the plain keys
@@ -5752,6 +5894,59 @@ mod tests {
             assert_eq!(action_for(Key::Char('h'), mode), WatchAction::ShiftLeft);
             assert_eq!(action_for(Key::Char('l'), mode), WatchAction::ShiftRight);
         }
+    }
+
+    #[test]
+    fn the_viewport_follows_the_focus() {
+        // Visible already — inside the live view or the scrolled
+        // window — the offset holds, pin bit included.
+        assert_eq!(follow_focus(None, 0, 5, 40, 22), None);
+        assert_eq!(follow_focus(None, 10, 5, 40, 22), None);
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 40, 22);
+        let held = follow_focus(Some(pinned), 20, 4, 40, 22).expect("still riding");
+        assert_eq!(held, pinned);
+        assert!(held.pinned(), "a visible pane never unpins the tail ride");
+        // Below the window: the bottom-most offset that shows the
+        // whole block.
+        let below = follow_focus(None, 30, 6, 40, 22).expect("scrolls down");
+        assert_eq!(below.offset(), 14);
+        assert!(!below.pinned());
+        // Above the window: the block's head row; reaching row zero
+        // collapses back to the live view.
+        let above =
+            follow_focus(Some(LiveScroll::at(14, 40, 22)), 5, 5, 40, 22).expect("scrolls up");
+        assert_eq!(above.offset(), 5);
+        assert_eq!(
+            follow_focus(Some(LiveScroll::at(14, 40, 22)), 0, 5, 40, 22),
+            None
+        );
+        // A block taller than the window anchors its head.
+        assert_eq!(
+            follow_focus(None, 24, 30, 60, 22).map(LiveScroll::offset),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn a_reshaped_frame_reclamps_the_viewport() {
+        // A zoom composes a frame that fits the window: any held
+        // offset lands back in the live view.
+        assert_eq!(
+            clamp_frame_scroll(Some(LiveScroll::at(8, 40, 22)), 20, 22),
+            None
+        );
+        assert_eq!(clamp_frame_scroll(None, 40, 22), None);
+        // A frame still taller than the window keeps the reader's
+        // place, clamped; a pinned ride keeps chasing the tail.
+        assert_eq!(
+            clamp_frame_scroll(Some(LiveScroll::at(8, 40, 22)), 30, 22).map(LiveScroll::offset),
+            Some(8)
+        );
+        let pinned = LiveScroll::start(ScrollStep::Bottom, 40, 22);
+        assert_eq!(
+            clamp_frame_scroll(Some(pinned), 50, 22).map(LiveScroll::offset),
+            Some(28)
+        );
     }
 
     #[test]
@@ -7589,16 +7784,17 @@ mod tests {
     }
 
     #[test]
-    fn z_zooms_the_focused_pane_only_while_live() {
-        assert_eq!(
-            action_for(Key::Char('z'), FrameMode::Live),
-            WatchAction::ToggleZoom
-        );
-        // Per-pane gestures are Live-only (INV-3): a frozen or scrolled
-        // frame is a composed string with no pane identity in it.
-        for mode in [FrameMode::LiveScrolled, FrameMode::Paused] {
-            assert_eq!(action_for(Key::Char('z'), mode), WatchAction::Ignore);
+    fn z_zooms_the_focused_pane_on_the_live_frame() {
+        // Live and live-scrolled alike (INV-3): the scrolled view is an
+        // offset over the same composition. A frozen frame is a
+        // composed string with no pane identity in it.
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(action_for(Key::Char('z'), mode), WatchAction::ToggleZoom);
         }
+        assert_eq!(
+            action_for(Key::Char('z'), FrameMode::Paused),
+            WatchAction::Ignore
+        );
         // One spelling: `Z` is not a second key.
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::Char('Z'), mode), WatchAction::Ignore);
@@ -7895,20 +8091,21 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_collapse_only_while_live() {
-        assert_eq!(
-            action_for(Key::Space, FrameMode::Live),
-            WatchAction::ToggleCollapse
-        );
-        // Per-pane gestures are Live-only (INV-3): a frozen or scrolled
-        // frame is a composed string with no pane identity left in it.
-        for mode in [FrameMode::LiveScrolled, FrameMode::Paused] {
+    fn space_toggles_collapse_on_the_live_frame() {
+        // Live and live-scrolled alike (INV-3): the scrolled view is an
+        // offset over the same composition. A frozen frame is a
+        // composed string with no pane identity left in it.
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
             assert_eq!(
                 action_for(Key::Space, mode),
-                WatchAction::Ignore,
+                WatchAction::ToggleCollapse,
                 "{mode:?}"
             );
         }
+        assert_eq!(
+            action_for(Key::Space, FrameMode::Paused),
+            WatchAction::Ignore
+        );
         // Not a second spelling: both input paths deliver 0x20 as
         // Key::Space (the crossterm map and the scanner), so the space
         // CHARACTER stays unbound and cannot drift into a second binding.
@@ -8326,11 +8523,15 @@ mod tests {
 
         panes.focus = Some(SourceId(1));
         assert_eq!(scroll_target(FrameMode::Live, &panes), Some(SourceId(1)));
-        // Per-pane gestures are Live-only (INV-3): a frozen or
-        // live-scrolled frame is a composed string with no pane identity,
-        // so the whole-frame arm keeps those keys.
+        // The scrolled live view is an offset over the SAME
+        // composition: a focused pane keeps the keys there (INV-3). A
+        // frozen frame is a composed string with no pane identity, so
+        // the whole-frame arm keeps those keys.
+        assert_eq!(
+            scroll_target(FrameMode::LiveScrolled, &panes),
+            Some(SourceId(1))
+        );
         assert_eq!(scroll_target(FrameMode::Paused, &panes), None);
-        assert_eq!(scroll_target(FrameMode::LiveScrolled, &panes), None);
         // A focused pane OWNS the scroll keys even while collapsed: the
         // target stays Some, and the arm itself declines the step (the
         // collapse task's `continue`). Returning None here would route
@@ -8397,7 +8598,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pager_follows_focus_only_while_live_and_serves_a_collapsed_pane() {
+    fn the_pager_follows_focus_on_the_live_frame_and_serves_a_collapsed_pane() {
         let mut panes = PaneView::new(2);
         assert_eq!(
             pager_target(FrameMode::Live, &panes),
@@ -8406,10 +8607,13 @@ mod tests {
         );
         panes.focus = Some(SourceId(0));
         assert_eq!(pager_target(FrameMode::Live, &panes), Some(SourceId(0)));
+        assert_eq!(
+            pager_target(FrameMode::LiveScrolled, &panes),
+            Some(SourceId(0))
+        );
         // Paused and scrubbed frames are composed strings with no pane
         // identity: they keep paging their frozen snapshot (INV-3).
         assert_eq!(pager_target(FrameMode::Paused, &panes), None);
-        assert_eq!(pager_target(FrameMode::LiveScrolled, &panes), None);
         // A collapsed pane keeps BOTH targets: the gestures diverge at
         // their arms, never here — a collapsed pane's scroll step
         // declines in the arm (its window is not on screen to move),

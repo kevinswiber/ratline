@@ -2516,6 +2516,156 @@ row {{
     );
 }
 
+/// The board is taller than the window, the reader's first gesture is a
+/// whole-frame scroll — and focus must still be reachable from there.
+/// Tab follows the viewport back to the focused pane and takes the
+/// scroll keys with it; the frame's own scroll never swallows them
+/// again.
+#[test]
+fn focus_reaches_a_frame_scrolled_board_and_takes_back_the_scroll_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // 30 composed rows in a 22-row window: pane b's head is the last
+    // thing visible at rest.
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // No focus: `j` scrolls the whole frame, the old-only behavior.
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-23 of 30"],
+        Duration::from_secs(3),
+    );
+
+    // Tab from the scrolled view: the gesture must land (the trap this
+    // test pins: it used to be silently ignored outside Live), and the
+    // viewport follows the focus back to pane a — offset zero, the
+    // live view itself.
+    session.write_bytes(b"\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"A01", b"focus a"],
+        Duration::from_secs(3),
+    );
+
+    // The scroll keys now drive the focused pane, not the frame.
+    session.write_bytes(b"j");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"A02", b"lines 2-15 of 20"],
+        Duration::from_secs(3),
+    );
+    assert!(
+        !contains(&seen, "live ·".as_bytes()),
+        "a focused scroll step must not re-enter the frame scroll: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// Focusing a pane below the fold scrolls the frame window down to it
+/// — the scroll keys must never drive a pane the reader cannot see —
+/// and the scrolled status row carries the focus segment.
+#[test]
+fn a_focus_gesture_brings_a_below_the_fold_pane_into_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // Tab twice: pane a is on screen (no scroll), pane b's block ends
+    // at row 30 — the window slides to its bottom-most offset, and the
+    // scrolled row names both the range and the focus.
+    session.write_bytes(b"\t\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 9-30 of 30", b"focus b"],
+        Duration::from_secs(3),
+    );
+
+    // The step drives pane b in place; the frame window holds.
+    session.write_bytes(b"j");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"B02", b"lines 2-15 of 20"],
+        Duration::from_secs(3),
+    );
+    assert!(
+        !contains(&seen, b"lines 10-30 of 30"),
+        "the frame window must hold while a focused pane scrolls: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// D4 end to end: a batch pane's body is replaced wholesale on every run,
 /// and the reader's place is held through it — positional, per the
 /// research's honesty note, which is why the badge names the new total.
