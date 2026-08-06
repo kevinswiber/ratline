@@ -24,8 +24,7 @@ use crate::core::child::{
 };
 use crate::core::duration::parse_interval;
 use crate::core::layout::{
-    PaneBlock, PaneChrome, PaneRect, compose_panes, overflow_clip, pane_order, pane_rects,
-    render_pane,
+    PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
 };
 use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
@@ -557,6 +556,12 @@ pub(crate) fn run_registry(
     // in-scope geometry vector.
     let mut size = measure_size(is_tty, (80, 24));
     let mut geom = derive_geometry(&registry, size, session.max_height, view.gutter, &panes);
+    // Each pane's window starts where its declaration puts it; the first
+    // collect step's reanchor gives a pinned window its tail.
+    for id in registry.ids() {
+        let overflow = registry.pane(id).map(|p| p.overflow).unwrap_or_default();
+        panes.scroll[id.0] = initial_pane_scroll(overflow, 0, geom[id.0].inner_rows as usize);
+    }
     let mut resize_gate = DebounceGate::new(RESIZE_DEBOUNCE);
     // The once-notice clock starts when the loop does — the panes'
     // first spawns are due immediately, so loop age IS wait age.
@@ -978,6 +983,9 @@ pub(crate) fn run_registry(
                 &mut geom,
                 &registry,
             );
+            // The bodies just changed and the geometry is fresh: clamp
+            // every pane's window into the new shape before it composes.
+            reanchor_pane_scrolls(&mut panes, &runtime, &geom);
             // Composed once, above the repaint gate: the newest frame
             // is tracked on every completion, so paging always acts on
             // the newest content. Combining the single source's output
@@ -1333,6 +1341,8 @@ pub(crate) fn run_registry(
             );
             if step.geom_moved {
                 resize_gate.fire(Instant::now());
+                // Every pane's window moved with its inner_rows.
+                reanchor_pane_scrolls(&mut panes, &runtime, &geom);
             }
             if step.size_moved
                 && is_tty
@@ -1725,6 +1735,53 @@ pub(crate) fn run_registry(
                                 WatchAction::ScrollN(step, n) => (step, n),
                                 _ => unreachable!("matched above"),
                             };
+                            // With a pane focused the step addresses THAT
+                            // pane's window over its own retained body;
+                            // the wheel arrives as the same actions and
+                            // follows. Recompose and repaint in place —
+                            // the gutter toggle's shape — because pane
+                            // identity is gone after `compose_panes`.
+                            if let Some(id) =
+                                scroll_target(mode_of(pause.as_ref(), live_scroll), &panes)
+                            {
+                                let total = runtime[id.0].output.as_ref().map_or(0, Vec::len);
+                                let window = geom[id.0].inner_rows as usize;
+                                for _ in 0..n {
+                                    panes.scroll[id.0] =
+                                        panes.scroll[id.0].step(step, total, window);
+                                }
+                                recompose_live(
+                                    &mut live,
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    view.alt_time,
+                                    &palette,
+                                    profile,
+                                );
+                                let Some(live) = live.as_ref() else { continue };
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    live,
+                                    &live_tail,
+                                    &palette,
+                                    view,
+                                    panes.key(),
+                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    None,
+                                    size,
+                                    session.max_height,
+                                    fullscreen,
+                                    &faint,
+                                    profile,
+                                    &history,
+                                )?);
+                                continue;
+                            }
                             let Some(live) = live.as_ref() else { continue };
                             // The repaint happens here, in place —
                             // re-entering the tick loop would re-run the
@@ -3208,9 +3265,6 @@ fn gutter_reserve(gutter: bool) -> u16 {
 /// held; `KeepBottom` is the tail, pinned. These are the SAME two states
 /// the shipped `render_pane` clip had — which is what lets the viewport
 /// replace that clip with an offset and change no bytes.
-// Staged: the scroll retarget consumes both helpers; the allows leave
-// with that consumer.
-#[allow(dead_code)]
 fn initial_pane_scroll(overflow: Overflow, total: usize, window: usize) -> LiveScroll {
     match overflow {
         Overflow::KeepTop => LiveScroll::at(0, total, window),
@@ -3223,11 +3277,36 @@ fn initial_pane_scroll(overflow: Overflow, total: usize, window: usize) -> LiveS
 /// NEVER `LiveScroll::at_top()`: that is the whole-frame collapse rule
 /// (offset 0 means the live view), and a KeepBottom pane at rest sits at
 /// its tail with a nonzero offset.
+// Staged: the scroll badge consumes this; the allow leaves with it.
 #[allow(dead_code)]
 fn pane_at_rest(scroll: LiveScroll, overflow: Overflow) -> bool {
     match overflow {
         Overflow::KeepTop => scroll.offset() == 0 && !scroll.pinned(),
         Overflow::KeepBottom => scroll.pinned(),
+    }
+}
+
+/// Which pane a scroll step addresses, or `None` for the whole frame.
+/// Live-only (INV-3): `Paused`/`LiveScrolled` are composed strings with no
+/// pane identity left in them. A focused pane owns the keys even while
+/// collapsed — the arm declines the step rather than handing the keys
+/// back to the whole frame.
+fn scroll_target(mode: FrameMode, panes: &PaneView) -> Option<SourceId> {
+    let id = panes.focus?;
+    (mode == FrameMode::Live).then_some(id)
+}
+
+/// THE reanchor. Every site that changes a pane's body or its window
+/// clamps every pane's window back into the new shape here — the collect
+/// step, the resize reflow, and (as consumers) the zoom and collapse arms.
+/// A pinned window rides its tail; an unpinned one HOLDS its offset,
+/// clamped (D4). Nothing here resets on a hash change or a failure: the
+/// clamp is the only thing allowed to move a reader's place.
+fn reanchor_pane_scrolls(panes: &mut PaneView, runtime: &[SourceRuntime], geom: &[PaneGeometry]) {
+    for (i, scroll) in panes.scroll.iter_mut().enumerate() {
+        let total = runtime[i].output.as_ref().map_or(0, Vec::len);
+        let window = geom[i].inner_rows as usize;
+        *scroll = scroll.reanchor(total, window);
     }
 }
 
@@ -4488,7 +4567,10 @@ fn compose_sources(
                 &source.marks,
                 pane,
                 geom[id.0],
-                overflow_clip(pane.overflow, body.len(), geom[id.0].inner_rows as usize),
+                // The pane's own window. At rest this IS
+                // `overflow_clip(pane.overflow, body.len(), inner_rows)`
+                // — brief seam 5, pinned by the at-rest equality test.
+                view.scroll[id.0].offset(),
                 &chrome,
                 palette,
                 profile,
@@ -5080,6 +5162,7 @@ mod tests {
     use ratatui::style::Color;
 
     use super::*;
+    use crate::core::layout::overflow_clip;
     use crate::term::scroll::max_offset;
 
     const ALL_MODES: [FrameMode; 3] = [FrameMode::Live, FrameMode::LiveScrolled, FrameMode::Paused];
@@ -7398,6 +7481,56 @@ mod tests {
             !pane_at_rest(scrolled_to_head, Overflow::KeepBottom),
             "a KeepBottom pane parked at its head is scrolled, and the badge must show it"
         );
+    }
+
+    #[test]
+    fn a_scroll_step_addresses_a_pane_only_when_one_is_focused_and_live() {
+        let mut panes = PaneView::new(2);
+        assert_eq!(
+            scroll_target(FrameMode::Live, &panes),
+            None,
+            "no focus, no target"
+        );
+
+        panes.focus = Some(SourceId(1));
+        assert_eq!(scroll_target(FrameMode::Live, &panes), Some(SourceId(1)));
+        // Per-pane gestures are Live-only (INV-3): a frozen or
+        // live-scrolled frame is a composed string with no pane identity,
+        // so the whole-frame arm keeps those keys.
+        assert_eq!(scroll_target(FrameMode::Paused, &panes), None);
+        assert_eq!(scroll_target(FrameMode::LiveScrolled, &panes), None);
+        // A focused pane OWNS the scroll keys even while collapsed: the
+        // target stays Some, and the arm itself declines the step (the
+        // collapse task's `continue`). Returning None here would route
+        // the keys back to the whole-frame arm — the INV-7 violation,
+        // not the no-op.
+        panes.collapsed[1] = true;
+        assert_eq!(scroll_target(FrameMode::Live, &panes), Some(SourceId(1)));
+    }
+
+    #[test]
+    fn a_reanchor_holds_a_panes_offset_across_a_body_replacement() {
+        // D4: a batch pane's body is REPLACED wholesale every run
+        // (`record_output`), and the reader's place is positional. Holding
+        // is the rule; the clamp is the only thing that may move it.
+        let scroll =
+            initial_pane_scroll(Overflow::KeepTop, 40, 5).step(ScrollStep::HalfDown, 40, 5);
+        assert_eq!(scroll.offset(), 2);
+        assert_eq!(scroll.reanchor(40, 5).offset(), 2, "same shape, same place");
+        assert_eq!(
+            scroll.reanchor(400, 5).offset(),
+            2,
+            "a longer body holds it"
+        );
+        assert_eq!(
+            scroll.reanchor(3, 5).offset(),
+            0,
+            "a two-line failure body clamps it to the head — the only reset"
+        );
+        // A KeepBottom pane at rest keeps riding its tail across the same
+        // replacement: that is today's behavior, unchanged.
+        let tail = initial_pane_scroll(Overflow::KeepBottom, 40, 5);
+        assert_eq!(tail.reanchor(400, 5).offset(), max_offset(400, 5));
     }
 
     #[test]

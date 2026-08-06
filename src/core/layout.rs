@@ -9,9 +9,12 @@ use crate::core::box_model::{BoxSpec, render_box};
 use crate::core::measure::{
     Align, Chunk, ELLIPSIS, chunks, display_width, kept_chars, pad_display, truncate_display,
 };
-use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneGeometry, SourceId};
+#[cfg(test)]
+use crate::core::registry::Overflow;
+use crate::core::registry::{LayoutNode, PaneBox, PaneGeometry, SourceId};
 use crate::style_spec::StyleSpec;
 use crate::term::marks::LineMark;
+#[cfg(test)]
 use crate::term::scroll::max_offset;
 use crate::theme::Palette;
 
@@ -50,7 +53,11 @@ pub struct PaneChrome<'a> {
 /// The viewport a pane's declared `Overflow` asks for: how many leading
 /// lines the box drops. `KeepBottom`'s clip IS `max_offset` over the same
 /// body and window — stated by CALLING it, so a per-pane offset and the
-/// declared clip can never drift into two different numbers.
+/// declared clip can never drift into two different numbers. The
+/// test-side spelling of the rest state: production windows start from
+/// `initial_pane_scroll` and stay clamped by `reanchor`, and the at-rest
+/// equality test is what keeps the two derivations one number.
+#[cfg(test)]
 pub fn overflow_clip(overflow: Overflow, total: usize, rows: usize) -> usize {
     match overflow {
         Overflow::KeepTop => 0,

@@ -2446,3 +2446,195 @@ row {{
         "dashboard should have exited on q"
     );
 }
+
+/// `j` with a pane focused moves THAT pane's window over its own retained
+/// body — the neighbour keeps ticking underneath, because a pane's view
+/// and its body are separate objects and a scrolled pane accepts output
+/// with no interaction at all.
+#[test]
+fn a_focused_pane_scrolls_its_own_body_while_its_neighbour_ticks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+row-gap 0
+
+defaults {{
+    height 5
+    border "none"
+    chrome #false
+    shell #true
+}}
+
+row {{
+    pane "a" {{
+        interval "1h"
+        command "printf 'A%s\n' 01 02 03 04 05 06 07 08 09 10"
+    }}
+    pane "b" {{
+        interval "250ms"
+        command "{counter}"
+    }}
+}}
+"#,
+            counter = labeled_counter_cmd(&count, "b"),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // Pane a is 5 rows over a 10-line body: at rest it shows A01-A05, so
+    // A06 is a line no unfocused frame can produce.
+    assert!(
+        wait_for(&session, &mut terminal, b"A05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let ticks = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+
+    session.write_bytes(b"\t"); // focus pane a (first in reading order)
+    session.write_bytes(b"j");
+    let advanced = format!("b-{}", ticks + 2);
+    // ONE capture: the scrolled row and the neighbour's later ticks can
+    // batch into a single read, and a consumed paint is never repainted.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"A06", advanced.as_bytes()],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// D4 end to end: a batch pane's body is replaced wholesale on every run,
+/// and the reader's place is held through it — positional, per the
+/// research's honesty note, which is why the badge names the new total.
+#[test]
+fn a_scrolled_pane_holds_its_place_across_a_body_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+row-gap 0
+
+defaults {{
+    height 5
+    border "none"
+    chrome #false
+    shell #true
+}}
+
+pane "a" {{
+    interval "1s"
+    command "echo run >> {p}; n=$(($(wc -l < {p}))); printf \"r$n-%s\n\" 01 02 03 04 05 06 07 08 09 10"
+}}
+"#,
+            p = count.display(),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"r1-05", Duration::from_secs(5)),
+        "the first run never painted"
+    );
+    session.write_bytes(b"\t");
+    session.write_bytes(b"j");
+    // r1-06 proves the step landed (offset 1 over a 5-row window); r2-06
+    // proves the offset SURVIVED the replacement — at rest run two would
+    // show r2-01..r2-05 and r2-06 would be unreachable.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"r1-06", b"r2-06"],
+        Duration::from_secs(6),
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The negative respawn pin for the scroll retarget, the gutter toggle's
+/// shape: a pane scroll reads geometry and never derives it, so
+/// detect_resize compares equal and the 250ms gate stays unarmed.
+#[test]
+fn a_pane_scroll_never_restarts_a_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count_a = dir.path().join("count_a");
+    let count_b = dir.path().join("count_b");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+row-gap 0
+
+defaults {{
+    height 5
+    border "none"
+    chrome #false
+    shell #true
+    interval "10s"
+}}
+
+row {{
+    pane "a" {{
+        command "echo run >> {pa}; printf 'A%s\n' 01 02 03 04 05 06 07 08 09 10"
+    }}
+    pane "b" {{
+        command "{counter}"
+    }}
+}}
+"#,
+            pa = count_a.display(),
+            counter = labeled_counter_cmd(&count_b, "b"),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"A05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    session.write_bytes(b"\t");
+    session.write_bytes(b"j");
+    let _ = wait_for_in_order(&session, &mut terminal, &[b"A06"], Duration::from_secs(5));
+    // Past the resize debounce: a geometry drift would have respawned
+    // every child and both counters would read 2.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    for (name, path) in [("a", &count_a), ("b", &count_b)] {
+        let runs = std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            runs, 1,
+            "pane {name}: a pane scroll must never restart children"
+        );
+    }
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
