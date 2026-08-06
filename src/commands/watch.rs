@@ -5124,12 +5124,17 @@ fn compose_sources(
             let spec = registry.spec(id);
             let zoom_cursor = (view.zoomed == Some(id)).then(|| zoom_badge(&order, id));
             // Navigation numbers: while ANY pane holds the focus,
-            // every title counts itself in reading order — the label
-            // Alt-digit jumps by. At rest the board stays unnumbered.
-            let numbered = view.focus.is_some().then(|| {
-                let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
-                format!("{at} · {}", pane_display_name(registry, id))
-            });
+            // a title counts itself in reading order — the label
+            // Alt-digit jumps by. The numbers stop where the jump
+            // keys do: past the ninth pane there is no Alt-digit, and
+            // a number nothing can jump to would be a false label. At
+            // rest the board stays unnumbered.
+            let numbered = view
+                .focus
+                .is_some()
+                .then(|| order.iter().position(|o| *o == id).map_or(0, |p| p + 1))
+                .filter(|at| (1..=9).contains(at))
+                .map(|at| format!("{at} · {}", pane_display_name(registry, id)));
             let pane = registry
                 .pane(id)
                 .expect("a Panes registry boxes every source");
@@ -8080,6 +8085,69 @@ mod tests {
             "the unfocused pane counts itself too"
         );
         assert!(focused.lines.iter().any(|l| l.contains("2 · right")));
+    }
+
+    #[test]
+    fn the_numbers_stop_where_the_jump_keys_do() {
+        use crate::core::box_model::{BorderPreset, Sides};
+        use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
+        // Eleven panes: the tenth and eleventh have no Alt-digit, so a
+        // number there would label a jump nothing can make. They stay
+        // plain; Tab still reaches them.
+        let spec = |n: usize| SourceSpec {
+            id: format!("p{n:02}"),
+            program: SourceProgram::Argv(vec!["true".to_string()]),
+            shell: ShellMode::Direct,
+            interval: Some(Duration::from_secs(3600)),
+            triggers: Vec::new(),
+            debounce: Duration::from_millis(250),
+            live: false,
+        };
+        let pane = || PaneBox {
+            height: 3,
+            width: PaneWidth::Weight(1),
+            overflow: Overflow::KeepTop,
+            border: BorderPreset::Rounded,
+            padding: Sides::default(),
+            title: None,
+            chrome: false,
+        };
+        let n = 11;
+        let registry = Registry::panes(
+            (1..=n).map(spec).collect(),
+            (0..n).map(|_| pane()).collect(),
+            LayoutNode::Column((0..n).map(|i| LayoutNode::Pane(SourceId(i))).collect()),
+            1,
+            0,
+        )
+        .expect("a valid eleven-pane column registry");
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let mut runtime: Vec<SourceRuntime> = (0..n).map(|_| SourceRuntime::for_test()).collect();
+        for (i, source) in runtime.iter_mut().enumerate() {
+            source.output = Some(vec![format!("body-{i}")]);
+            source.posted = true;
+        }
+        let mut panes = PaneView::new(registry.len());
+        panes.focus = Some(SourceId(0));
+        let geom = derive_geometry(&registry, (80, 60), None, false, &panes);
+        let focused = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            false,
+            &palette,
+            ColorProfile::Ascii,
+        );
+        assert!(focused.lines.iter().any(|l| l.contains("9 · p09")));
+        assert!(
+            !focused.lines.iter().any(|l| l.contains("10 · ")),
+            "an unjumpable pane stays unnumbered"
+        );
+        assert!(
+            focused.lines.iter().any(|l| l.contains(" p10 ")),
+            "its plain title still renders"
+        );
     }
 
     /// A `PaneView` for the geometry tests. Only `zoomed` is read by
