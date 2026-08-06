@@ -12,6 +12,7 @@ use crate::core::measure::{
 use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneGeometry, SourceId};
 use crate::style_spec::StyleSpec;
 use crate::term::marks::LineMark;
+use crate::term::scroll::max_offset;
 use crate::theme::Palette;
 
 /// A rendered block and its marks in the block's own line coordinates.
@@ -46,9 +47,20 @@ pub struct PaneChrome<'a> {
     pub focused: bool,
 }
 
-/// Pin one pane's output into its declared box: apply the overflow
-/// rule, pad to the inner height, chop/pad to the inner width, append
-/// the chrome row, draw the border. EXACTLY `geom.rows` lines of
+/// The viewport a pane's declared `Overflow` asks for: how many leading
+/// lines the box drops. `KeepBottom`'s clip IS `max_offset` over the same
+/// body and window — stated by CALLING it, so a per-pane offset and the
+/// declared clip can never drift into two different numbers.
+pub fn overflow_clip(overflow: Overflow, total: usize, rows: usize) -> usize {
+    match overflow {
+        Overflow::KeepTop => 0,
+        Overflow::KeepBottom => max_offset(total, rows),
+    }
+}
+
+/// Pin one pane's output into its declared box: drop the viewport's
+/// leading lines, pad to the inner height, chop/pad to the inner width,
+/// append the chrome row, draw the border. EXACTLY `geom.rows` lines of
 /// `geom.cells` display cells. Marks arrive in output-line coordinates
 /// and leave in box coordinates; marks on truncated lines are dropped.
 ///
@@ -56,11 +68,20 @@ pub struct PaneChrome<'a> {
 /// `Align::Left`; a centered or right-aligned pane would need the shift
 /// computed per line from the rendered row, and the horizontal mark
 /// re-basing in `compose_panes` would move with it.
+///
+/// `dropped` is the pane's viewport: how many leading output lines the
+/// box drops. It is ALSO the mark re-base term and the index the
+/// truncation clip reads the untruncated source at — one number, three
+/// uses, which is why a moving viewport carries its highlights for free.
+/// Callers derive it from `overflow_clip` (at rest) or a pane's
+/// `LiveScroll` (scrolled); `render_pane` no longer knows `Overflow`.
+#[allow(clippy::too_many_arguments)]
 pub fn render_pane(
     output: &[String],
     marks: &[LineMark],
     pane: &PaneBox,
     geom: PaneGeometry,
+    dropped: usize,
     chrome: &PaneChrome<'_>,
     palette: &Palette,
     profile: ColorProfile,
@@ -68,12 +89,6 @@ pub fn render_pane(
     let rows = geom.inner_rows as usize;
     let cols = geom.inner_cols as usize;
 
-    // The overflow rule picks the surviving window and, with it, how
-    // far the surviving marks moved.
-    let dropped = match pane.overflow {
-        Overflow::KeepTop => 0,
-        Overflow::KeepBottom => output.len().saturating_sub(rows),
-    };
     let mut content: Vec<String> = output.iter().skip(dropped).take(rows).cloned().collect();
     // Short output pads: the height is declared, never measured.
     content.resize(rows, String::new());
@@ -443,6 +458,24 @@ mod tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `render_pane` at its declared viewport — what the shipped
+    /// `Overflow` match produced before the clip became a parameter.
+    /// Every test that is not ABOUT the offset renders at rest, and the
+    /// derivation is written down once, here.
+    #[allow(clippy::too_many_arguments)]
+    fn render_at_rest(
+        output: &[String],
+        marks: &[LineMark],
+        pane: &PaneBox,
+        geom: PaneGeometry,
+        chrome: &PaneChrome<'_>,
+        palette: &Palette,
+        profile: ColorProfile,
+    ) -> PaneBlock {
+        let dropped = overflow_clip(pane.overflow, output.len(), geom.inner_rows as usize);
+        render_pane(output, marks, pane, geom, dropped, chrome, palette, profile)
+    }
+
     fn sides(top: usize, right: usize, bottom: usize, left: usize) -> Sides {
         Sides {
             top,
@@ -627,7 +660,7 @@ mod tests {
         // Borderless: the block IS the inner box, so the whole frame is
         // assertable byte for byte.
         let bare = pane(4, BorderPreset::None, Sides::default(), true);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["ab"]),
             &[LineMark::default()],
             &bare,
@@ -652,7 +685,7 @@ mod tests {
         // Bordered and padded: 7 rows of 30 cells, every row, regardless
         // of how little the child printed.
         let boxed = pane(7, BorderPreset::Normal, sides(0, 1, 0, 1), true);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["line one", "line two"]),
             &[LineMark::default(), LineMark::default()],
             &boxed,
@@ -675,7 +708,7 @@ mod tests {
     #[test]
     fn overflow_keep_top_drops_the_tail() {
         let pane = pane(3, BorderPreset::None, Sides::default(), false);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["1", "2", "3", "4", "5"]),
             &vec![LineMark::default(); 5],
             &pane,
@@ -700,7 +733,7 @@ mod tests {
             changed: true,
             cells: vec![0..1],
         };
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["1", "2", "3", "4", "5"]),
             &marks,
             &pane,
@@ -717,7 +750,7 @@ mod tests {
     #[test]
     fn a_short_pane_pads_with_blank_rows() {
         let pane = pane(3, BorderPreset::None, Sides::default(), false);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["only"]),
             &[LineMark::default()],
             &pane,
@@ -728,7 +761,7 @@ mod tests {
         );
         assert_eq!(block.lines, lines(&["only ", "     ", "     "]));
         // Empty output is the same case, not a special one.
-        let block = render_pane(
+        let block = render_at_rest(
             &[],
             &[],
             &pane,
@@ -745,7 +778,7 @@ mod tests {
         // Bottom padding proves the status row sits inside the content
         // block, not on the bottom border.
         let pane = pane(8, BorderPreset::Normal, sides(0, 1, 1, 1), true);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["x"]),
             &[LineMark::default()],
             &pane,
@@ -762,7 +795,7 @@ mod tests {
     #[test]
     fn a_failure_badge_rides_the_chrome_row_without_changing_the_height() {
         let pane = pane(7, BorderPreset::Normal, sides(0, 1, 0, 1), true);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["boom"]),
             &[LineMark::default()],
             &pane,
@@ -779,7 +812,7 @@ mod tests {
         );
 
         // Too narrow for the badge: the row still fits its box exactly.
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["boom"]),
             &[LineMark::default()],
             &pane,
@@ -804,7 +837,7 @@ mod tests {
             },
             LineMark::default(),
         ];
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["abc", "d"]),
             &marks,
             &pane,
@@ -836,7 +869,7 @@ mod tests {
         let pane = pane(4, BorderPreset::Normal, sides(0, 0, 0, 0), false);
         let source = "abcdefghijklmnopqrstuvwxyz0123";
         let hidden = vec![marked(20..25), LineMark::default()];
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&[source, "x"]),
             &hidden,
             &pane,
@@ -856,7 +889,7 @@ mod tests {
         );
 
         let straddling = vec![marked(15..25), LineMark::default()];
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&[source, "x"]),
             &straddling,
             &pane,
@@ -884,7 +917,7 @@ mod tests {
         let pane = pane(3, BorderPreset::Normal, sides(0, 0, 0, 0), false);
         let source = "日本語abcd";
         let marks = vec![marked(1..5)];
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&[source]),
             &marks,
             &pane,
@@ -905,7 +938,7 @@ mod tests {
         // never index at or past the left block's own chars.
         let pane_box = pane(3, BorderPreset::Normal, sides(0, 0, 0, 0), false);
         let long = "abcdefghijklmnopqrstuvwxyz0123";
-        let left = render_pane(
+        let left = render_at_rest(
             &lines(&[long]),
             &[marked(20..25)],
             &pane_box,
@@ -914,7 +947,7 @@ mod tests {
             &palette(),
             ColorProfile::Ascii,
         );
-        let right = render_pane(
+        let right = render_at_rest(
             &lines(&["quiet"]),
             &[LineMark::default()],
             &pane_box,
@@ -1040,7 +1073,7 @@ mod tests {
         // hole rather than opening a new one — which is exactly why a
         // notice row that names the panes has to exist too.
         let bare = pane(4, BorderPreset::None, Sides::default(), false);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["ab"]),
             &[LineMark::default()],
             &bare,
@@ -1146,7 +1179,7 @@ mod tests {
         let tall = pane(6, BorderPreset::None, Sides::default(), false);
         let short = pane(4, BorderPreset::Normal, Sides::default(), false);
         let render = |p: &PaneBox, cells: u16| {
-            render_pane(
+            render_at_rest(
                 &lines(&["x"]),
                 &[LineMark::default()],
                 p,
@@ -1215,7 +1248,7 @@ mod tests {
     fn a_focused_pane_wears_the_accent_border_and_no_extra_cell() {
         let boxed = pane(4, BorderPreset::Normal, Sides::default(), false);
         let draw = |focused: bool| {
-            render_pane(
+            render_at_rest(
                 &lines(&["x"]),
                 &[LineMark::default()],
                 &boxed,
@@ -1250,7 +1283,7 @@ mod tests {
         // Phase 1's byte-inertness pin at pane scope: with the flag
         // off, not one byte of the box moves.
         let boxed = pane(4, BorderPreset::Normal, Sides::default(), true);
-        let block = render_pane(
+        let block = render_at_rest(
             &lines(&["x"]),
             &[LineMark::default()],
             &boxed,
@@ -1280,5 +1313,61 @@ mod tests {
             (0, 0)
         );
         assert_eq!(rects[0], PaneRect::default());
+    }
+
+    #[test]
+    fn the_overflow_clip_is_the_declared_viewport() {
+        // KeepTop's clip is the head; KeepBottom's IS max_offset — the
+        // identity per-pane scrolling rests on, so it is structural
+        // (`overflow_clip` calls `max_offset`) and asserted, not restated.
+        assert_eq!(overflow_clip(Overflow::KeepTop, 100, 3), 0);
+        assert_eq!(overflow_clip(Overflow::KeepBottom, 100, 3), 97);
+        assert_eq!(
+            overflow_clip(Overflow::KeepBottom, 100, 3),
+            crate::term::scroll::max_offset(100, 3)
+        );
+        // A body shorter than the window never clips, either way.
+        assert_eq!(overflow_clip(Overflow::KeepBottom, 2, 3), 0);
+        assert_eq!(overflow_clip(Overflow::KeepTop, 0, 3), 0);
+    }
+
+    #[test]
+    fn an_offset_mid_body_renders_that_window_with_its_marks() {
+        // The parameter is the whole feature: a KeepTop pane rendered at
+        // offset 2 shows lines 3-5, and the mark on output line 4 lands on
+        // the row that line actually occupies — the re-base term IS the
+        // offset, so nothing else had to move.
+        let pane = pane(3, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["L1", "L2", "L3", "L4", "L5", "L6"]);
+        let mut marks = vec![LineMark::default(); 6];
+        marks[3] = marked(0..2);
+        let block = render_pane(
+            &body,
+            &marks,
+            &pane,
+            geom(&pane, 5),
+            2,
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines, lines(&["L3   ", "L4   ", "L5   "]));
+        assert!(block.marks[1].changed, "L4's mark rode the offset");
+        assert_eq!(block.marks[1].cells, vec![0..2]);
+        assert!(!block.marks[0].changed && !block.marks[2].changed);
+
+        // An offset with fewer than `rows` lines left still pads: the
+        // height is declared, never measured.
+        let block = render_pane(
+            &body,
+            &marks,
+            &pane,
+            geom(&pane, 5),
+            5,
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines, lines(&["L6   ", "     ", "     "]));
     }
 }

@@ -24,7 +24,8 @@ use crate::core::child::{
 };
 use crate::core::duration::parse_interval;
 use crate::core::layout::{
-    PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
+    PaneBlock, PaneChrome, PaneRect, compose_panes, overflow_clip, pane_order, pane_rects,
+    render_pane,
 };
 use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
@@ -4481,11 +4482,13 @@ fn compose_sources(
                 truncated: source.truncated.as_deref(),
                 focused: view.focus == Some(id),
             };
+            let body = source.output.as_deref().unwrap_or(&[]);
             render_pane(
-                source.output.as_deref().unwrap_or(&[]),
+                body,
                 &source.marks,
                 pane,
                 geom[id.0],
+                overflow_clip(pane.overflow, body.len(), geom[id.0].inner_rows as usize),
                 &chrome,
                 palette,
                 profile,
@@ -7395,6 +7398,33 @@ mod tests {
             !pane_at_rest(scrolled_to_head, Overflow::KeepBottom),
             "a KeepBottom pane parked at its head is scrolled, and the badge must show it"
         );
+    }
+
+    #[test]
+    fn a_panes_window_at_rest_is_exactly_the_overflow_clip() {
+        // Phase 2's byte-inertness pin. `render_pane`'s viewport becomes
+        // `view.scroll[i].offset()` in 2.3; with no gesture pressed that
+        // number must BE the clip the shipped match produced — at the
+        // first frame and after every tick's reanchor, for both rules.
+        for (total, window) in [(0, 5), (3, 5), (46, 22), (1000, 7)] {
+            for overflow in [Overflow::KeepTop, Overflow::KeepBottom] {
+                let rest = initial_pane_scroll(overflow, total, window);
+                assert_eq!(
+                    rest.offset(),
+                    overflow_clip(overflow, total, window),
+                    "{overflow:?} at rest over {total} lines in {window} rows"
+                );
+                // And it stays the clip as the body grows and shrinks —
+                // a pinned window tracks, an unpinned one holds at 0.
+                for grown in [total + 37, total.saturating_sub(2)] {
+                    assert_eq!(
+                        rest.reanchor(grown, window).offset(),
+                        overflow_clip(overflow, grown, window),
+                        "{overflow:?} after a tick to {grown} lines"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
