@@ -536,13 +536,24 @@ pub(crate) fn run_registry(
         }
     }
     let live_tail = session.live_tail.clone();
+    let mut view = ViewState {
+        wrap: session.wrap,
+        hshift: 0,
+        gutter: false,
+        highlight: false,
+        alt_time: false,
+    };
+    // Per-pane view state, beside the whole-frame `view`: the gestures
+    // move it, the composer reads it, and the repaint gate sees it
+    // through the digest.
+    let panes = PaneView::new(registry.len());
     // Loop-persistent geometry state: the one size/geometry pair the
     // spawn step, the composer, and the (future) resize arm consume. It
     // outlives the spawn branch — a completion can arrive in an
     // iteration with no new spawn, and the composer still needs an
     // in-scope geometry vector.
     let mut size = measure_size(is_tty, (80, 24));
-    let mut geom = registry.geometry(size);
+    let mut geom = derive_geometry(&registry, size, session.max_height, view.gutter, &panes);
     let mut resize_gate = DebounceGate::new(RESIZE_DEBOUNCE);
     // The once-notice clock starts when the loop does — the panes'
     // first spawns are due immediately, so loop age IS wait age.
@@ -562,13 +573,6 @@ pub(crate) fn run_registry(
     let mut pause: Option<PauseState> = None;
     let mut live_scroll: Option<LiveScroll> = None;
     let mut history = History::new();
-    let mut view = ViewState {
-        wrap: session.wrap,
-        hshift: 0,
-        gutter: false,
-        highlight: false,
-        alt_time: false,
-    };
     // `append && interactive` ⟺ append && !once (append implies
     // is_tty), and live_suffix returns "" under --once — so this also
     // never prints a useless stub on a one-shot run.
@@ -975,7 +979,7 @@ pub(crate) fn run_registry(
             // is tracked on every completion, so paging always acts on
             // the newest content. Combining the single source's output
             // is the identity — the bytes cannot drift.
-            let (lines, panes) = match registry.composition() {
+            let (lines, pane_live) = match registry.composition() {
                 Composition::Plain { .. } => (runtime[0].output.clone().unwrap_or_default(), None),
                 Composition::Panes { .. } => {
                     let block = compose_sources(
@@ -1000,7 +1004,7 @@ pub(crate) fn run_registry(
                 hash: content,
                 changed_at,
                 since,
-                panes,
+                panes: pane_live,
                 // Plain only: under panes the marker is on the pane that
                 // overflowed, which is the question a reader would ask.
                 dropped: match registry.composition() {
@@ -1042,6 +1046,7 @@ pub(crate) fn run_registry(
                 palette.appearance,
                 size,
                 view,
+                panes.key(),
                 displayed_age_key(
                     pause.as_ref(),
                     live_scroll,
@@ -1086,6 +1091,7 @@ pub(crate) fn run_registry(
                         &live_tail,
                         &palette,
                         view,
+                        panes.key(),
                         None,
                         size,
                         session.max_height,
@@ -1290,6 +1296,7 @@ pub(crate) fn run_registry(
                     &live_tail,
                     &palette,
                     view,
+                    panes.key(),
                     (!notices.is_empty()).then(|| notices.join(" · ")),
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1310,7 +1317,9 @@ pub(crate) fn run_registry(
             let measured = measure_size(is_tty, size);
             let step = detect_resize(
                 measured,
-                gutter_reserve(view.gutter),
+                session.max_height,
+                view.gutter,
+                &panes,
                 &mut size,
                 &mut geom,
                 &registry,
@@ -1365,6 +1374,7 @@ pub(crate) fn run_registry(
                     &live_tail,
                     &palette,
                     view,
+                    panes.key(),
                     None,
                     size,
                     session.max_height,
@@ -1480,6 +1490,7 @@ pub(crate) fn run_registry(
                     &live_tail,
                     &palette,
                     view,
+                    panes.key(),
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1685,6 +1696,7 @@ pub(crate) fn run_registry(
                                     &live_tail,
                                     &palette,
                                     view,
+                                    panes.key(),
                                     pager_notice,
                                     size,
                                     session.max_height,
@@ -1743,6 +1755,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1773,6 +1786,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1807,6 +1821,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1861,6 +1876,7 @@ pub(crate) fn run_registry(
                                     &live_tail,
                                     &palette,
                                     view,
+                                    panes.key(),
                                     None,
                                     size,
                                     session.max_height,
@@ -1897,6 +1913,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1950,8 +1967,13 @@ pub(crate) fn run_registry(
                                 // next spawn, and a live pane keeps
                                 // its two-column ellipsis rather than
                                 // being killed by a view toggle.
-                                geom =
-                                    registry.geometry_reserving(size, gutter_reserve(view.gutter));
+                                geom = derive_geometry(
+                                    &registry,
+                                    size,
+                                    session.max_height,
+                                    view.gutter,
+                                    &panes,
+                                );
                                 recompose_live(
                                     &mut live,
                                     &registry,
@@ -1988,6 +2010,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2023,6 +2046,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 Some(text.to_string()),
                                 size,
                                 session.max_height,
@@ -2051,6 +2075,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 Some(text),
                                 size,
                                 session.max_height,
@@ -2096,6 +2121,7 @@ pub(crate) fn run_registry(
                                 &live_tail,
                                 &palette,
                                 view,
+                                panes.key(),
                                 debug_notice,
                                 size,
                                 session.max_height,
@@ -2519,6 +2545,55 @@ struct ViewState {
     alt_time: bool,
 }
 
+/// Per-pane view state: what the pane gestures move and the composer
+/// reads. Loop-local beside `view`, never inside `SourceRuntime` —
+/// that vector is capture and scheduling state, iterated as runtime by
+/// the change hash and the respawn requests.
+struct PaneView {
+    focus: Option<SourceId>,
+    zoomed: Option<SourceId>,
+    /// Indexed by `SourceId`; `len() == registry.len()`.
+    collapsed: Vec<bool>,
+    scroll: Vec<LiveScroll>,
+}
+
+impl PaneView {
+    fn new(len: usize) -> PaneView {
+        PaneView {
+            focus: None,
+            zoomed: None,
+            collapsed: vec![false; len],
+            scroll: vec![LiveScroll::at(0, 0, 0); len],
+        }
+    }
+
+    /// The digest the repaint gate compares. The per-pane vectors fold
+    /// into one hash — the `combined_hash` shape — because a bitset
+    /// would cap the pane count, and the gate's key must stay `Copy`.
+    fn key(&self) -> PaneViewKey {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (collapsed, scroll) in self.collapsed.iter().zip(&self.scroll) {
+            collapsed.hash(&mut hasher);
+            scroll.offset().hash(&mut hasher);
+        }
+        PaneViewKey {
+            focus: self.focus,
+            zoomed: self.zoomed,
+            panes: hasher.finish(),
+        }
+    }
+}
+
+/// Everything per-pane the repaint gate must see, in a shape a
+/// `PaintKey` can hold: `Copy`, comparable, and no `Vec`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+struct PaneViewKey {
+    focus: Option<SourceId>,
+    zoomed: Option<SourceId>,
+    panes: u64,
+}
+
 /// Everything a painted frame depends on; the repaint gate compares two of
 /// these. While paused, `content`/`appearance` are the freeze-time values,
 /// so new child output never repaints a frozen frame — but scroll, resize,
@@ -2536,6 +2611,9 @@ struct PaintKey {
     gutter: bool,
     highlight: bool,
     alt_time: bool,
+    /// The per-pane view, digested. Without it the gate is pane-blind:
+    /// content and size are unchanged by a focus or collapse gesture.
+    view: PaneViewKey,
     /// Whole seconds since the viewed frame was current; 0 while live.
     /// Advancing once per second is what lets the paused age repaint.
     age_secs: u64,
@@ -2544,6 +2622,7 @@ struct PaintKey {
 /// The one construction of the repaint gate's key: while paused it holds
 /// the freeze-time content/appearance and the window's offset; live it
 /// holds this tick's values.
+#[allow(clippy::too_many_arguments)]
 fn paint_key(
     pause: Option<&PauseState>,
     live_scroll: Option<LiveScroll>,
@@ -2551,6 +2630,7 @@ fn paint_key(
     live_appearance: Appearance,
     size: (u16, u16),
     view: ViewState,
+    view_key: PaneViewKey,
     age_secs: u64,
 ) -> PaintKey {
     // A live-scrolled key carries the LIVE hash: the tail keeps
@@ -2578,6 +2658,7 @@ fn paint_key(
         gutter: view.gutter,
         highlight: view.highlight,
         alt_time: view.alt_time,
+        view: view_key,
         age_secs,
     }
 }
@@ -2797,6 +2878,7 @@ fn repaint(
     live_tail: &str,
     palette: &Palette,
     view: ViewState,
+    view_key: PaneViewKey,
     notice: Option<String>,
     size: (u16, u16),
     max_height: Option<u16>,
@@ -2819,6 +2901,7 @@ fn repaint(
         palette.appearance,
         size,
         view,
+        view_key,
         age_secs,
     );
     let (source, offset, mode) = match (pause, live_scroll) {
@@ -2908,6 +2991,25 @@ fn repaint(
 /// on; zero otherwise. One spelling, used by every geometry site.
 fn gutter_reserve(gutter: bool) -> u16 {
     if gutter { GUTTER_COLS as u16 } else { 0 }
+}
+
+/// The ONE geometry derivation. The gesture arms, the resize arm, and
+/// `detect_resize` all call this with the same inputs, or a view
+/// gesture reads as a resize and restarts every child 250ms later.
+/// Explicit parameters, never a captured closure: the failure mode is
+/// "two sites derived from different state", and a closure makes that
+/// invisible again.
+fn derive_geometry(
+    registry: &Registry,
+    size: (u16, u16),
+    max_height: Option<u16>,
+    gutter: bool,
+    panes: &PaneView,
+) -> Vec<PaneGeometry> {
+    // Nothing in the per-pane view carries an allocation term: every
+    // pane takes its declared share of the reserved width.
+    let _ = (max_height, panes);
+    registry.geometry_reserving(size, gutter_reserve(gutter))
 }
 
 /// The painted body: `max_height`, else terminal rows − 2 (one row for the
@@ -3547,18 +3649,20 @@ struct ResizeStep {
 /// grew rows changes the window, not any child's world.
 fn detect_resize(
     measured: (u16, u16),
-    reserved: u16,
+    max_height: Option<u16>,
+    gutter: bool,
+    panes: &PaneView,
     size: &mut (u16, u16),
     geom: &mut Vec<PaneGeometry>,
     registry: &Registry,
 ) -> ResizeStep {
     let size_moved = measured != *size;
     *size = measured;
-    // The same reservation every other geometry site applies: a view
-    // toggle that narrowed the stored geom must compare EQUAL here,
-    // or the very next iteration arms the debounce gate and every
-    // child — live ones included — restarts 250ms after a keypress.
-    let next = registry.geometry_reserving(measured, reserved);
+    // The same derivation every other geometry site applies: a view
+    // change that moved the stored geom must compare EQUAL here, or
+    // the very next iteration arms the debounce gate and every child —
+    // live ones included — restarts 250ms after a keypress.
+    let next = derive_geometry(registry, measured, max_height, gutter, panes);
     let geom_moved = next != *geom;
     if geom_moved {
         *geom = next;
@@ -5302,9 +5406,22 @@ mod tests {
             highlight: false,
             alt_time: false,
         };
+        // Expected keys are always built via `key()`: an empty
+        // DefaultHasher finishes to a nonzero value, so a PaneViewKey
+        // literal (or Default's zero) would pin the wrong number.
+        let panes = PaneView::new(0);
         // The key carries the caller's displayed age verbatim; which
         // surface counts is the caller's business.
-        let live = paint_key(None, None, 42, Appearance::Dark, (80, 24), view, 14);
+        let live = paint_key(
+            None,
+            None,
+            42,
+            Appearance::Dark,
+            (80, 24),
+            view,
+            panes.key(),
+            14,
+        );
         assert_eq!(
             live,
             PaintKey {
@@ -5319,6 +5436,7 @@ mod tests {
                 gutter: false,
                 highlight: false,
                 alt_time: false,
+                view: panes.key(),
                 age_secs: 14,
             }
         );
@@ -5334,7 +5452,16 @@ mod tests {
         // A live-scrolled key carries the LIVE hash and the window offset:
         // the tail keeps repainting under the offset.
         let ls = LiveScroll::start(ScrollStep::LineDown, 50, 10);
-        let scrolled = paint_key(None, Some(ls), 42, Appearance::Dark, (80, 24), view, 14);
+        let scrolled = paint_key(
+            None,
+            Some(ls),
+            42,
+            Appearance::Dark,
+            (80, 24),
+            view,
+            panes.key(),
+            14,
+        );
         assert_eq!(
             scrolled,
             PaintKey {
@@ -5349,10 +5476,20 @@ mod tests {
                 gutter: false,
                 highlight: false,
                 alt_time: false,
+                view: panes.key(),
                 age_secs: 14,
             }
         );
-        let paused = paint_key(Some(&p), None, 42, Appearance::Dark, (80, 24), view, 14);
+        let paused = paint_key(
+            Some(&p),
+            None,
+            42,
+            Appearance::Dark,
+            (80, 24),
+            view,
+            panes.key(),
+            14,
+        );
         assert_eq!(
             paused,
             PaintKey {
@@ -5367,6 +5504,7 @@ mod tests {
                 gutter: false,
                 highlight: false,
                 alt_time: false,
+                view: panes.key(),
                 age_secs: 14,
             }
         );
@@ -6545,7 +6683,16 @@ mod tests {
         refresh_geometry_for_spawn(true, (120, 24), 0, &mut size, &mut geom, &registry);
         assert_eq!(size, (80, 24), "the spawn step wrote nothing under panes");
         assert_eq!(geom, before);
-        let step = detect_resize((120, 24), 0, &mut size, &mut geom, &registry);
+        let panes = PaneView::new(registry.len());
+        let step = detect_resize(
+            (120, 24),
+            None,
+            false,
+            &panes,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
         assert!(step.size_moved, "detection survived the coincident spawn");
         assert!(
             step.geom_moved,
@@ -6574,8 +6721,9 @@ mod tests {
         // comparison is equal, the debounce gate stays unarmed, and no
         // child restarts 250ms after a keypress.
         let registry = two_weighted_panes();
+        let panes = PaneView::new(registry.len());
         let mut size = (80, 24);
-        let mut geom = registry.geometry_reserving(size, gutter_reserve(true));
+        let mut geom = derive_geometry(&registry, size, None, true, &panes);
         assert_ne!(
             geom,
             registry.geometry(size),
@@ -6583,7 +6731,9 @@ mod tests {
         );
         let step = detect_resize(
             (80, 24),
-            gutter_reserve(true),
+            None,
+            true,
+            &panes,
             &mut size,
             &mut geom,
             &registry,
@@ -6594,9 +6744,127 @@ mod tests {
             "a view toggle must never arm the respawn gate"
         );
         // Toggling back off under the zero reservation is symmetric.
-        geom = registry.geometry_reserving(size, gutter_reserve(false));
-        let step = detect_resize((80, 24), 0, &mut size, &mut geom, &registry);
+        geom = derive_geometry(&registry, size, None, false, &panes);
+        let step = detect_resize(
+            (80, 24),
+            None,
+            false,
+            &panes,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
         assert!(!step.geom_moved);
+    }
+
+    #[test]
+    fn the_view_key_moves_with_every_per_pane_bit() {
+        let base = PaneView::new(3);
+        // Equal state, equal key: the gate must never repaint on its own.
+        assert_eq!(base.key(), PaneView::new(3).key());
+
+        let mut focused = PaneView::new(3);
+        focused.focus = Some(SourceId(2));
+        assert_ne!(base.key(), focused.key());
+
+        let mut zoomed = PaneView::new(3);
+        zoomed.zoomed = Some(SourceId(2));
+        assert_ne!(base.key(), zoomed.key());
+        assert_ne!(focused.key(), zoomed.key());
+
+        let mut collapsed = PaneView::new(3);
+        collapsed.collapsed[1] = true;
+        assert_ne!(base.key(), collapsed.key());
+        // WHICH pane is what the hash must carry: the same bit on a
+        // different pane is a different key.
+        let mut other = PaneView::new(3);
+        other.collapsed[2] = true;
+        assert_ne!(collapsed.key(), other.key());
+
+        let mut scrolled = PaneView::new(3);
+        scrolled.scroll[0] = LiveScroll::at(2, 50, 10);
+        assert_ne!(base.key(), scrolled.key());
+    }
+
+    #[test]
+    fn the_derivation_is_the_reserved_allocation() {
+        // One derivation, and in this phase it is exactly the reserved
+        // allocation: nothing in the per-pane view moves a pane's cells.
+        let registry = two_weighted_panes();
+        let panes = PaneView::new(registry.len());
+        for gutter in [false, true] {
+            assert_eq!(
+                derive_geometry(&registry, (80, 24), None, gutter, &panes),
+                registry.geometry_reserving((80, 24), gutter_reserve(gutter))
+            );
+        }
+    }
+
+    #[test]
+    fn a_per_pane_view_change_never_reads_as_a_resize() {
+        // The plan's most important NON-event: a gesture that moves the
+        // view must derive the same geometry, or the very next
+        // iteration arms the 250ms gate and every child — live ones
+        // included — restarts after a keypress.
+        let registry = two_weighted_panes();
+        let mut panes = PaneView::new(registry.len());
+        let mut size = (80, 24);
+        let mut geom = derive_geometry(&registry, size, None, false, &panes);
+        panes.focus = Some(SourceId(1));
+        panes.collapsed[0] = true;
+        let step = detect_resize(
+            (80, 24),
+            None,
+            false,
+            &panes,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
+        assert!(!step.size_moved, "the terminal did not move");
+        assert!(
+            !step.geom_moved,
+            "focus and collapse are not allocation terms"
+        );
+    }
+
+    #[test]
+    fn the_paint_key_carries_the_per_pane_view() {
+        // The gate is output-derived at pane scope, so without this
+        // field a gesture that changes only what is composed paints
+        // nothing.
+        let registry = two_weighted_panes();
+        let mut panes = PaneView::new(registry.len());
+        let view = ViewState {
+            wrap: true,
+            hshift: 0,
+            gutter: false,
+            highlight: false,
+            alt_time: false,
+        };
+        let before = paint_key(
+            None,
+            None,
+            42,
+            Appearance::Dark,
+            (80, 24),
+            view,
+            panes.key(),
+            0,
+        );
+        panes.focus = Some(SourceId(1));
+        let after = paint_key(
+            None,
+            None,
+            42,
+            Appearance::Dark,
+            (80, 24),
+            view,
+            panes.key(),
+            0,
+        );
+        assert_ne!(before, after, "same content, moved focus, new key");
+        assert_eq!(after.view, panes.key());
     }
 
     /// A timestamp `secs` in the past, without timestamp arithmetic.

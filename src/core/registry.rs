@@ -372,7 +372,11 @@ impl Registry {
     }
 
     /// Per-pane geometry for one terminal size, resolved BEFORE the
-    /// spawn step so a child can be told its pane's inner size.
+    /// spawn step so a child can be told its pane's inner size. The
+    /// test-side spelling of `geometry_reserving(size, 0)`: production
+    /// derives through the loop's one derivation, which always names
+    /// its reservation.
+    #[cfg(test)]
     pub fn geometry(&self, size: (u16, u16)) -> Vec<PaneGeometry> {
         self.geometry_reserving(size, 0)
     }
