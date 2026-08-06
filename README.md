@@ -397,11 +397,11 @@ with an empty stdout rather than printing a partial frame.
 reading order, wrapping; `Alt-h/j/k/l` moves it directionally, and a
 direction with no candidate pane is a no-op rather than a wrap;
 `Alt-1`–`Alt-9` jump straight to a pane by its reading-order number.
-While any pane is focused, every title counts itself (`1 · alpha`), so
-the jump targets are visible exactly while you are navigating — at
-rest the board stays unnumbered. The numbers stop where the jump keys
-do: on a board with more than nine panes the tenth onward stays
-unnumbered, and `Tab` still reaches it. The
+While any pane is focused, the first nine titles count themselves
+(`1 · alpha`), so the jump targets are visible exactly while you are
+navigating — at rest the board stays unnumbered. The numbers stop
+where the jump keys do: on a board with more than nine panes the
+tenth onward stays unnumbered, and `Tab` still reaches it. The
 focused pane wears the accent border and the footer names it. On a
 board taller than the window the frame viewport follows the focus:
 focusing a pane below the fold scrolls it into view, and the gestures
