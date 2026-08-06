@@ -6157,7 +6157,10 @@ mod tests {
             assert_eq!(action_for(Key::Alt('9'), mode), WatchAction::FocusJump(8));
             assert_eq!(action_for(Key::Alt('0'), mode), WatchAction::Ignore);
         }
-        assert_eq!(action_for(Key::Alt('1'), FrameMode::Paused), WatchAction::Ignore);
+        assert_eq!(
+            action_for(Key::Alt('1'), FrameMode::Paused),
+            WatchAction::Ignore
+        );
     }
 
     #[test]

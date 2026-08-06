@@ -132,6 +132,7 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "  pane gestures (while the frame is live — not the `live` label):",
     "    Tab, BackTab     cycle focus between panes — a zoom rides along",
     "    Alt-h/j/k/l      move focus directionally",
+    "    Alt-1..9         jump straight to a numbered pane",
     "    Esc              unzoom, then drop focus, then the frame scroll",
     "    Enter            zoom the focused pane; zoomed, page its body",
     "    z                zoom the focused pane to the full frame",
@@ -139,7 +140,9 @@ const PANE_GESTURE_HELP: &[&str] = &[
     "    With a pane focused, the scroll keys and the wheel drive that",
     "    pane's own window instead of the whole frame, and focusing a",
     "    pane below the fold scrolls the frame to it. h/l shift",
-    "    nothing here: pane content is clipped to its box.",
+    "    nothing here: pane content is clipped to its box. While a",
+    "    focus is held, every title counts itself — the number",
+    "    Alt-1..9 jumps by (and it works from rest, too).",
 ];
 
 /// What the `live` label means, and what `interval` means under it.
@@ -436,6 +439,7 @@ mod tests {
                 "  pane gestures (while the frame is live — not the `live` label):".to_string(),
                 "    Tab, BackTab     cycle focus between panes — a zoom rides along".to_string(),
                 "    Alt-h/j/k/l      move focus directionally".to_string(),
+                "    Alt-1..9         jump straight to a numbered pane".to_string(),
                 "    Esc              unzoom, then drop focus, then the frame scroll".to_string(),
                 "    Enter            zoom the focused pane; zoomed, page its body".to_string(),
                 "    z                zoom the focused pane to the full frame".to_string(),
@@ -443,7 +447,9 @@ mod tests {
                 "    With a pane focused, the scroll keys and the wheel drive that".to_string(),
                 "    pane's own window instead of the whole frame, and focusing a".to_string(),
                 "    pane below the fold scrolls the frame to it. h/l shift".to_string(),
-                "    nothing here: pane content is clipped to its box.".to_string(),
+                "    nothing here: pane content is clipped to its box. While a".to_string(),
+                "    focus is held, every title counts itself — the number".to_string(),
+                "    Alt-1..9 jumps by (and it works from rest, too).".to_string(),
             ]
         );
     }
@@ -458,6 +464,7 @@ mod tests {
             "Tab",
             "BackTab",
             "Alt-h/j/k/l",
+            "Alt-1..9",
             "Esc",
             "Enter",
             "z ",

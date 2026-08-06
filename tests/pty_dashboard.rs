@@ -2708,11 +2708,21 @@ pane "ccc" {
 
     // From rest: Alt-3 focuses the third pane directly.
     session.write_bytes(b"\x1b3");
-    let _ = wait_for_in_order(&session, &mut terminal, &[b"focus ccc"], Duration::from_secs(3));
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"focus ccc"],
+        Duration::from_secs(3),
+    );
 
     // And Alt-1 jumps back without cycling through bbb.
     session.write_bytes(b"\x1b1");
-    let seen = wait_for_in_order(&session, &mut terminal, &[b"focus aaa"], Duration::from_secs(3));
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"focus aaa"],
+        Duration::from_secs(3),
+    );
     assert!(
         !contains(&seen, b"focus bbb"),
         "a jump must not pass through the panes between: {:?}",

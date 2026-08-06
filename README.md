@@ -395,7 +395,11 @@ with an empty stdout rather than printing a partial frame.
 
 `Tab` and `BackTab` cycle the focus through the panes in layout
 reading order, wrapping; `Alt-h/j/k/l` moves it directionally, and a
-direction with no candidate pane is a no-op rather than a wrap. The
+direction with no candidate pane is a no-op rather than a wrap;
+`Alt-1`–`Alt-9` jump straight to a pane by its reading-order number.
+While any pane is focused, every title counts itself (`1 · alpha`), so
+the jump targets are visible exactly while you are navigating — at
+rest the board stays unnumbered. The
 focused pane wears the accent border and the footer names it. On a
 board taller than the window the frame viewport follows the focus:
 focusing a pane below the fold scrolls it into view, and the gestures
@@ -420,9 +424,10 @@ just re-clips to the new width — a view gesture never restarts a
 long-lived child, the same rule the gutter toggle and a resize already
 follow. A batch pane's content was rendered at its old declared width,
 so it re-runs once, debounced, to arrive at the zoomed width honestly —
-on zoom-in and zoom-out alike. While zoomed, `Tab` and `BackTab` carry
-the zoom from pane to pane along the reading order, and the chrome
-row's `zoomed 2/4` badge names the pane's place in that cycle. The hidden panes
+on zoom-in and zoom-out alike. While zoomed, `Tab`/`BackTab` — and an
+`Alt-digit` jump — carry the zoom from pane to pane along the reading
+order, and the chrome row's `zoomed 2/4` badge names the pane's place
+in that cycle. The hidden panes
 keep running underneath, and per-pane scroll stays active over the
 zoomed body.
 
