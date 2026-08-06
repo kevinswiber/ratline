@@ -5124,17 +5124,16 @@ fn compose_sources(
             let spec = registry.spec(id);
             let zoom_cursor = (view.zoomed == Some(id)).then(|| zoom_badge(&order, id));
             // Navigation numbers: while ANY pane holds the focus,
-            // a title counts itself in reading order — the label
-            // Alt-digit jumps by. The numbers stop where the jump
-            // keys do: past the ninth pane there is no Alt-digit, and
-            // a number nothing can jump to would be a false label. At
+            // every title counts itself in reading order. The count
+            // deliberately continues past the ninth pane — the number
+            // names the declaration order, which is worth knowing on
+            // its own, and a future go-to-pane command can address it
+            // even though Alt-digit only reaches the first nine. At
             // rest the board stays unnumbered.
-            let numbered = view
-                .focus
-                .is_some()
-                .then(|| order.iter().position(|o| *o == id).map_or(0, |p| p + 1))
-                .filter(|at| (1..=9).contains(at))
-                .map(|at| format!("{at} · {}", pane_display_name(registry, id)));
+            let numbered = view.focus.is_some().then(|| {
+                let at = order.iter().position(|o| *o == id).map_or(0, |p| p + 1);
+                format!("{at} · {}", pane_display_name(registry, id))
+            });
             let pane = registry
                 .pane(id)
                 .expect("a Panes registry boxes every source");
@@ -8088,12 +8087,13 @@ mod tests {
     }
 
     #[test]
-    fn the_numbers_stop_where_the_jump_keys_do() {
+    fn the_numbers_keep_counting_past_the_jump_keys() {
         use crate::core::box_model::{BorderPreset, Sides};
         use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneWidth};
-        // Eleven panes: the tenth and eleventh have no Alt-digit, so a
-        // number there would label a jump nothing can make. They stay
-        // plain; Tab still reaches them.
+        // Eleven panes: Alt-digit reaches only the first nine, but the
+        // count continues — the number names the declaration order,
+        // and a future go-to-pane command can address it (the owner's
+        // ruling; the help states which numbers the keys reach).
         let spec = |n: usize| SourceSpec {
             id: format!("p{n:02}"),
             program: SourceProgram::Argv(vec!["true".to_string()]),
@@ -8141,13 +8141,10 @@ mod tests {
         );
         assert!(focused.lines.iter().any(|l| l.contains("9 · p09")));
         assert!(
-            !focused.lines.iter().any(|l| l.contains("10 · ")),
-            "an unjumpable pane stays unnumbered"
+            focused.lines.iter().any(|l| l.contains("10 · p10")),
+            "the count continues past the jump keys"
         );
-        assert!(
-            focused.lines.iter().any(|l| l.contains(" p10 ")),
-            "its plain title still renders"
-        );
+        assert!(focused.lines.iter().any(|l| l.contains("11 · p11")));
     }
 
     /// A `PaneView` for the geometry tests. Only `zoomed` is read by
