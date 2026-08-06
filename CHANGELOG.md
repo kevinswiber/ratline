@@ -2,6 +2,20 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.18.0](https://github.com/kevinswiber/ratto/compare/3da69fd4da3c86237b1c068682d31aaf671f261b..v0.18.0) - 2026-08-06
+#### Features
+- the numbers keep counting past the jump keys - ([4c83a55](https://github.com/kevinswiber/ratto/commit/4c83a55407ab8cab2dc98b229e36b68b55aea75b)) - [@kevinswiber](https://github.com/kevinswiber)
+- pane titles count themselves while a focus is held - ([0eed74e](https://github.com/kevinswiber/ratto/commit/0eed74ee5d7b663bb8929f2e7384327ccb8712ea)) - [@kevinswiber](https://github.com/kevinswiber)
+- alt-digit jumps the focus straight to a numbered pane - ([3da69fd](https://github.com/kevinswiber/ratto/commit/3da69fd4da3c86237b1c068682d31aaf671f261b)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Bug Fixes
+- the numbers stop where the jump keys do - ([dd3c66f](https://github.com/kevinswiber/ratto/commit/dd3c66ffc2002917d495ff6d18ba57a9094f7e2e)) - [@kevinswiber](https://github.com/kevinswiber)
+#### Documentation
+- the readme counts only the nine jumpable titles too - ([16fc509](https://github.com/kevinswiber/ratto/commit/16fc509ea9e934fd46ee376669241a27c5956671)) - [@kevinswiber](https://github.com/kevinswiber)
+- the help counts only the nine jumpable titles - ([6a7ea3b](https://github.com/kevinswiber/ratto/commit/6a7ea3b966c3e0611a13a088b6b8e4d008ce445b)) - [@kevinswiber](https://github.com/kevinswiber)
+- the numbered jump reaches the help and the readme - ([8dbe391](https://github.com/kevinswiber/ratto/commit/8dbe39157b30f87dfe1be358d2d89f7668962193)) - [@kevinswiber](https://github.com/kevinswiber)
+
+- - -
+
 ## [v0.17.0](https://github.com/kevinswiber/ratto/compare/99f0a6016defd672b98c977b4c4afeea8d3ae5c8..v0.17.0) - 2026-08-06
 #### Features
 - the zoomed badge carries its place in the cycle - ([e6cb2b7](https://github.com/kevinswiber/ratto/commit/e6cb2b7542eff7d6b7baeb2fe93abbcedbb5fc8e)) - [@kevinswiber](https://github.com/kevinswiber)
