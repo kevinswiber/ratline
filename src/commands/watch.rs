@@ -2264,11 +2264,89 @@ pub(crate) fn run_registry(
                                 )?);
                                 continue;
                             }
-                            // While zoomed the other panes are not on
-                            // screen; moving focus onto a hidden surface
-                            // is the unzoom-guard problem v1 declines
-                            // (INV-12).
-                            if panes.zoomed.is_some() {
+                            // While zoomed, Tab/BackTab CARRY the zoom
+                            // along the reading order: the surface stays
+                            // a single pane, so there is no hidden focus
+                            // to guard. A directional move still
+                            // declines — it needs the on-screen geometry
+                            // the zoom is hiding (INV-12).
+                            if let Some(from) = panes.zoomed {
+                                if !matches!(
+                                    action,
+                                    WatchAction::FocusNext | WatchAction::FocusPrev
+                                ) {
+                                    continue;
+                                }
+                                let order = pane_order(layout);
+                                let next = focus_cycle(
+                                    panes.focus,
+                                    &order,
+                                    action == WatchAction::FocusNext,
+                                );
+                                let Some(to) = next else { continue };
+                                if next == panes.focus {
+                                    // A one-pane board: nowhere to carry
+                                    // the zoom, no repaint to spend.
+                                    continue;
+                                }
+                                panes.focus = next;
+                                panes.zoomed = next;
+                                geom = derive_geometry(
+                                    &registry,
+                                    size,
+                                    session.max_height,
+                                    view.gutter,
+                                    &panes,
+                                );
+                                // Both panes changed width: the one
+                                // leaving the zoom owes its declared-width
+                                // run, the one entering owes its
+                                // full-frame run (the per-pane gates —
+                                // INV-5's reason to exist).
+                                zoom_gates[from.0].fire(Instant::now());
+                                zoom_gates[to.0].fire(Instant::now());
+                                reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+                                recompose_live(
+                                    &mut live,
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    view.alt_time,
+                                    &palette,
+                                    profile,
+                                );
+                                let Some(live) = live.as_ref() else { continue };
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                // The zoomed frame fits the window; a
+                                // held offset re-clamps away.
+                                let window = usize::from(window_rows(session.max_height, size.1));
+                                live_scroll = refollow(
+                                    &registry,
+                                    &geom,
+                                    &panes,
+                                    live_scroll,
+                                    live.lines.len(),
+                                    window,
+                                );
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    live,
+                                    &live_tail,
+                                    &palette,
+                                    view,
+                                    panes.key(),
+                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    None,
+                                    size,
+                                    session.max_height,
+                                    fullscreen,
+                                    &faint,
+                                    profile,
+                                    &history,
+                                )?);
                                 continue;
                             }
                             let order = pane_order(layout);

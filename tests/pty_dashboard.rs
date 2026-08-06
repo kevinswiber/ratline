@@ -3249,12 +3249,13 @@ fn esc_leaves_the_zoom_and_keeps_the_focus() {
     );
 }
 
-/// Tab while zoomed must not move focus (INV-12: moving focus onto a
-/// hidden surface is Zellij's unzoom-guard problem; v1 declines it).
-/// The proof is the NEXT z: with focus still on `left` it unzooms; a
-/// focus that had slipped to `right` would zoom `right` instead.
+/// Tab while zoomed carries the zoom along the reading order — the
+/// surface stays one pane, so there is no hidden focus to guard — and
+/// each switch owes BOTH panes their honest-width run (the per-pane
+/// gates). A directional move still declines: it needs the on-screen
+/// geometry the zoom is hiding (INV-12).
 #[test]
-fn focus_gestures_are_inert_while_zoomed() {
+fn tab_cycles_the_zoomed_pane_and_a_directional_move_declines() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (left, right) = (dir.path().join("left"), dir.path().join("right"));
     let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
@@ -3270,21 +3271,47 @@ fn focus_gestures_are_inert_while_zoomed() {
     wait_for_in_order(
         &session,
         &mut terminal,
-        &[wide.as_bytes(), b"left-1"],
+        &[wide.as_bytes(), b"left-2"],
         Duration::from_secs(5),
     );
 
-    session.write_bytes(b"\tz");
+    // Tab: the zoom moves to `right` without leaving the zoom — its
+    // honest full-frame run arrives on the wide surface.
+    session.write_bytes(b"\t");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"right-2"],
+        Duration::from_secs(5),
+    );
+    // The pane that LEFT the zoom owes its declared-width run too;
+    // hidden, so its counter file is the evidence — and exactly one.
+    assert_counter_settled_at(&left, 3);
+
+    // Alt-l while zoomed is silently declined; BackTab returns the
+    // zoom to `left`, whose full-frame run arrives visible.
+    session.write_bytes(b"\x1bl");
+    session.write_bytes(b"\x1b[Z");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"left-4"],
+        Duration::from_secs(5),
+    );
+    assert_counter_settled_at(&right, 3);
+
+    // z unzooms the CARRIED focus: the two-pane row composes again.
+    session.write_bytes(b"z");
     let back = wait_for_in_order(
         &session,
         &mut terminal,
-        &[b"right-1"],
+        &[b"right-"],
         Duration::from_secs(5),
     );
-    let at = position(&back, b"right-1").expect("the restored right pane");
+    let at = position(&back, b"right-").expect("the restored right pane");
     assert!(
-        position(&back[at..], "─".repeat(60).as_bytes()).is_none(),
-        "a second pane was zoomed instead of the first being unzoomed"
+        position(&back[at..], wide.as_bytes()).is_none(),
+        "unzoom must restore the two-pane row"
     );
 
     session.write_bytes(b"q");
