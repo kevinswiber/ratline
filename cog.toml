@@ -10,9 +10,12 @@ skip_ci = "[skip ci]"
 skip_untracked = false
 tag_prefix = "v"
 
-# Scopes are intentionally not enforced yet. Add scopes once the crate has
-# stable module/package boundaries that should be reflected in commit headers.
-scopes = []
+# The one allowed scope is the version bump's own (`chore(version): vX.Y.Z`,
+# written by `cog bump`) — without it, `cog changelog` grumbles over every
+# release commit. Add module scopes once the crate has stable boundaries
+# that should be reflected in commit headers. Keep this single-line: the
+# commit-msg hook's awk below parses it that way.
+scopes = ["version"]
 
 pre_bump_hooks = [
     "just lint",
