@@ -2186,6 +2186,7 @@ pub(crate) fn run_registry(
                         }
                         action @ (WatchAction::FocusNext
                         | WatchAction::FocusPrev
+                        | WatchAction::FocusJump(_)
                         | WatchAction::FocusMove(_)
                         | WatchAction::ClearFocus) => {
                             // A pane gesture needs a boxed registry and
@@ -2266,24 +2267,25 @@ pub(crate) fn run_registry(
                                 continue;
                             }
                             // While zoomed, Tab/BackTab CARRY the zoom
-                            // along the reading order: the surface stays
-                            // a single pane, so there is no hidden focus
-                            // to guard. A directional move still
-                            // declines — it needs the on-screen geometry
-                            // the zoom is hiding (INV-12).
+                            // along the reading order, and Alt-digit
+                            // carries it straight to a numbered pane:
+                            // the surface stays a single pane, so there
+                            // is no hidden focus to guard. A directional
+                            // move still declines — it needs the
+                            // on-screen geometry the zoom is hiding
+                            // (INV-12).
                             if let Some(from) = panes.zoomed {
-                                if !matches!(
-                                    action,
-                                    WatchAction::FocusNext | WatchAction::FocusPrev
-                                ) {
-                                    continue;
-                                }
                                 let order = pane_order(layout);
-                                let next = focus_cycle(
-                                    panes.focus,
-                                    &order,
-                                    action == WatchAction::FocusNext,
-                                );
+                                let next = match action {
+                                    WatchAction::FocusNext => {
+                                        focus_cycle(panes.focus, &order, true)
+                                    }
+                                    WatchAction::FocusPrev => {
+                                        focus_cycle(panes.focus, &order, false)
+                                    }
+                                    WatchAction::FocusJump(n) => order.get(n).copied(),
+                                    _ => None,
+                                };
                                 let Some(to) = next else { continue };
                                 if next == panes.focus {
                                     // A one-pane board: nowhere to carry
@@ -2354,6 +2356,12 @@ pub(crate) fn run_registry(
                             let next = match action {
                                 WatchAction::FocusNext => focus_cycle(panes.focus, &order, true),
                                 WatchAction::FocusPrev => focus_cycle(panes.focus, &order, false),
+                                WatchAction::FocusJump(n) => {
+                                    // Out of range holds the focus —
+                                    // `next == panes.focus` below makes
+                                    // it a silent no-op, never a wrap.
+                                    order.get(n).copied().or(panes.focus)
+                                }
                                 WatchAction::FocusMove(dir) => match panes.focus {
                                     None => order.first().copied(),
                                     Some(from) => {
@@ -2860,6 +2868,10 @@ enum WatchAction {
     /// Per-pane gestures. Live only: a frozen or scrubbed frame is a
     /// composed string with no pane identity left in it.
     FocusNext,
+    /// Jump the focus straight to the pane at this reading-order
+    /// index (Alt-1..9 → 0..8). The order is `pane_order`'s — the
+    /// same order Tab cycles and the numbered titles display.
+    FocusJump(usize),
     FocusPrev,
     FocusMove(FocusDir),
     ClearFocus,
@@ -3005,6 +3017,9 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Alt('j') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Down),
         Key::Alt('k') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Up),
         Key::Alt('l') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Right),
+        Key::Alt(c @ '1'..='9') if mode != FrameMode::Paused => {
+            WatchAction::FocusJump(c as usize - '1' as usize)
+        }
         Key::Char('z') if mode != FrameMode::Paused => WatchAction::ToggleZoom,
         Key::Space if mode != FrameMode::Paused => WatchAction::ToggleCollapse,
         Key::Esc if mode != FrameMode::Paused => WatchAction::ClearFocus,
@@ -6119,6 +6134,21 @@ mod tests {
             assert_eq!(action_for(Key::Char('h'), mode), WatchAction::ShiftLeft);
             assert_eq!(action_for(Key::Char('l'), mode), WatchAction::ShiftRight);
         }
+    }
+
+    #[test]
+    fn alt_digits_jump_to_a_numbered_pane() {
+        // Alt-1..9 address the reading order directly — the same
+        // order Tab cycles and the numbered titles display. Live
+        // frame only, like every pane gesture (INV-3); a frozen frame
+        // has no pane identity, and Alt-0 stays unbound.
+        for mode in [FrameMode::Live, FrameMode::LiveScrolled] {
+            assert_eq!(action_for(Key::Alt('1'), mode), WatchAction::FocusJump(0));
+            assert_eq!(action_for(Key::Alt('5'), mode), WatchAction::FocusJump(4));
+            assert_eq!(action_for(Key::Alt('9'), mode), WatchAction::FocusJump(8));
+            assert_eq!(action_for(Key::Alt('0'), mode), WatchAction::Ignore);
+        }
+        assert_eq!(action_for(Key::Alt('1'), FrameMode::Paused), WatchAction::Ignore);
     }
 
     #[test]

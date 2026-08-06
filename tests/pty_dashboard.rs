@@ -2666,6 +2666,108 @@ pane "b" {
     );
 }
 
+/// Alt-digit addresses the reading order directly: no cycling, no
+/// reveal step — the numbers are the declaration order Tab already
+/// walks, and an out-of-range digit is a silent no-op.
+#[test]
+fn alt_digit_jumps_straight_to_a_numbered_pane() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 4
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "aaa" {
+    interval "1h"
+    command "printf 'body-a'"
+}
+pane "bbb" {
+    interval "1h"
+    command "printf 'body-b'"
+}
+pane "ccc" {
+    interval "1h"
+    command "printf 'body-c'"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"body-c", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // From rest: Alt-3 focuses the third pane directly.
+    session.write_bytes(b"\x1b3");
+    let _ = wait_for_in_order(&session, &mut terminal, &[b"focus ccc"], Duration::from_secs(3));
+
+    // And Alt-1 jumps back without cycling through bbb.
+    session.write_bytes(b"\x1b1");
+    let seen = wait_for_in_order(&session, &mut terminal, &[b"focus aaa"], Duration::from_secs(3));
+    assert!(
+        !contains(&seen, b"focus bbb"),
+        "a jump must not pass through the panes between: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// While zoomed, Alt-digit carries the zoom straight to its number —
+/// the same both-panes-owe-a-run contract Tab's carry keeps.
+#[test]
+fn alt_digit_carries_the_zoom_to_its_number() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let wide = "─".repeat(60);
+    session.write_bytes(b"\tz");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-2"],
+        Duration::from_secs(5),
+    );
+
+    // Alt-2: the zoom lands on `right` without leaving the zoom; its
+    // honest full-frame run arrives, and the departed pane owes its
+    // declared-width run (counter-file evidence, hidden surface).
+    session.write_bytes(b"\x1b2");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"zoomed 2/2", b"right-2"],
+        Duration::from_secs(5),
+    );
+    assert_counter_settled_at(&left, 3);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
 /// Esc peels one layer at a time: with a pane focused on a scrolled
 /// frame, the first Esc only deselects — the frame window HOLDS its
 /// place — and the second returns the frame to the live view.
