@@ -2823,3 +2823,175 @@ pane "b" {
         "dashboard should have exited on q"
     );
 }
+
+/// z fills the frame with the focused pane; z again restores the layout.
+/// At 80 columns a 1fr pane is under 40 cells, so a 60-dash border run
+/// can only exist zoomed — the positive control every absence assertion
+/// here rides with.
+#[test]
+fn z_fills_the_frame_with_the_focused_pane_and_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // Tab focuses the first pane in reading order; z zooms it.
+    let wide = "─".repeat(60);
+    session.write_bytes(b"\tz");
+    // ONE capture: the wide border and the retained body can land in
+    // one chunk or two, and a second wait would race the first.
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-1"],
+        Duration::from_secs(5),
+    );
+    let at = position(&seen, wide.as_bytes()).expect("the zoomed border");
+    assert!(
+        position(&seen[at..], b"right-1").is_none(),
+        "the hidden pane must not be composed: {:?}",
+        String::from_utf8_lossy(&seen[at..])
+    );
+
+    // The negative respawn pin (INV-10), on the pane the gesture did
+    // NOT name: past the 250ms debounce, a zoom must not have read as a
+    // resize and restarted the board. The ZOOMED pane's counter is
+    // deliberately left out — the debounced respawn task makes it 2 on
+    // purpose, and a pin that task has to edit is not a pin.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    assert_counter_settled_at(&right, 1);
+
+    // z again restores the declared layout — `right-1` was erased by
+    // the zoom, so the differ MUST write it back.
+    session.write_bytes(b"z");
+    let back = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"right-1"],
+        Duration::from_secs(5),
+    );
+    let top = row_containing(&back, "╭".as_bytes()).expect("the restored top-border row");
+    assert_eq!(
+        String::from_utf8_lossy(top).matches('╮').count(),
+        2,
+        "both panes are back in one row: {:?}",
+        String::from_utf8_lossy(top)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// Esc's first rung is the unzoom, and the focus survives it (INV-12).
+#[test]
+fn esc_leaves_the_zoom_and_keeps_the_focus() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let wide = "─".repeat(60);
+    session.write_bytes(b"\tz");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-1"],
+        Duration::from_secs(5),
+    );
+
+    // A bare ESC needs ESC_HOLD (50ms) of SILENCE to decode: no other
+    // byte may be written inside that window (`bytes_cancel_a_pending_escape`).
+    session.write_bytes(b"\x1b");
+    let back = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"right-1"],
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(row_containing(&back, "╭".as_bytes()).expect("top border"))
+            .matches('╮')
+            .count(),
+        2,
+        "Esc's first rung is the unzoom"
+    );
+
+    // Focus SURVIVED the unzoom: z re-zooms the same pane, which is
+    // only reachable with a focused pane (INV-12). This is the
+    // assertion, not a footer needle — an unchanged footer row is not
+    // rewritten and could never be waited on.
+    session.write_bytes(b"z");
+    let again = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-1"],
+        Duration::from_secs(5),
+    );
+    let at = position(&again, wide.as_bytes()).expect("the second zoom");
+    assert!(position(&again[at..], b"right-1").is_none());
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// Tab while zoomed must not move focus (INV-12: moving focus onto a
+/// hidden surface is Zellij's unzoom-guard problem; v1 declines it).
+/// The proof is the NEXT z: with focus still on `left` it unzooms; a
+/// focus that had slipped to `right` would zoom `right` instead.
+#[test]
+fn focus_gestures_are_inert_while_zoomed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let wide = "─".repeat(60);
+    session.write_bytes(b"\tz");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-1"],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"\tz");
+    let back = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"right-1"],
+        Duration::from_secs(5),
+    );
+    let at = position(&back, b"right-1").expect("the restored right pane");
+    assert!(
+        position(&back[at..], "─".repeat(60).as_bytes()).is_none(),
+        "a second pane was zoomed instead of the first being unzoomed"
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}

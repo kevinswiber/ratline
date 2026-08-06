@@ -31,8 +31,8 @@ use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
 use crate::core::registry::{
-    Composition, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId, SourceProgram,
-    SourceSpec, TitleSource, shebang,
+    Composition, LayoutNode, Overflow, PaneGeometry, Registry, Shebang, ShellMode, SourceId,
+    SourceProgram, SourceSpec, TitleSource, shebang,
 };
 use crate::core::retain::{Keep, Retention, compact_count};
 use crate::core::schedule::{Due, TickSchedule};
@@ -2007,6 +2007,58 @@ pub(crate) fn run_registry(
                                 &history,
                             )?);
                         }
+                        WatchAction::ToggleZoom => {
+                            if live.is_none() {
+                                continue;
+                            }
+                            // A gesture with no target is a no-op, never
+                            // a guess (INV-12).
+                            let Some(id) = panes.focus else { continue };
+                            // z while zoomed unzooms: one key both ways.
+                            panes.zoomed = (panes.zoomed != Some(id)).then_some(id);
+                            // geom only — `size` stays the resize arm's,
+                            // and this derivation uses the loop's size,
+                            // so detect_resize compares EQUAL on the next
+                            // iteration and the debounce gate stays
+                            // unarmed (INV-1).
+                            geom = derive_geometry(
+                                &registry,
+                                size,
+                                session.max_height,
+                                view.gutter,
+                                &panes,
+                            );
+                            recompose_live(
+                                &mut live,
+                                &registry,
+                                &runtime,
+                                &geom,
+                                &panes,
+                                view.alt_time,
+                                &palette,
+                                profile,
+                            );
+                            let Some(live) = live.as_ref() else { continue };
+                            let size = crossterm::terminal::size().unwrap_or((80, 24));
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
                         action @ (WatchAction::FocusNext
                         | WatchAction::FocusPrev
                         | WatchAction::FocusMove(_)
@@ -2024,6 +2076,56 @@ pub(crate) fn run_registry(
                                 continue;
                             };
                             if live.is_none() {
+                                continue;
+                            }
+                            // The ladder (INV-12): zoomed → unzoom and
+                            // KEEP the focus, so a second Esc clears it;
+                            // only then does the focus rung run.
+                            if action == WatchAction::ClearFocus && panes.zoomed.take().is_some() {
+                                geom = derive_geometry(
+                                    &registry,
+                                    size,
+                                    session.max_height,
+                                    view.gutter,
+                                    &panes,
+                                );
+                                recompose_live(
+                                    &mut live,
+                                    &registry,
+                                    &runtime,
+                                    &geom,
+                                    &panes,
+                                    view.alt_time,
+                                    &palette,
+                                    profile,
+                                );
+                                let Some(live) = live.as_ref() else { continue };
+                                let size = crossterm::terminal::size().unwrap_or((80, 24));
+                                previous_key = Some(repaint(
+                                    &mut renderer,
+                                    pause.as_ref(),
+                                    live_scroll,
+                                    live,
+                                    &live_tail,
+                                    &palette,
+                                    view,
+                                    panes.key(),
+                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
+                                    None,
+                                    size,
+                                    session.max_height,
+                                    fullscreen,
+                                    &faint,
+                                    profile,
+                                    &history,
+                                )?);
+                                continue;
+                            }
+                            // While zoomed the other panes are not on
+                            // screen; moving focus onto a hidden surface
+                            // is the unzoom-guard problem v1 declines
+                            // (INV-12).
+                            if panes.zoomed.is_some() {
                                 continue;
                             }
                             let order = pane_order(layout);
@@ -2511,6 +2613,7 @@ enum WatchAction {
     FocusPrev,
     FocusMove(FocusDir),
     ClearFocus,
+    ToggleZoom,
     Ignore,
 }
 
@@ -2649,6 +2752,7 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Alt('j') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Down),
         Key::Alt('k') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Up),
         Key::Alt('l') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Right),
+        Key::Char('z') if mode == FrameMode::Live => WatchAction::ToggleZoom,
         Key::Esc if mode == FrameMode::Live => WatchAction::ClearFocus,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
@@ -4653,7 +4757,17 @@ fn compose_sources(
             )
         })
         .collect();
-    let mut block = compose_panes(layout, &blocks, *gap, *row_gap);
+    // A zoomed pane composes ALONE: compose_panes takes its root as a
+    // parameter, so the hidden panes' blocks are simply never joined.
+    // Bound first — a `&LayoutNode::Pane(id)` built inside the call
+    // would be a temporary that dies at the semicolon.
+    let zoom_root = view.zoomed.map(LayoutNode::Pane);
+    let mut block = compose_panes(
+        zoom_root.as_ref().unwrap_or(layout),
+        &blocks,
+        *gap,
+        *row_gap,
+    );
     // The dashboard's own name: one bold line above the composed
     // panes, the same treatment `rat watch --title` gives a plain
     // frame — and prepended HERE so the collect step, the resize
@@ -5290,6 +5404,7 @@ mod tests {
             Key::Alt('j'),
             Key::Alt('k'),
             Key::Alt('l'),
+            Key::Char('z'),
         ];
         for key in bound {
             let expect = match key {
@@ -7343,6 +7458,77 @@ mod tests {
             collapsed: vec![false; n],
             scroll: vec![initial_pane_scroll(Overflow::KeepTop, 0, 0); n],
         }
+    }
+
+    #[test]
+    fn z_zooms_the_focused_pane_only_while_live() {
+        assert_eq!(
+            action_for(Key::Char('z'), FrameMode::Live),
+            WatchAction::ToggleZoom
+        );
+        // Per-pane gestures are Live-only (INV-3): a frozen or scrolled
+        // frame is a composed string with no pane identity in it.
+        for mode in [FrameMode::LiveScrolled, FrameMode::Paused] {
+            assert_eq!(action_for(Key::Char('z'), mode), WatchAction::Ignore);
+        }
+        // One spelling: `Z` is not a second key.
+        for mode in ALL_MODES {
+            assert_eq!(action_for(Key::Char('Z'), mode), WatchAction::Ignore);
+        }
+    }
+
+    #[test]
+    fn a_zoomed_compose_joins_only_the_zoomed_pane() {
+        let registry = zoom_row_registry();
+        let palette = Palette::builtin(Appearance::Dark, AppearanceSource::Default);
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        for (i, text) in ["alpha", "beta"].iter().enumerate() {
+            runtime[i].output = Some(vec![(*text).to_string()]);
+            runtime[i].posted = true;
+        }
+        let flat = compose_sources(
+            &registry,
+            &runtime,
+            &derive_geometry(
+                &registry,
+                (80, 24),
+                None,
+                false,
+                &view_zooming(&registry, None),
+            ),
+            &view_zooming(&registry, None),
+            false,
+            &palette,
+            ColorProfile::TrueColor,
+        );
+        assert!(flat.lines.iter().any(|l| l.contains("beta")));
+
+        let panes = view_zooming(&registry, Some(SourceId(0)));
+        let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+        let zoomed = compose_sources(
+            &registry,
+            &runtime,
+            &geom,
+            &panes,
+            false,
+            &palette,
+            ColorProfile::TrueColor,
+        );
+        assert!(zoomed.lines.iter().any(|l| l.contains("alpha")));
+        assert!(
+            !zoomed.lines.iter().any(|l| l.contains("beta")),
+            "the hidden pane's block is never joined"
+        );
+        assert_eq!(
+            zoomed.lines.len(),
+            geom[0].rows as usize,
+            "one pane, the frame's rows"
+        );
+        assert_eq!(
+            zoomed.lines.len(),
+            zoomed.marks.len(),
+            "marks stay aligned to lines"
+        );
     }
 
     #[test]
