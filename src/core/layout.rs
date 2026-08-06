@@ -165,9 +165,6 @@ pub fn compose_panes(
 /// big it is. Rows and columns, never cells-vs-chars: these coordinates
 /// are what a directional move compares, and a mark's char indices are
 /// a different space entirely.
-// Staged: constructed by the focus dispatch (landing with the gesture
-// arms); the allow leaves with that consumer.
-#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub struct PaneRect {
     pub row: usize,
@@ -183,7 +180,6 @@ pub struct PaneRect {
 /// reads a `PaneGeometry`. `origin` is the composition's own top-left,
 /// so a dashboard title row is one row of offset rather than a term
 /// inside the walk.
-#[allow(dead_code)]
 pub fn pane_rects(
     root: &LayoutNode,
     sizes: &[(usize, usize)],
@@ -240,7 +236,6 @@ pub fn pane_rects(
 
 /// The panes in reading order: rows left to right, columns top to
 /// bottom — the order the declaration placed them.
-#[allow(dead_code)]
 pub fn pane_order(root: &LayoutNode) -> Vec<SourceId> {
     match root {
         LayoutNode::Pane(id) => vec![*id],

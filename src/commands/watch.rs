@@ -23,7 +23,9 @@ use crate::core::child::{
     ChildSlot, ShutdownGuard, TickEvent, not_started, run_tick, spawn_live_tick, spawn_tick,
 };
 use crate::core::duration::parse_interval;
-use crate::core::layout::{PaneBlock, PaneChrome, compose_panes, render_pane};
+use crate::core::layout::{
+    PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
+};
 use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
 use crate::core::pager::{PagerCommand, resolve_pagers};
@@ -546,7 +548,7 @@ pub(crate) fn run_registry(
     // Per-pane view state, beside the whole-frame `view`: the gestures
     // move it, the composer reads it, and the repaint gate sees it
     // through the digest.
-    let panes = PaneView::new(registry.len());
+    let mut panes = PaneView::new(registry.len());
     // Loop-persistent geometry state: the one size/geometry pair the
     // spawn step, the composer, and the (future) resize arm consume. It
     // outlives the spawn branch — a completion can arrive in an
@@ -1923,6 +1925,84 @@ pub(crate) fn run_registry(
                                 &history,
                             )?);
                         }
+                        action @ (WatchAction::FocusNext
+                        | WatchAction::FocusPrev
+                        | WatchAction::FocusMove(_)
+                        | WatchAction::ClearFocus) => {
+                            // A pane gesture needs a boxed registry and
+                            // a composed frame: plain watch has no pane
+                            // to address.
+                            let Composition::Panes {
+                                layout,
+                                gap,
+                                row_gap,
+                                ..
+                            } = registry.composition()
+                            else {
+                                continue;
+                            };
+                            if live.is_none() {
+                                continue;
+                            }
+                            let order = pane_order(layout);
+                            let next = match action {
+                                WatchAction::FocusNext => focus_cycle(panes.focus, &order, true),
+                                WatchAction::FocusPrev => focus_cycle(panes.focus, &order, false),
+                                WatchAction::FocusMove(dir) => match panes.focus {
+                                    None => order.first().copied(),
+                                    Some(from) => {
+                                        let sizes = pane_block_sizes(&geom, &panes);
+                                        let mut rects = vec![PaneRect::default(); registry.len()];
+                                        pane_rects(
+                                            layout,
+                                            &sizes,
+                                            *gap,
+                                            *row_gap,
+                                            (0, 0),
+                                            &mut rects,
+                                        );
+                                        // No wrap: an edge move holds.
+                                        focus_neighbor(from, dir, &rects, &order).or(Some(from))
+                                    }
+                                },
+                                _ => None,
+                            };
+                            if next == panes.focus {
+                                // Nothing moved — an Esc with no focus,
+                                // a move at the edge, a cycle over one
+                                // pane. No repaint, so the gate is not
+                                // disturbed either.
+                                continue;
+                            }
+                            panes.focus = next;
+                            recompose_live(
+                                &mut live,
+                                &registry,
+                                &runtime,
+                                &geom,
+                                view.alt_time,
+                                &palette,
+                                profile,
+                            );
+                            let Some(live) = live.as_ref() else { continue };
+                            previous_key = Some(repaint(
+                                &mut renderer,
+                                pause.as_ref(),
+                                live_scroll,
+                                live,
+                                &live_tail,
+                                &palette,
+                                view,
+                                panes.key(),
+                                None,
+                                size,
+                                session.max_height,
+                                fullscreen,
+                                &faint,
+                                profile,
+                                &history,
+                            )?);
+                        }
                         action @ (WatchAction::ToggleWrap
                         | WatchAction::ShiftLeft
                         | WatchAction::ShiftRight
@@ -2335,7 +2415,22 @@ enum WatchAction {
     ToggleHighlight,
     ToggleTime,
     ToggleMouse,
+    /// Per-pane gestures. Live only: a frozen or scrubbed frame is a
+    /// composed string with no pane identity left in it.
+    FocusNext,
+    FocusPrev,
+    FocusMove(FocusDir),
+    ClearFocus,
     Ignore,
+}
+
+/// Which way a directional focus move travels.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum FocusDir {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// What append mode does with one key. A separate, CLOSED vocabulary —
@@ -2433,9 +2528,9 @@ fn append_help_lines(extra: &[String]) -> Vec<String> {
 /// The whole binding table, for both input paths and every mode — unix and
 /// Windows read their keys differently but mean the same things by them.
 /// What a Scroll action does while live is the loop's business, not the
-/// table's. View keys never freeze. No key addresses a pane: every
-/// gesture acts on the whole surface, which is why this table has no
-/// pane parameter.
+/// table's. View keys never freeze. A pane gesture names a direction,
+/// never a pane — which is why this table still has no pane parameter:
+/// the loop resolves which pane a direction reaches.
 fn action_for(key: Key, mode: FrameMode) -> WatchAction {
     match key {
         Key::CtrlC => WatchAction::Abort,
@@ -2458,12 +2553,93 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Char('c') => WatchAction::ToggleHighlight,
         Key::Char('t') => WatchAction::ToggleTime,
         Key::Char('m') => WatchAction::ToggleMouse,
+        Key::Tab if mode == FrameMode::Live => WatchAction::FocusNext,
+        Key::BackTab if mode == FrameMode::Live => WatchAction::FocusPrev,
+        Key::Alt('h') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Left),
+        Key::Alt('j') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Down),
+        Key::Alt('k') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Up),
+        Key::Alt('l') if mode == FrameMode::Live => WatchAction::FocusMove(FocusDir::Right),
+        Key::Esc if mode == FrameMode::Live => WatchAction::ClearFocus,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
         Key::Char('>') | Key::Char('.') if mode == FrameMode::Paused => WatchAction::ScrubForward,
         _ => WatchAction::Ignore,
     }
+}
+
+/// The next or previous pane in reading order, wrapping. With no focus
+/// any focus gesture lands on the first pane, so reaching for a pane
+/// always gets one.
+fn focus_cycle(from: Option<SourceId>, order: &[SourceId], forward: bool) -> Option<SourceId> {
+    let first = order.first().copied();
+    let Some(at) = from.and_then(|id| order.iter().position(|o| *o == id)) else {
+        return first;
+    };
+    let n = order.len();
+    let next = if forward { at + 1 } else { at + n - 1 };
+    order.get(next % n).copied()
+}
+
+/// The pane a directional move lands on, or None at the edge of the
+/// composition. A candidate lies STRICTLY beyond the focused pane's
+/// edge in the direction of travel and overlaps it by at least one cell
+/// on the cross axis; the nearest edge wins, and a tie goes to
+/// whichever candidate reads first.
+///
+/// Ratto separates panes by `gap`/`row_gap` cells, so a touching-edges
+/// test would find no neighbour at all; the distance minimum plus the
+/// overlap filter is the gap-proof equivalent.
+fn focus_neighbor(
+    from: SourceId,
+    dir: FocusDir,
+    rects: &[PaneRect],
+    order: &[SourceId],
+) -> Option<SourceId> {
+    let here = *rects.get(from.0)?;
+    order
+        .iter()
+        .copied()
+        .filter(|id| *id != from)
+        .filter_map(|id| Some((id, edge_distance(here, *rects.get(id.0)?, dir)?)))
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(id, _)| id)
+}
+
+/// How far `there` lies beyond `here`'s edge in the direction of
+/// travel, or None when it is not a candidate at all.
+fn edge_distance(here: PaneRect, there: PaneRect, dir: FocusDir) -> Option<usize> {
+    // Half-open spans: they share a cell when each starts before the
+    // other ends.
+    let overlaps = |a: usize, a_len: usize, b: usize, b_len: usize| a < b + b_len && b < a + a_len;
+    match dir {
+        FocusDir::Left => (there.col + there.cols <= here.col
+            && overlaps(here.row, here.rows, there.row, there.rows))
+        .then(|| here.col - (there.col + there.cols)),
+        FocusDir::Right => (here.col + here.cols <= there.col
+            && overlaps(here.row, here.rows, there.row, there.rows))
+        .then(|| there.col - (here.col + here.cols)),
+        FocusDir::Up => (there.row + there.rows <= here.row
+            && overlaps(here.col, here.cols, there.col, there.cols))
+        .then(|| here.row - (there.row + there.rows)),
+        FocusDir::Down => (here.row + here.rows <= there.row
+            && overlaps(here.col, here.cols, there.col, there.cols))
+        .then(|| there.row - (here.row + here.rows)),
+    }
+}
+
+/// Each pane's rendered block size for the rect walk: its declared box,
+/// or one row when it is collapsed.
+fn pane_block_sizes(geom: &[PaneGeometry], panes: &PaneView) -> Vec<(usize, usize)> {
+    geom.iter()
+        .zip(&panes.collapsed)
+        .map(|(g, collapsed)| {
+            (
+                if *collapsed { 1 } else { g.rows as usize },
+                g.cells as usize,
+            )
+        })
+        .collect()
 }
 
 /// The mouse's half of the binding table: the wheel drives the scroll
@@ -4841,6 +5017,12 @@ mod tests {
             Key::Char(','),
             Key::Char('>'),
             Key::Char('.'),
+            Key::Tab,
+            Key::BackTab,
+            Key::Alt('h'),
+            Key::Alt('j'),
+            Key::Alt('k'),
+            Key::Alt('l'),
         ];
         for key in bound {
             let expect = match key {
@@ -5010,13 +5192,219 @@ mod tests {
     }
 
     #[test]
-    fn esc_only_means_something_when_not_live() {
-        assert_eq!(action_for(Key::Esc, FrameMode::Live), WatchAction::Ignore);
+    fn esc_clears_focus_while_live_and_resumes_otherwise() {
+        assert_eq!(
+            action_for(Key::Esc, FrameMode::Live),
+            WatchAction::ClearFocus
+        );
         assert_eq!(
             action_for(Key::Esc, FrameMode::LiveScrolled),
             WatchAction::Resume
         );
         assert_eq!(action_for(Key::Esc, FrameMode::Paused), WatchAction::Resume);
+    }
+
+    #[test]
+    fn the_focus_keys_bind_only_while_live() {
+        // Per-pane gestures address a pane in the composed frame. A
+        // frozen or scrubbed frame is a literal copy with no pane
+        // identity in it, so the keys are inert there.
+        assert_eq!(
+            action_for(Key::Tab, FrameMode::Live),
+            WatchAction::FocusNext
+        );
+        assert_eq!(
+            action_for(Key::BackTab, FrameMode::Live),
+            WatchAction::FocusPrev
+        );
+        for (c, dir) in [
+            ('h', FocusDir::Left),
+            ('j', FocusDir::Down),
+            ('k', FocusDir::Up),
+            ('l', FocusDir::Right),
+        ] {
+            assert_eq!(
+                action_for(Key::Alt(c), FrameMode::Live),
+                WatchAction::FocusMove(dir)
+            );
+        }
+        for mode in [FrameMode::LiveScrolled, FrameMode::Paused] {
+            assert_eq!(action_for(Key::Tab, mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::BackTab, mode), WatchAction::Ignore);
+            for c in ['h', 'j', 'k', 'l'] {
+                assert_eq!(action_for(Key::Alt(c), mode), WatchAction::Ignore);
+            }
+        }
+        for mode in ALL_MODES {
+            // An unbound meta spelling stays inert, and the plain keys
+            // keep the whole-frame meanings they have always had.
+            assert_eq!(action_for(Key::Alt('x'), mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Char('h'), mode), WatchAction::ShiftLeft);
+            assert_eq!(action_for(Key::Char('l'), mode), WatchAction::ShiftRight);
+        }
+    }
+
+    #[test]
+    fn the_cycle_walks_reading_order_and_wraps() {
+        let order = [SourceId(2), SourceId(0), SourceId(1)];
+        // With no focus, any focus gesture lands on the first pane —
+        // forward and backward alike.
+        assert_eq!(focus_cycle(None, &order, true), Some(SourceId(2)));
+        assert_eq!(focus_cycle(None, &order, false), Some(SourceId(2)));
+        assert_eq!(
+            focus_cycle(Some(SourceId(2)), &order, true),
+            Some(SourceId(0))
+        );
+        assert_eq!(
+            focus_cycle(Some(SourceId(1)), &order, true),
+            Some(SourceId(2)),
+            "forward wraps past the last pane"
+        );
+        assert_eq!(
+            focus_cycle(Some(SourceId(2)), &order, false),
+            Some(SourceId(1)),
+            "backward wraps past the first pane"
+        );
+        // A single pane cycles to itself, which the arm reads as a no-op.
+        assert_eq!(
+            focus_cycle(Some(SourceId(0)), &[SourceId(0)], true),
+            Some(SourceId(0))
+        );
+        assert_eq!(focus_cycle(None, &[], true), None);
+    }
+
+    /// A 2x2 board: 4-row, 10-cell panes, gap 2 and row_gap 1.
+    fn grid_rects() -> Vec<PaneRect> {
+        vec![
+            PaneRect {
+                row: 0,
+                col: 0,
+                rows: 4,
+                cols: 10,
+            },
+            PaneRect {
+                row: 0,
+                col: 12,
+                rows: 4,
+                cols: 10,
+            },
+            PaneRect {
+                row: 5,
+                col: 0,
+                rows: 4,
+                cols: 10,
+            },
+            PaneRect {
+                row: 5,
+                col: 12,
+                rows: 4,
+                cols: 10,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_directional_move_crosses_the_gap_to_the_nearest_neighbour() {
+        // Zellij's exact-edge-adjacency test would find NOTHING here:
+        // ratto separates panes by gap/row_gap cells, so candidacy is
+        // "strictly beyond the edge, overlapping on the cross axis" and
+        // the nearest edge wins.
+        let rects = grid_rects();
+        let order = [SourceId(0), SourceId(1), SourceId(2), SourceId(3)];
+        let go = |from: usize, dir| focus_neighbor(SourceId(from), dir, &rects, &order);
+        assert_eq!(go(0, FocusDir::Right), Some(SourceId(1)));
+        assert_eq!(go(1, FocusDir::Left), Some(SourceId(0)));
+        assert_eq!(go(0, FocusDir::Down), Some(SourceId(2)));
+        assert_eq!(go(2, FocusDir::Up), Some(SourceId(0)));
+        assert_eq!(go(3, FocusDir::Left), Some(SourceId(2)));
+        assert_eq!(go(3, FocusDir::Up), Some(SourceId(1)));
+    }
+
+    #[test]
+    fn a_directional_move_stops_at_the_edge() {
+        let rects = grid_rects();
+        let order = [SourceId(0), SourceId(1), SourceId(2), SourceId(3)];
+        // No wrap: the cycle is the gesture that wraps.
+        assert_eq!(
+            focus_neighbor(SourceId(0), FocusDir::Left, &rects, &order),
+            None
+        );
+        assert_eq!(
+            focus_neighbor(SourceId(0), FocusDir::Up, &rects, &order),
+            None
+        );
+        assert_eq!(
+            focus_neighbor(SourceId(3), FocusDir::Right, &rects, &order),
+            None
+        );
+        assert_eq!(
+            focus_neighbor(SourceId(3), FocusDir::Down, &rects, &order),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pane_sharing_no_cross_axis_cells_is_not_a_neighbour() {
+        // Left-of is not enough: the panes must share at least one row,
+        // or a move left from the top-right lands on a pane the user
+        // would not call "to the left of this one".
+        let rects = vec![
+            PaneRect {
+                row: 0,
+                col: 12,
+                rows: 4,
+                cols: 10,
+            },
+            PaneRect {
+                row: 6,
+                col: 0,
+                rows: 4,
+                cols: 10,
+            },
+        ];
+        let order = [SourceId(0), SourceId(1)];
+        assert_eq!(
+            focus_neighbor(SourceId(0), FocusDir::Left, &rects, &order),
+            None
+        );
+    }
+
+    #[test]
+    fn a_directional_tie_goes_to_the_first_pane_in_reading_order() {
+        // One tall pane on the right, two stacked panes on its left:
+        // both are the same distance away and both overlap it.
+        let rects = vec![
+            PaneRect {
+                row: 0,
+                col: 12,
+                rows: 9,
+                cols: 10,
+            },
+            PaneRect {
+                row: 0,
+                col: 0,
+                rows: 4,
+                cols: 10,
+            },
+            PaneRect {
+                row: 5,
+                col: 0,
+                rows: 4,
+                cols: 10,
+            },
+        ];
+        let order = [SourceId(1), SourceId(2), SourceId(0)];
+        assert_eq!(
+            focus_neighbor(SourceId(0), FocusDir::Left, &rects, &order),
+            Some(SourceId(1))
+        );
+        // Reading order decides, not id order: reverse it and the other
+        // candidate wins.
+        let flipped = [SourceId(2), SourceId(1), SourceId(0)];
+        assert_eq!(
+            focus_neighbor(SourceId(0), FocusDir::Left, &rects, &flipped),
+            Some(SourceId(2))
+        );
     }
 
     #[test]
@@ -5093,7 +5481,7 @@ mod tests {
     fn unbound_keys_are_ignored() {
         for mode in ALL_MODES {
             assert_eq!(action_for(Key::Char('x'), mode), WatchAction::Ignore);
-            assert_eq!(action_for(Key::Tab, mode), WatchAction::Ignore);
+            assert_eq!(action_for(Key::Alt('x'), mode), WatchAction::Ignore);
             assert_eq!(action_for(Key::Backspace, mode), WatchAction::Ignore);
         }
     }
