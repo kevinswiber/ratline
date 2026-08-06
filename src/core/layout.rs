@@ -9,7 +9,7 @@ use crate::core::box_model::{BoxSpec, render_box};
 use crate::core::measure::{
     Align, Chunk, ELLIPSIS, chunks, display_width, kept_chars, pad_display, truncate_display,
 };
-use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneGeometry};
+use crate::core::registry::{LayoutNode, Overflow, PaneBox, PaneGeometry, SourceId};
 use crate::style_spec::StyleSpec;
 use crate::term::marks::LineMark;
 use crate::theme::Palette;
@@ -161,6 +161,95 @@ pub fn compose_panes(
     }
 }
 
+/// Where one pane's block lands in composed-frame coordinates, and how
+/// big it is. Rows and columns, never cells-vs-chars: these coordinates
+/// are what a directional move compares, and a mark's char indices are
+/// a different space entirely.
+// Staged: constructed by the focus dispatch (landing with the gesture
+// arms); the allow leaves with that consumer.
+#[allow(dead_code)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct PaneRect {
+    pub row: usize,
+    pub col: usize,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Walk the layout the way `compose_panes` joins it and record where
+/// every pane's block lands, returning the walked node's own
+/// (rows, cols). `sizes[id.0]` is the block's own size — the caller
+/// decides what a collapsed pane measures, which is why this never
+/// reads a `PaneGeometry`. `origin` is the composition's own top-left,
+/// so a dashboard title row is one row of offset rather than a term
+/// inside the walk.
+#[allow(dead_code)]
+pub fn pane_rects(
+    root: &LayoutNode,
+    sizes: &[(usize, usize)],
+    gap: usize,
+    row_gap: usize,
+    origin: (usize, usize),
+    out: &mut [PaneRect],
+) -> (usize, usize) {
+    match root {
+        LayoutNode::Pane(id) => {
+            let (rows, cols) = sizes.get(id.0).copied().unwrap_or((0, 0));
+            if let Some(rect) = out.get_mut(id.0) {
+                *rect = PaneRect {
+                    row: origin.0,
+                    col: origin.1,
+                    rows,
+                    cols,
+                };
+            }
+            (rows, cols)
+        }
+        // `stack`: a part starts `row_gap` rows below the previous
+        // part's end, and the block is as wide as its widest part.
+        LayoutNode::Column(children) => {
+            let (mut rows, mut cols) = (0usize, 0usize);
+            for (i, child) in children.iter().enumerate() {
+                if i > 0 {
+                    rows += row_gap;
+                }
+                let (h, w) =
+                    pane_rects(child, sizes, gap, row_gap, (origin.0 + rows, origin.1), out);
+                rows += h;
+                cols = cols.max(w);
+            }
+            (rows, cols)
+        }
+        // `beside`: a part starts `gap` cells past the previous part's
+        // width, and the block is as tall as its tallest part.
+        LayoutNode::Row(children) => {
+            let (mut rows, mut cols) = (0usize, 0usize);
+            for (i, child) in children.iter().enumerate() {
+                if i > 0 {
+                    cols += gap;
+                }
+                let (h, w) =
+                    pane_rects(child, sizes, gap, row_gap, (origin.0, origin.1 + cols), out);
+                cols += w;
+                rows = rows.max(h);
+            }
+            (rows, cols)
+        }
+    }
+}
+
+/// The panes in reading order: rows left to right, columns top to
+/// bottom — the order the declaration placed them.
+#[allow(dead_code)]
+pub fn pane_order(root: &LayoutNode) -> Vec<SourceId> {
+    match root {
+        LayoutNode::Pane(id) => vec![*id],
+        LayoutNode::Row(children) | LayoutNode::Column(children) => {
+            children.iter().flat_map(pane_order).collect()
+        }
+    }
+}
+
 /// Stack blocks with `row_gap` blank rows between. Mirrors
 /// `join_vertical(.., Align::Left)`: lines are cloned verbatim, no
 /// padding invented, so a mark's char indices are unchanged and only
@@ -304,7 +393,7 @@ mod tests {
     // `just lint` denies.
     use crate::core::box_model::{BorderPreset, Sides};
     use crate::core::join::{VAlign, join_horizontal, join_vertical};
-    use crate::core::registry::{PaneWidth, SourceId};
+    use crate::core::registry::PaneWidth;
     use crate::theme::{Appearance, AppearanceSource};
 
     fn palette() -> Palette {
@@ -961,5 +1050,178 @@ mod tests {
         assert_eq!(block.lines.len(), 4, "a chrome-less pane is all content");
         assert!(!block.lines.iter().any(|l| l.contains("looping")));
         assert!(!block.lines.iter().any(|l| l.contains("exit 3")));
+    }
+
+    #[test]
+    fn the_rect_walk_mirrors_the_stack_and_beside_offsets() {
+        // Depth two: a column of two rows, the second row taller than
+        // the first and narrower.
+        let root = LayoutNode::Column(vec![
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(0)),
+                LayoutNode::Pane(SourceId(1)),
+            ]),
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(2)),
+                LayoutNode::Pane(SourceId(3)),
+            ]),
+        ]);
+        let sizes = [(4, 10), (4, 20), (6, 12), (6, 8)];
+        let mut rects = vec![PaneRect::default(); 4];
+        let (rows, cols) = pane_rects(&root, &sizes, 2, 1, (0, 0), &mut rects);
+        assert_eq!(
+            rects[0],
+            PaneRect {
+                row: 0,
+                col: 0,
+                rows: 4,
+                cols: 10
+            }
+        );
+        // Past the first pane's cells plus the gap.
+        assert_eq!(
+            rects[1],
+            PaneRect {
+                row: 0,
+                col: 12,
+                rows: 4,
+                cols: 20
+            }
+        );
+        // One blank row below the first row's height.
+        assert_eq!(
+            rects[2],
+            PaneRect {
+                row: 5,
+                col: 0,
+                rows: 6,
+                cols: 12
+            }
+        );
+        assert_eq!(
+            rects[3],
+            PaneRect {
+                row: 5,
+                col: 14,
+                rows: 6,
+                cols: 8
+            }
+        );
+        // A column is as wide as its widest row and as tall as the sum
+        // of its rows plus the gaps between them.
+        assert_eq!((rows, cols), (11, 32));
+    }
+
+    #[test]
+    fn a_collapsed_size_shortens_the_column_it_sits_in() {
+        // The caller decides what a collapsed pane measures; the walk
+        // only places what it is handed, which is what keeps this
+        // function out of PaneGeometry.
+        let root = LayoutNode::Column(vec![
+            LayoutNode::Pane(SourceId(0)),
+            LayoutNode::Pane(SourceId(1)),
+        ]);
+        let mut rects = vec![PaneRect::default(); 2];
+        assert_eq!(
+            pane_rects(&root, &[(5, 30), (5, 30)], 0, 0, (0, 0), &mut rects),
+            (10, 30)
+        );
+        assert_eq!(rects[1].row, 5);
+        assert_eq!(
+            pane_rects(&root, &[(1, 30), (5, 30)], 0, 0, (0, 0), &mut rects),
+            (6, 30)
+        );
+        assert_eq!(rects[1].row, 1);
+    }
+
+    #[test]
+    fn the_walk_reports_the_dimensions_compose_panes_produces() {
+        // The walk restates stack/beside's offset rules, so the
+        // composition itself is the standing witness for the restatement.
+        let tall = pane(6, BorderPreset::None, Sides::default(), false);
+        let short = pane(4, BorderPreset::Normal, Sides::default(), false);
+        let render = |p: &PaneBox, cells: u16| {
+            render_pane(
+                &lines(&["x"]),
+                &[LineMark::default()],
+                p,
+                geom(p, cells),
+                &chrome(None),
+                &palette(),
+                ColorProfile::Ascii,
+            )
+        };
+        let blocks = vec![render(&tall, 20), render(&short, 12)];
+        let sizes: Vec<(usize, usize)> = blocks
+            .iter()
+            .map(|b| {
+                (
+                    b.lines.len(),
+                    b.lines.iter().map(|l| display_width(l)).max().unwrap_or(0),
+                )
+            })
+            .collect();
+        let root = LayoutNode::Row(vec![
+            LayoutNode::Pane(SourceId(0)),
+            LayoutNode::Pane(SourceId(1)),
+        ]);
+        let mut rects = vec![PaneRect::default(); 2];
+        let (rows, cols) = pane_rects(&root, &sizes, 1, 0, (0, 0), &mut rects);
+        let composed = compose_panes(&root, &blocks, 1, 0);
+        assert_eq!(rows, composed.lines.len());
+        assert_eq!(
+            cols,
+            composed
+                .lines
+                .iter()
+                .map(|l| display_width(l))
+                .max()
+                .unwrap_or(0)
+        );
+        assert_eq!(rects[1].col, 21, "past 20 cells and the gap");
+
+        // The origin is what a dashboard title row costs: one line is
+        // inserted above the composition, so every rect moves down one.
+        let mut shifted = vec![PaneRect::default(); 2];
+        pane_rects(&root, &sizes, 1, 0, (1, 0), &mut shifted);
+        assert_eq!(shifted[0].row, 1);
+        assert_eq!(shifted[1].row, 1);
+    }
+
+    #[test]
+    fn pane_order_flattens_in_declaration_order() {
+        let root = LayoutNode::Column(vec![
+            LayoutNode::Row(vec![
+                LayoutNode::Pane(SourceId(2)),
+                LayoutNode::Pane(SourceId(0)),
+            ]),
+            LayoutNode::Pane(SourceId(1)),
+        ]);
+        // The tree's order, never the id's: rows left to right, columns
+        // top to bottom.
+        assert_eq!(
+            pane_order(&root),
+            vec![SourceId(2), SourceId(0), SourceId(1)]
+        );
+        assert!(pane_order(&LayoutNode::Row(Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn an_out_of_range_pane_places_nothing_and_panics_at_nothing() {
+        // Validation is the registry's job: a layout the sizes do not
+        // cover walks to zero, the way compose_panes composes empty.
+        let mut rects = vec![PaneRect::default(); 1];
+        assert_eq!(
+            pane_rects(
+                &LayoutNode::Pane(SourceId(9)),
+                &[(4, 10)],
+                1,
+                1,
+                (0, 0),
+                &mut rects
+            ),
+            (0, 0)
+        );
+        assert_eq!(rects[0], PaneRect::default());
     }
 }
