@@ -97,6 +97,31 @@ pub fn display_width(s: &str) -> usize {
         .sum()
 }
 
+/// Expand horizontal tabs to spaces at terminal tab stops while preserving
+/// escape sequences. Fixed-layout surfaces must do this before width math:
+/// terminals expand a tab from the current screen column, which can carry a
+/// pane's content through its border and make repaint row counts untrustworthy.
+pub fn expand_tabs(s: &str, tab_stop: usize) -> String {
+    let tab_stop = tab_stop.max(1);
+    let mut expanded = String::with_capacity(s.len());
+    let mut column = 0usize;
+    for chunk in chunks(s) {
+        match chunk {
+            Chunk::Escape(escape) => expanded.push_str(escape),
+            Chunk::Text("\t", _) => {
+                let spaces = tab_stop - column % tab_stop;
+                expanded.push_str(&" ".repeat(spaces));
+                column += spaces;
+            }
+            Chunk::Text(text, width) => {
+                expanded.push_str(text);
+                column += width;
+            }
+        }
+    }
+    expanded
+}
+
 /// Split at the last position fitting in `max` display cells. Escape
 /// sequences never straddle the split and trailing zero-width escapes stay
 /// with the head; a wide character that would straddle goes to the tail.
@@ -373,6 +398,16 @@ fn skip_leading_spaces(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tabs_expand_at_terminal_stops_without_counting_escapes() {
+        assert_eq!(expand_tabs("a\tb", 8), "a       b");
+        assert_eq!(expand_tabs("12345678\tb", 8), "12345678        b");
+        assert_eq!(
+            expand_tabs("\x1b[31ma\tb\x1b[0m", 8),
+            "\x1b[31ma       b\x1b[0m"
+        );
+    }
 
     #[test]
     fn display_width_ignores_escapes() {

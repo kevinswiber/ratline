@@ -57,6 +57,34 @@ pane "right" {{
 }
 
 #[test]
+fn a_dashboard_expands_child_tabs_before_boxing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = dir.path().join("tabbed");
+    std::fs::write(&output, "completed\tsuccess\ttest").expect("write tabbed output");
+    let file = fixture(
+        dir.path(),
+        "tabbed.kdl",
+        &format!(
+            r#"
+defaults height=1 chrome=#false border="none" padding="0" width="32"
+
+pane "ci" {{
+    command "{bin}" "__cat" "{output}"
+}}
+"#,
+            bin = rat_bin().replace('\\', "\\\\"),
+            output = output.display().to_string().replace('\\', "\\\\"),
+        ),
+    );
+    rat()
+        .env("NO_COLOR", "1")
+        .args(["dashboard", &file, "--once"])
+        .assert()
+        .success()
+        .stdout("completed       success test    \n");
+}
+
+#[test]
 fn a_pane_child_is_told_its_inner_geometry() {
     // A Cells pane with no border and no padding has an inner width
     // equal to its declared cells, whatever the terminal is — so the

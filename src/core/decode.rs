@@ -5,6 +5,8 @@
 //! gate's signatures hash bytes upstream of this module — decoding here
 //! changes what a frame SHOWS, never what rat captured.
 
+const TAB_STOP: usize = 8;
+
 /// A captured stream as frame lines: trailing newlines stripped,
 /// interior blanks kept, each line decoded independently.
 ///
@@ -16,7 +18,10 @@
 /// never a UTF-8 continuation byte.
 #[cfg(unix)]
 pub fn stream_lines(bytes: &[u8]) -> Vec<String> {
-    pieces(bytes).map(decode_line).collect()
+    pieces(bytes)
+        .map(decode_line)
+        .map(|line| crate::core::measure::expand_tabs(&line, TAB_STOP))
+        .collect()
 }
 
 /// On Windows a console child writes its pipe in the CONSOLE codepage
@@ -54,6 +59,7 @@ fn decode_line(line: &[u8]) -> String {
 fn stream_lines_at(bytes: &[u8], codepage: u32) -> Vec<String> {
     pieces(bytes)
         .map(|line| decode_line_at(line, codepage))
+        .map(|line| crate::core::measure::expand_tabs(&line, TAB_STOP))
         .collect()
 }
 
@@ -158,6 +164,14 @@ mod tests {
         assert_eq!(
             stream_lines("grüße\n".as_bytes()),
             vec!["grüße".to_string()]
+        );
+    }
+
+    #[test]
+    fn tabs_become_geometry_safe_spaces() {
+        assert_eq!(
+            stream_lines(b"completed\tsuccess\ttest\n"),
+            vec!["completed       success test".to_string()]
         );
     }
 
