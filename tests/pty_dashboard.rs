@@ -3171,3 +3171,116 @@ fn a_second_panes_zoom_never_discards_the_firsts_respawn() {
         "the dashboard should have exited on q"
     );
 }
+
+/// A resize while zoomed: the zoomed pane repaints at the NEW width from
+/// retained output (no child could have produced it yet), the zoom
+/// survives, and the resize's own whole-board respawn still reaches the
+/// pane that is not even on screen.
+#[test]
+fn a_resize_while_zoomed_tracks_the_terminal_and_keeps_the_zoom() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\tz");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &["─".repeat(60).as_bytes(), b"left-1"],
+        Duration::from_secs(5),
+    );
+
+    session.set_winsize(24, 120);
+    // A 100-dash run is unreachable at 80 columns, zoomed or not: this
+    // is the zoomed box at the new width, and `left-1` beside it in ONE
+    // capture is the retained body being re-clipped, not a re-run. The
+    // debounced respawn-all then paints `left-2` zoomed at the new
+    // width — the screen needle that keeps the master drained while the
+    // HIDDEN pane's own respawn lands in its file.
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &["─".repeat(100).as_bytes(), b"left-1", b"left-2"],
+        Duration::from_secs(5),
+    );
+    let at = position(&seen, "─".repeat(100).as_bytes()).expect("the widened zoom");
+    assert!(
+        position(&seen[at..], b"right-1").is_none(),
+        "the resize must not have unzoomed"
+    );
+
+    // The hidden pane is not exempt from a REAL resize (that is what a
+    // resize means): the debounced respawn-all reaches it.
+    wait_for_counter(&right, 2);
+
+    // Unzoom lands the declared layout at the NEW size.
+    session.write_bytes(b"z");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &["─".repeat(45).as_bytes(), b"right-"],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// `D` while zoomed reflows the zoomed box by the gutter's two columns
+/// and keeps the zoom — one derivation, both view states.
+#[test]
+fn the_gutter_toggle_reflows_a_zoomed_pane_without_restarting_anything() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\tz");
+    // The zoom itself respawns the zoomed batch pane exactly once (its
+    // honest-width run paints `left-2` zoomed) — ONE drained capture.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &["─".repeat(60).as_bytes(), b"left-1", b"left-2"],
+        Duration::from_secs(5),
+    );
+
+    session.write_bytes(b"D");
+    // The gutter margin lands before the border's SGR escape, so the
+    // contiguous needle is the row separator plus the two-space margin
+    // — the shipped gutter test's needle.
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\r\n  ", "─".repeat(60).as_bytes()],
+        Duration::from_secs(5),
+    );
+    let at = position(&seen, "─".repeat(60).as_bytes()).expect("the reflowed zoom");
+    assert!(position(&seen[at..], b"right-1").is_none(), "still zoomed");
+
+    // Past the debounce: a view toggle that read as a resize would have
+    // restarted every child, including the one that was never zoomed.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    assert_counter_settled_at(&right, 1);
+    assert_counter_settled_at(&left, 2);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}

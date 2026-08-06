@@ -4158,8 +4158,10 @@ struct ResizeStep {
 /// The resize arm's detection: advance the geometry pair from a fresh
 /// measure and report what moved. The arm's reflow keys off
 /// `size_moved`; the respawn is owed only when a pane's INNER geometry
-/// moved — that is the child's environment, and a terminal that only
-/// grew rows changes the window, not any child's world.
+/// moved — that is the child's environment. Declared heights are
+/// pinned, so a terminal that only grew rows changes the window and no
+/// child's world — EXCEPT under a zoom, whose row budget is
+/// `window_rows` and genuinely follows the terminal.
 fn detect_resize(
     measured: (u16, u16),
     max_height: Option<u16>,
@@ -7685,6 +7687,113 @@ mod tests {
         assert!(
             moved.geom_moved,
             "the same geom under a different view MUST move"
+        );
+    }
+
+    #[test]
+    fn a_resize_while_zoomed_re_derives_every_pane_then_overrides() {
+        let registry = zoom_row_registry();
+        let panes = view_zooming(&registry, Some(SourceId(0)));
+        let mut size = (80u16, 24u16);
+        let mut geom = derive_geometry(&registry, size, None, false, &panes);
+
+        let step = detect_resize(
+            (120, 40),
+            None,
+            false,
+            &panes,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
+        assert!(step.size_moved && step.geom_moved);
+        // The zoomed pane tracks the new terminal, both axes.
+        assert_eq!(geom[0].cells, 120);
+        assert_eq!(geom[0].rows, 38);
+        // The HIDDEN pane is exactly what an unzoomed derivation at the new
+        // size gives it — never stale, never skipped (q5's Zellij bug,
+        // stated positively).
+        let declared = derive_geometry(
+            &registry,
+            (120, 40),
+            None,
+            false,
+            &view_zooming(&registry, None),
+        );
+        assert_eq!(geom[1], declared[1]);
+        // …and the zoom survived the resize.
+        let after = detect_resize(
+            (120, 40),
+            None,
+            false,
+            &panes,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
+        assert!(
+            !after.geom_moved,
+            "the settled frame re-derives equal (INV-1)"
+        );
+    }
+
+    #[test]
+    fn a_rows_only_resize_moves_the_geometry_only_while_zoomed() {
+        let registry = zoom_row_registry();
+        let mut size = (80u16, 24u16);
+
+        // Unzoomed, this is today's shipped behavior: declared heights are
+        // pinned, so more rows change the window and no child's world.
+        let flat = view_zooming(&registry, None);
+        let mut geom = derive_geometry(&registry, size, None, false, &flat);
+        let step = detect_resize(
+            (80, 40),
+            None,
+            false,
+            &flat,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
+        assert!(step.size_moved && !step.geom_moved);
+
+        // Zoomed, the row budget IS the zoomed pane's height, so a
+        // rows-only resize genuinely moves its inner geometry — and the
+        // resize arm's debounced respawn-all is owed, as for any other
+        // geometry change.
+        let mut size = (80u16, 24u16);
+        let panes = view_zooming(&registry, Some(SourceId(0)));
+        let mut geom = derive_geometry(&registry, size, None, false, &panes);
+        let step = detect_resize(
+            (80, 40),
+            None,
+            false,
+            &panes,
+            &mut size,
+            &mut geom,
+            &registry,
+        );
+        assert!(step.geom_moved, "the zoomed pane's rows follow window_rows");
+        assert_eq!(geom[0].rows, 38);
+    }
+
+    #[test]
+    fn the_gutter_toggle_keeps_the_zoom_and_stays_off_the_gate() {
+        let registry = zoom_row_registry();
+        let panes = view_zooming(&registry, Some(SourceId(0)));
+        let mut size = (80u16, 24u16);
+        // What the gutter arm now computes (1.4 moved this line onto
+        // derive_geometry; this test is the witness that it passes the view).
+        let mut geom = derive_geometry(&registry, size, None, true, &panes);
+        assert_eq!(
+            geom[0].cells,
+            80 - gutter_reserve(true),
+            "still zoomed, two columns lighter"
+        );
+        let step = detect_resize(size, None, true, &panes, &mut size, &mut geom, &registry);
+        assert!(
+            !step.geom_moved,
+            "a view toggle under a zoom must still compare equal, or every child restarts"
         );
     }
 
