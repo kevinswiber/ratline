@@ -104,11 +104,13 @@ impl TapScanner {
 
             if self.buf.len() == 2 {
                 if !matches!(self.buf[1], b'[' | b']' | b'O') {
-                    // Not a recognized introducer: the leading ESC was not
-                    // the start of a sequence this scanner understands.
-                    // Drop it and reprocess this byte as an ordinary one.
+                    // Not a recognized introducer: the leading ESC was
+                    // either a meta prefix or a keypress this byte
+                    // cancelled. Drop it and decode the byte — as a
+                    // meta key where that spelling exists, else as the
+                    // ordinary one.
                     self.buf.clear();
-                    if let Some(key) = decode_key(byte) {
+                    if let Some(key) = decode_meta(byte).or_else(|| decode_key(byte)) {
                         events.push(TapEvent::Key(key));
                     }
                 }
@@ -183,14 +185,26 @@ impl Default for TapScanner {
     }
 }
 
-/// 0x03 → CtrlC; b'\r' | b'\n' → Enter; printable ASCII (0x20..=0x7e) →
-/// Char; everything else → None. What a key *means* is the consumer's
-/// business — the scanner only decodes.
+/// 0x03 → CtrlC; 0x09 → Tab; b'\r' | b'\n' → Enter; 0x20 → Space;
+/// printable ASCII (0x21..=0x7e) → Char; everything else → None. What a
+/// key *means* is the consumer's business — the scanner only decodes.
 pub fn decode_key(byte: u8) -> Option<Key> {
     match byte {
         0x03 => Some(Key::CtrlC),
+        0x09 => Some(Key::Tab),
         b'\r' | b'\n' => Some(Key::Enter),
-        0x20..=0x7e => Some(Key::Char(byte as char)),
+        0x20 => Some(Key::Space),
+        0x21..=0x7e => Some(Key::Char(byte as char)),
+        _ => None,
+    }
+}
+
+/// ESC followed by one printable: the meta encoding a terminal sends
+/// for an ALT-modified key. 0x20 is excluded — `Alt(' ')` is not a
+/// thing, so an escape and a space stay a space.
+pub fn decode_meta(byte: u8) -> Option<Key> {
+    match byte {
+        0x21..=0x7e => Some(Key::Alt(byte as char)),
         _ => None,
     }
 }
@@ -233,7 +247,7 @@ pub fn parse_sgr_mouse(seq: &[u8]) -> Option<MouseEvent> {
     })
 }
 
-/// Exact matches only: ESC [ A/B/C/D, ESC [ H/F, ESC [ 1~/4~/7~/8~,
+/// Exact matches only: ESC [ A/B/C/D, ESC [ H/F, ESC [ Z, ESC [ 1~/4~/7~/8~,
 /// ESC [ 5~/6~. A private or parameterized run is never a key.
 pub fn decode_csi(seq: &[u8]) -> Option<Key> {
     match seq {
@@ -243,6 +257,7 @@ pub fn decode_csi(seq: &[u8]) -> Option<Key> {
         b"\x1b[D" => Some(Key::Left),
         b"\x1b[H" | b"\x1b[1~" | b"\x1b[7~" => Some(Key::Home),
         b"\x1b[F" | b"\x1b[4~" | b"\x1b[8~" => Some(Key::End),
+        b"\x1b[Z" => Some(Key::BackTab),
         b"\x1b[5~" => Some(Key::PageUp),
         b"\x1b[6~" => Some(Key::PageDown),
         _ => None,
@@ -709,10 +724,44 @@ mod tests {
     }
 
     #[test]
+    fn the_pane_gesture_keys_decode_through_the_scanner() {
+        // The exact bytes a terminal sends. None of the three reached a
+        // Key before: 0x09 had no arm, ESC [ Z had no arm, and 0x20
+        // decoded as Char(' ').
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\t"), vec![TapEvent::Key(Key::Tab)]);
+        assert_eq!(scanner.feed(b"\x1b[Z"), vec![TapEvent::Key(Key::BackTab)]);
+        assert_eq!(scanner.feed(b" "), vec![TapEvent::Key(Key::Space)]);
+    }
+
+    #[test]
+    fn an_escape_and_a_printable_are_the_meta_encoding() {
+        let mut scanner = TapScanner::new();
+        for (bytes, c) in [
+            (&b"\x1bh"[..], 'h'),
+            (&b"\x1bj"[..], 'j'),
+            (&b"\x1bk"[..], 'k'),
+            (&b"\x1bl"[..], 'l'),
+        ] {
+            assert_eq!(scanner.feed(bytes), vec![TapEvent::Key(Key::Alt(c))]);
+        }
+    }
+
+    #[test]
+    fn an_escape_then_a_space_is_not_an_alt_key() {
+        // Alt(' ') is not a thing: the space keeps its own spelling, so
+        // a bare escape followed by a space still reads as the space.
+        let mut scanner = TapScanner::new();
+        assert_eq!(scanner.feed(b"\x1b "), vec![TapEvent::Key(Key::Space)]);
+    }
+
+    #[test]
     fn a_lone_escape_with_no_recognized_introducer_does_not_eat_the_next_byte() {
+        // The byte still produces an event; it now carries the escape
+        // that preceded it instead of arriving bare.
         let mut scanner = TapScanner::new();
         assert_eq!(scanner.feed(b"\x1b"), vec![]);
-        assert_eq!(scanner.feed(b"q"), vec![TapEvent::Key(Key::Char('q'))]);
+        assert_eq!(scanner.feed(b"q"), vec![TapEvent::Key(Key::Alt('q'))]);
     }
 
     #[test]
@@ -740,9 +789,9 @@ mod tests {
     }
 
     #[test]
-    fn an_escape_followed_by_a_plain_byte_keeps_todays_behavior() {
+    fn an_escape_followed_by_a_plain_byte_is_the_meta_encoding() {
         let mut scanner = TapScanner::new();
-        assert_eq!(scanner.feed(b"\x1bq"), vec![TapEvent::Key(Key::Char('q'))]);
+        assert_eq!(scanner.feed(b"\x1bq"), vec![TapEvent::Key(Key::Alt('q'))]);
     }
 
     #[test]
@@ -757,10 +806,12 @@ mod tests {
     }
 
     #[test]
-    fn decode_key_maps_the_five_recognized_bytes() {
+    fn decode_key_maps_the_bytes_it_recognizes() {
         assert_eq!(decode_key(0x03), Some(Key::CtrlC));
+        assert_eq!(decode_key(0x09), Some(Key::Tab));
         assert_eq!(decode_key(b'\r'), Some(Key::Enter));
         assert_eq!(decode_key(b'\n'), Some(Key::Enter));
+        assert_eq!(decode_key(b' '), Some(Key::Space));
         assert_eq!(decode_key(b'q'), Some(Key::Char('q')));
         assert_eq!(decode_key(b'v'), Some(Key::Char('v')));
     }
