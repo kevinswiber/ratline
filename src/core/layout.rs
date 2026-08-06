@@ -406,11 +406,84 @@ fn beside(parts: &[PaneBlock], gap: usize) -> PaneBlock {
 /// `CrashLoopBackOff` is confident over a mechanism that only counts.
 /// The hedging belongs where there is room for it — a notice row and
 /// the key reference — never in a nine-cell badge.
-fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> String {
+/// A collapsed pane: EXACTLY one line of `geom.cells` display cells —
+/// the pane's name on the left, the chrome row's facts on the right.
+/// No body is composed, because collapse hides output rather than
+/// shrinking it: nothing here reads `output`, `marks`, or `overflow`,
+/// and the pane's `PaneGeometry` arrives unchanged and leaves unused
+/// past its width.
+///
+/// The name is unconditional. A bordered pane's title rides a border
+/// this row has no room for, so this is the one place a collapsed pane
+/// says what it is — and a row the user cannot name is a row they
+/// cannot act on. The facts follow the pane's own `chrome`
+/// declaration: `chrome = #false` asked never to see the cadence row,
+/// and a collapsed row is not the place to overrule it.
+// Staged: the collapse gesture's compose branch is the consumer; the
+// allow leaves with it.
+#[allow(dead_code)]
+pub fn render_pane_collapsed(
+    pane: &PaneBox,
+    geom: PaneGeometry,
+    chrome: &PaneChrome<'_>,
+    palette: &Palette,
+    profile: ColorProfile,
+) -> PaneBlock {
+    let cols = geom.cells as usize;
+    let name_style = if chrome.focused {
+        StyleSpec {
+            bold: true,
+            foreground: Some(palette.accent),
+            ..StyleSpec::default()
+        }
+    } else {
+        StyleSpec::default()
+    };
+    let name = truncate_display(chrome.title, cols, ELLIPSIS);
+    // The name takes the row first and keeps one separating cell;
+    // whatever is left is the facts' budget, so a narrow row loses the
+    // facts' tail — the rule chrome_row already truncates by.
+    let budget = cols.saturating_sub(display_width(&name) + 1);
+    let facts = if pane.chrome {
+        truncate_display(&chrome_facts(chrome), budget, ELLIPSIS)
+    } else {
+        String::new()
+    };
+    let faint = StyleSpec {
+        faint: true,
+        ..StyleSpec::default()
+    };
+    // Measured before styling, padded after: escapes are zero cells, so
+    // the pad lands on the same column either way — the idiom
+    // `chrome_row` already uses.
+    let left = pad_display(
+        &name_style.render(&name, profile),
+        cols - display_width(&facts),
+        Align::Left,
+    );
+    PaneBlock {
+        lines: vec![format!("{left}{}", faint.render(&facts, profile))],
+        // One line, one mark. `stack`/`beside` push lines and marks in
+        // lockstep and a block that arrives short slides every mark
+        // below it.
+        marks: vec![LineMark::default()],
+    }
+}
+
+/// `{cadence} · {stamp}` plus the badges the pane currently carries —
+/// the shared core of the chrome row and the collapsed row. The scroll
+/// and `zoomed` badges stay at `chrome_row`'s own site: a collapsed row
+/// must not advertise a viewport it is not showing.
+fn chrome_facts(chrome: &PaneChrome<'_>) -> String {
     let mut text = format!("{} · {}", chrome.cadence, chrome.stamp);
     push_badge(&mut text, chrome.failure);
     push_badge(&mut text, chrome.looping.then_some("looping"));
     push_badge(&mut text, chrome.truncated);
+    text
+}
+
+fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> String {
+    let mut text = chrome_facts(chrome);
     push_badge(&mut text, chrome.scrolled);
     push_badge(&mut text, chrome.zoomed.then_some("zoomed"));
     let faint = StyleSpec {
@@ -1518,5 +1591,229 @@ mod tests {
             !plain.lines.iter().any(|l| l.contains("zoomed")),
             "no badge when the pane is not zoomed"
         );
+    }
+
+    #[test]
+    fn a_collapsed_pane_is_exactly_one_row_of_its_declared_width() {
+        // Seven declared rows, one rendered: the box is not drawn at all —
+        // a 1-row bordered box is inexpressible, so the row is composed
+        // directly.
+        let boxed = pane(7, BorderPreset::Normal, sides(0, 1, 0, 1), true);
+        let block = render_pane_collapsed(
+            &boxed,
+            geom(&boxed, 30),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines.len(), 1);
+        assert_eq!(display_width(&block.lines[0]), 30, "{:?}", block.lines[0]);
+        // Lines and marks in lockstep: a block that arrives short slides
+        // every mark below it in the composed frame.
+        assert_eq!(block.marks, vec![LineMark::default()]);
+        // The name rides the left edge, the facts the right.
+        assert!(
+            block.lines[0].starts_with("plan"),
+            "got {:?}",
+            block.lines[0]
+        );
+        assert!(
+            block.lines[0].ends_with("every 5s · 12:04:31"),
+            "got {:?}",
+            block.lines[0]
+        );
+    }
+
+    #[test]
+    fn a_collapsed_row_carries_every_badge_the_chrome_row_would_have() {
+        let bare = pane(4, BorderPreset::None, Sides::default(), true);
+        let block = render_pane_collapsed(
+            &bare,
+            geom(&bare, 70),
+            &PaneChrome {
+                looping: true,
+                truncated: Some("90 lines dropped"),
+                ..chrome(Some("exit 3"))
+            },
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert!(
+            block.lines[0].contains("every 5s · 12:04:31 · exit 3 · looping · 90 lines dropped"),
+            "got {:?}",
+            block.lines[0]
+        );
+    }
+
+    #[test]
+    fn a_narrow_collapsed_row_loses_the_facts_before_the_name() {
+        // The same append-and-truncate-tail rule chrome_row obeys, applied
+        // to a row that also has to hold a name: the name is what the next
+        // keystroke acts on, so it is the last thing to go.
+        let bare = pane(4, BorderPreset::None, Sides::default(), true);
+        for cells in [30u16, 12, 6, 4, 2, 1] {
+            let block = render_pane_collapsed(
+                &bare,
+                geom(&bare, cells),
+                &chrome(None),
+                &palette(),
+                ColorProfile::Ascii,
+            );
+            assert_eq!(block.lines.len(), 1, "at {cells} cells");
+            assert_eq!(
+                display_width(&block.lines[0]),
+                cells as usize,
+                "ragged row at {cells} cells: {:?}",
+                block.lines[0]
+            );
+        }
+        let narrow = render_pane_collapsed(
+            &bare,
+            geom(&bare, 12),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(narrow.lines[0], "plan every …");
+        let tiny = render_pane_collapsed(
+            &bare,
+            geom(&bare, 4),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(tiny.lines[0], "plan", "no room for facts, still a name");
+    }
+
+    #[test]
+    fn a_chrome_less_pane_collapses_to_its_name_alone() {
+        // `chrome = #false` asked never to see the cadence row; collapse
+        // must not smuggle it in. The badges inherit the hole they already
+        // have on an expanded chrome-less pane
+        // (`a_pane_with_no_chrome_row_renders_no_badge_and_does_not_panic`),
+        // which is why D5 puts a chrome-less pane's position on the FOOTER.
+        let bare = pane(4, BorderPreset::None, Sides::default(), false);
+        let block = render_pane_collapsed(
+            &bare,
+            geom(&bare, 20),
+            &PaneChrome {
+                looping: true,
+                ..chrome(Some("exit 3"))
+            },
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert_eq!(block.lines[0], format!("plan{}", " ".repeat(16)));
+        assert!(
+            !block.lines[0].contains("every"),
+            "no cadence on a chrome-less pane"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_pane_shortens_the_column_by_the_rows_it_hides() {
+        // Column collapse shortens the composed frame; nothing is
+        // redistributed (INV-8).
+        let bare = pane(5, BorderPreset::None, Sides::default(), false);
+        let body = lines(&["r1", "r2", "r3", "r4", "r5"]);
+        let expanded = render_at_rest(
+            &body,
+            &vec![LineMark::default(); 5],
+            &bare,
+            geom(&bare, 10),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let collapsed = render_pane_collapsed(
+            &bare,
+            geom(&bare, 10),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let both = compose_panes(&column(2), &[expanded.clone(), expanded.clone()], 1, 1);
+        let one = compose_panes(&column(2), &[collapsed, expanded], 1, 1);
+        assert_eq!(
+            both.lines.len() - one.lines.len(),
+            4,
+            "5 declared rows, 1 rendered"
+        );
+        assert_eq!(one.marks.len(), one.lines.len());
+    }
+
+    #[test]
+    fn a_collapsed_pane_in_a_row_frees_nothing_and_leaves_blanks() {
+        // Row collapse frees nothing: `beside` takes the row's max height
+        // and pads the short part's missing rows to blanks (grounding §8).
+        let bare = pane(5, BorderPreset::None, Sides::default(), false);
+        let expanded = render_at_rest(
+            &lines(&["r1", "r2", "r3", "r4", "r5"]),
+            &vec![LineMark::default(); 5],
+            &bare,
+            geom(&bare, 10),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let collapsed = render_pane_collapsed(
+            &bare,
+            geom(&bare, 10),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let composed = compose_panes(&row(2), &[collapsed, expanded], 1, 0);
+        assert_eq!(
+            composed.lines.len(),
+            5,
+            "the row keeps its tallest pane's height"
+        );
+        assert!(
+            composed.lines[1].starts_with(&" ".repeat(11)),
+            "the collapsed pane's missing rows are blanks: {:?}",
+            composed.lines[1]
+        );
+        assert!(composed.lines[1].contains("r2"), "the sibling is untouched");
+    }
+
+    #[test]
+    fn a_focused_collapsed_row_wears_the_accent_without_spending_a_cell() {
+        // The focused restyle reaches the collapsed row too — the border it
+        // would otherwise have restyled is not drawn here (the BoxSpec
+        // restyle lives in `render_pane`; this row has no box).
+        let bare = pane(4, BorderPreset::None, Sides::default(), true);
+        let accent = StyleSpec {
+            bold: true,
+            foreground: Some(palette().accent),
+            ..StyleSpec::default()
+        };
+        let expected = accent.render("plan", ColorProfile::TrueColor);
+        let focused = render_pane_collapsed(
+            &bare,
+            geom(&bare, 30),
+            &PaneChrome {
+                focused: true,
+                ..chrome(None)
+            },
+            &palette(),
+            ColorProfile::TrueColor,
+        );
+        let plain = render_pane_collapsed(
+            &bare,
+            geom(&bare, 30),
+            &chrome(None),
+            &palette(),
+            ColorProfile::TrueColor,
+        );
+        assert!(
+            focused.lines[0].contains(&expected),
+            "got {:?}",
+            focused.lines[0]
+        );
+        assert!(!plain.lines[0].contains(&expected));
+        // Escapes are zero display cells: focus never costs the row a cell.
+        assert_eq!(display_width(&focused.lines[0]), 30);
+        assert_eq!(display_width(&plain.lines[0]), 30);
     }
 }
