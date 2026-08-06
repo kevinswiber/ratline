@@ -3284,3 +3284,70 @@ fn the_gutter_toggle_reflows_a_zoomed_pane_without_restarting_anything() {
         "the dashboard should have exited on q"
     );
 }
+
+/// D7: the zoomed pane keeps its own viewport. `j` scrolls INSIDE the
+/// zoomed frame, and the badge says which pane is filling the screen.
+#[test]
+fn a_zoomed_pane_scrolls_its_own_body_and_wears_the_badge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tall = "i=1; while [ $i -le 60 ]; do echo r$i-x; i=$((i+1)); done";
+    let decl = write_dashboard(
+        dir.path(),
+        &board(
+            "    height 5\n    border \"rounded\"\n    shell #true",
+            &[("tall", "1h", tall), ("other", "1h", "printf zzz")],
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"zzz", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // Zoom: 19 inner rows instead of 2, so `r19-x` is a row the declared
+    // box could never have shown — that is the positive control here
+    // (both panes are full width in a column, so a wide border would
+    // not discriminate). The badge rides the same capture, after the
+    // body, on the chrome row.
+    session.write_bytes(b"\tz");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"r19-x", b"zoomed"],
+        Duration::from_secs(5),
+    );
+    let at = position(&seen, b"r19-x").expect("the zoomed viewport");
+    assert!(
+        position(&seen[at..], b"zzz").is_none(),
+        "the hidden pane is not composed while zoomed"
+    );
+    assert!(
+        position(&seen, b"r20-x").is_none(),
+        "the viewport is 19 rows, not the whole body"
+    );
+
+    // `j` with a focused pane steps THAT pane's viewport (INV-7); the
+    // focused pane is the zoomed one, so the zoomed frame scrolls.
+    session.write_bytes(b"j");
+    wait_for_in_order(&session, &mut terminal, &[b"r20-x"], Duration::from_secs(5));
+
+    // Unzoom: the other pane comes back (the positive control — an
+    // absence assertion alone would also pass on a frame nobody
+    // repainted) and the badge is gone with the zoom.
+    session.write_bytes(b"z");
+    let back = wait_for_in_order(&session, &mut terminal, &[b"zzz"], Duration::from_secs(5));
+    let at = position(&back, b"zzz").expect("the restored neighbour");
+    assert!(
+        position(&back[at..], b"zoomed").is_none(),
+        "the badge outlived the zoom: {:?}",
+        String::from_utf8_lossy(&back[at..])
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}

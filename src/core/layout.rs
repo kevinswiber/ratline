@@ -54,6 +54,10 @@ pub struct PaneChrome<'a> {
     /// focused pane gets: the border recolors and costs no display
     /// cell, which is why a borderless pane needs the footer too.
     pub focused: bool,
+    /// This pane is currently filling the frame. LAST of the badges:
+    /// the ones before it are conditions the pane is in, this one is
+    /// what the reader did.
+    pub zoomed: bool,
 }
 
 /// The viewport a pane's declared `Overflow` asks for: how many leading
@@ -408,6 +412,7 @@ fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> St
     push_badge(&mut text, chrome.looping.then_some("looping"));
     push_badge(&mut text, chrome.truncated);
     push_badge(&mut text, chrome.scrolled);
+    push_badge(&mut text, chrome.zoomed.then_some("zoomed"));
     let faint = StyleSpec {
         faint: true,
         ..StyleSpec::default()
@@ -476,6 +481,7 @@ mod tests {
             truncated: None,
             scrolled: None,
             focused: false,
+            zoomed: false,
         }
     }
 
@@ -1465,5 +1471,52 @@ mod tests {
             "the cadence and the stamp survive: {narrow:?}"
         );
         assert_eq!(display_width(&narrow), 37, "and the row still fits");
+    }
+
+    #[test]
+    fn a_zoomed_pane_says_so_last_in_its_chrome_row() {
+        let pane = pane(5, BorderPreset::Rounded, sides(0, 0, 0, 0), true);
+        let mut chrome = chrome(Some("exit 3"));
+        chrome.looping = true;
+        chrome.truncated = Some("2 lines dropped");
+        chrome.zoomed = true;
+        // Wide enough that no badge is truncated from the right.
+        let block = render_pane(
+            &lines(&["body"]),
+            &[],
+            &pane,
+            geom(&pane, 90),
+            0,
+            &chrome,
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        let row = block
+            .lines
+            .iter()
+            .find(|l| l.contains("zoomed"))
+            .expect("the chrome row carries the badge");
+        let at = row.find("zoomed").expect("badge");
+        for earlier in ["every 5s", "exit 3", "looping", "2 lines dropped"] {
+            assert!(
+                row.find(earlier).expect(earlier) < at,
+                "`zoomed` is the last badge: {row:?}"
+            );
+        }
+        chrome.zoomed = false;
+        let plain = render_pane(
+            &lines(&["body"]),
+            &[],
+            &pane,
+            geom(&pane, 90),
+            0,
+            &chrome,
+            &palette(),
+            ColorProfile::Ascii,
+        );
+        assert!(
+            !plain.lines.iter().any(|l| l.contains("zoomed")),
+            "no badge when the pane is not zoomed"
+        );
     }
 }

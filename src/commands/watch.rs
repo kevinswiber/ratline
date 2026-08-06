@@ -2053,6 +2053,9 @@ pub(crate) fn run_registry(
                             // Both directions moved this pane's width;
                             // the due check below owes it one honest run.
                             zoom_gates[id.0].fire(Instant::now());
+                            // The pane's window just changed shape:
+                            // clamp every viewport into it (INV-7).
+                            reanchor_pane_scrolls(&mut panes, &runtime, &geom);
                             recompose_live(
                                 &mut live,
                                 &registry,
@@ -2118,6 +2121,9 @@ pub(crate) fn run_registry(
                                 );
                                 // The restore moved this pane's width too.
                                 zoom_gates[id.0].fire(Instant::now());
+                                // And its window: clamp every viewport
+                                // back into the declared shape (INV-7).
+                                reanchor_pane_scrolls(&mut panes, &runtime, &geom);
                                 recompose_live(
                                     &mut live,
                                     &registry,
@@ -4772,6 +4778,7 @@ fn compose_sources(
                 truncated: source.truncated.as_deref(),
                 scrolled: scrolled.as_deref(),
                 focused: view.focus == Some(id),
+                zoomed: view.zoomed == Some(id),
             };
             render_pane(
                 body,
@@ -7795,6 +7802,61 @@ mod tests {
             !step.geom_moved,
             "a view toggle under a zoom must still compare equal, or every child restarts"
         );
+    }
+
+    #[test]
+    fn zooming_reanchors_the_panes_viewport_to_the_new_window() {
+        let registry = zoom_row_registry();
+        let mut runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let body: Vec<String> = (1..=60).map(|i| format!("r{i}")).collect();
+        runtime[0].output = Some(body.clone());
+        runtime[1].output = Some(body);
+        let panes_at = |zoomed| {
+            let panes = view_zooming(&registry, zoomed);
+            let geom = derive_geometry(&registry, (80, 24), None, false, &panes);
+            (panes, geom)
+        };
+        assert_eq!(
+            (
+                panes_at(None).1[0].inner_rows,
+                panes_at(Some(SourceId(0))).1[0].inner_rows
+            ),
+            (2, 19)
+        );
+
+        // A pane at its KeepBottom rest — pinned to the tail — stays at the
+        // tail when the window grows.
+        let (mut panes, geom) = panes_at(Some(SourceId(0)));
+        panes.scroll[0] = LiveScroll::start(ScrollStep::Bottom, 60, 2);
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert!(panes.scroll[0].pinned());
+        assert_eq!(panes.scroll[0].offset(), 60 - 19);
+
+        // An unpinned offset HOLDS across the gesture (D4) …
+        panes.scroll[0] = LiveScroll::at(5, 60, 2);
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(
+            (panes.scroll[0].offset(), panes.scroll[0].pinned()),
+            (5, false)
+        );
+
+        // … and is CLAMPED, never left past the end, when the bigger window
+        // shortens the maximum offset from 58 to 41.
+        panes.scroll[0] = LiveScroll::at(58, 60, 2);
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.scroll[0].offset(), 41);
+
+        // Unzoom is the same call with the declared geometry: the reader's
+        // place is kept, never re-expanded toward the tail. The helper is
+        // whole-view by design (it is also the collect step's), so the
+        // neighbour is reanchored too — and a pane at rest reanchors to
+        // itself, which is what keeps the gesture invisible to it.
+        let (mut panes, geom) = panes_at(None);
+        panes.scroll[0] = LiveScroll::at(41, 60, 19);
+        let neighbour = panes.scroll[1];
+        reanchor_pane_scrolls(&mut panes, &runtime, &geom);
+        assert_eq!(panes.scroll[0].offset(), 41);
+        assert_eq!(panes.scroll[1], neighbour, "a pane at rest is unmoved");
     }
 
     // The engine itself never names these two types (they live behind
