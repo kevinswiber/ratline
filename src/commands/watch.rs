@@ -1640,7 +1640,8 @@ pub(crate) fn run_registry(
                     let action = match event {
                         TapEvent::Key(key) => {
                             let mode = mode_of(pause.as_ref(), live_scroll);
-                            resolve_page_or_zoom(action_for(key, mode), mode, &panes)
+                            let action = resolve_page_or_zoom(action_for(key, mode), mode, &panes);
+                            resolve_esc(action, &panes)
                         }
                         // Gated on LIVE capture, not just the flag: a
                         // terminal that keeps reporting after a release
@@ -3006,13 +3007,27 @@ fn action_for(key: Key, mode: FrameMode) -> WatchAction {
         Key::Alt('l') if mode != FrameMode::Paused => WatchAction::FocusMove(FocusDir::Right),
         Key::Char('z') if mode != FrameMode::Paused => WatchAction::ToggleZoom,
         Key::Space if mode != FrameMode::Paused => WatchAction::ToggleCollapse,
-        Key::Esc if mode == FrameMode::Live => WatchAction::ClearFocus,
+        Key::Esc if mode != FrameMode::Paused => WatchAction::ClearFocus,
         Key::Esc | Key::Char('F') if mode != FrameMode::Live => WatchAction::Resume,
         Key::Char('p') if mode != FrameMode::Paused => WatchAction::Freeze,
         Key::Char('<') | Key::Char(',') => WatchAction::ScrubBack,
         Key::Char('>') | Key::Char('.') if mode == FrameMode::Paused => WatchAction::ScrubForward,
         _ => WatchAction::Ignore,
     }
+}
+
+/// Esc's ladder, resolved where the pane state is visible: leave the
+/// zoom first, then drop the focus — the frame scroll HOLDS its place
+/// through both — and only with nothing pane-side left to peel does
+/// the frame rung run (Resume: back to the live view, byte-silent on
+/// a frame already there). The table cannot see panes, so Esc on the
+/// live frame always arrives as `ClearFocus` and the empty rungs fall
+/// through here.
+fn resolve_esc(action: WatchAction, panes: &PaneView) -> WatchAction {
+    if action == WatchAction::ClearFocus && panes.zoomed.is_none() && panes.focus.is_none() {
+        return WatchAction::Resume;
+    }
+    action
 }
 
 /// Enter's meaning, resolved where the pane state is visible: a
@@ -5993,15 +6008,57 @@ mod tests {
 
     #[test]
     fn esc_clears_focus_while_live_and_resumes_otherwise() {
+        // Esc on the live frame — scrolled or not — is the ladder key
+        // (`resolve_esc` peels zoom, focus, then frame scroll); on a
+        // frozen frame it resumes. `F` is the explicit resume spelling
+        // and keeps it everywhere outside Live.
         assert_eq!(
             action_for(Key::Esc, FrameMode::Live),
             WatchAction::ClearFocus
         );
         assert_eq!(
             action_for(Key::Esc, FrameMode::LiveScrolled),
-            WatchAction::Resume
+            WatchAction::ClearFocus
         );
         assert_eq!(action_for(Key::Esc, FrameMode::Paused), WatchAction::Resume);
+        assert_eq!(
+            action_for(Key::Char('F'), FrameMode::LiveScrolled),
+            WatchAction::Resume
+        );
+        assert_eq!(
+            action_for(Key::Char('F'), FrameMode::Paused),
+            WatchAction::Resume
+        );
+    }
+
+    #[test]
+    fn esc_peels_zoom_then_focus_then_the_frame_scroll() {
+        let mut panes = PaneView::new(2);
+        // Nothing pane-side to peel: Esc falls through to the frame
+        // rung — Resume drops a frame scroll, and is a byte-silent
+        // no-op on a frame already live.
+        assert_eq!(
+            resolve_esc(WatchAction::ClearFocus, &panes),
+            WatchAction::Resume
+        );
+        // A focus holds the frame scroll in place: Esc only deselects.
+        panes.focus = Some(SourceId(0));
+        assert_eq!(
+            resolve_esc(WatchAction::ClearFocus, &panes),
+            WatchAction::ClearFocus
+        );
+        // A zoom peels first (the arm's own rung, unchanged).
+        panes.zoomed = Some(SourceId(0));
+        assert_eq!(
+            resolve_esc(WatchAction::ClearFocus, &panes),
+            WatchAction::ClearFocus
+        );
+        // Every other action passes through untouched.
+        assert_eq!(
+            resolve_esc(WatchAction::Resume, &panes),
+            WatchAction::Resume
+        );
+        assert_eq!(resolve_esc(WatchAction::Quit, &panes), WatchAction::Quit);
     }
 
     #[test]

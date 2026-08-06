@@ -2666,6 +2666,82 @@ pane "b" {
     );
 }
 
+/// Esc peels one layer at a time: with a pane focused on a scrolled
+/// frame, the first Esc only deselects — the frame window HOLDS its
+/// place — and the second returns the frame to the live view.
+#[test]
+fn esc_drops_the_focus_before_the_frame_scroll() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 15
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo A$i; done"
+}
+pane "b" {
+    interval "1h"
+    command "for i in $(seq -w 1 20); do echo B$i; done"
+}
+"#,
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"B05", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    // Focus pane b below the fold: the frame window slides to it.
+    session.write_bytes(b"\t\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 9-30 of 30", b"focus b"],
+        Duration::from_secs(3),
+    );
+
+    // First Esc: deselect only — the scrolled row repaints WITHOUT
+    // the focus segment, at the same held offset.
+    session.write_bytes(b"\x1b");
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 9-30 of 30"],
+        Duration::from_secs(3),
+    );
+    assert!(
+        !contains(&seen, b"focus"),
+        "the first Esc must only drop the focus: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // Second Esc: now the frame rung runs — back to the live view.
+    session.write_bytes(b"\x1b");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"more lines"],
+        Duration::from_secs(3),
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
 /// D4 end to end: a batch pane's body is replaced wholesale on every run,
 /// and the reader's place is held through it — positional, per the
 /// research's honesty note, which is why the badge names the new total.
