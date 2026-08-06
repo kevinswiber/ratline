@@ -235,14 +235,20 @@ fn a_file_that_is_not_kdl_names_the_path() {
     let file = fixture(dir.path(), "board.conf", "gap = 0\n");
     rat()
         .args(["dashboard", &file])
+        // The escape-free pin below needs the profile PINNED, not
+        // inferred from pipedness: an ambient CLICOLOR_FORCE outvotes
+        // a piped stream, and a Windows sshd session's hidden console
+        // reads as a tty. NO_COLOR beats both (detect_profile checks
+        // it before anything else). Piped-earns-plain itself is
+        // color.rs's unit contract, not this test's.
+        .env("NO_COLOR", "1")
         .assert()
         .code(1)
         .stderr(predicates::str::contains("board.conf"))
         .stderr(predicates::str::contains("line "))
         .stderr(predicates::str::contains("column "))
         // The rustc-style snippet reaches the user: the offending
-        // source line is echoed on stderr, pointed at by the span —
-        // uncolored, because a piped run earns the plain profile.
+        // source line is echoed on stderr, pointed at by the span.
         .stderr(predicates::str::contains("gap = 0"))
         .stderr(predicates::str::contains("\u{1b}").not());
 }
