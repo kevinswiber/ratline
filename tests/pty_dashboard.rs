@@ -2995,3 +2995,179 @@ fn focus_gestures_are_inert_while_zoomed() {
         "the dashboard should have exited on q"
     );
 }
+
+/// Zoom hands ONE pane a new width, and the pane class decides how.
+/// A batch pane re-runs once; a live pane is never restarted by a view
+/// gesture — it re-clips and keeps its stale-width content, exactly as
+/// the gutter toggle and the resize arm already decided twice.
+#[test]
+fn zoom_respawns_the_zoomed_batch_pane_and_never_a_live_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (follower, batch) = (dir.path().join("follower"), dir.path().join("batch"));
+    let log = dir.path().join("log");
+    seed(&log, "start\n");
+    // A ROW, inlined like the gutter test's declaration rather than
+    // through `live_board`: that builder stacks panes in a column, where
+    // every pane is already full width and a wide-border needle could
+    // not tell a zoom from the declared frame. Reading order is
+    // declaration order: the live follower first, the 1h batch second.
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+defaults {{
+    height 5
+    border "rounded"
+    shell #true
+}}
+
+row {{
+    pane "follower" live=#true {{
+        interval "1h"
+        command "{follow}"
+    }}
+    pane "batch" {{
+        interval "1h"
+        command "{count}"
+    }}
+}}
+"#,
+            follow = following_counter_cmd(&follower, &log),
+            count = labeled_counter_cmd(&batch, "batch"),
+        ),
+    );
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"batch-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    wait_for_counter(&follower, 1);
+    wait_for_counter(&batch, 1);
+
+    // Zoom the LIVE pane: Tab focuses the first pane in reading order.
+    let wide = "─".repeat(60);
+    session.write_bytes(b"\tz");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"start"],
+        Duration::from_secs(5),
+    );
+    // Past the 250ms window: a live child is never killed and never
+    // re-requested, so its spawn count cannot have moved.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    assert_counter_settled_at(&follower, 1);
+
+    // Unzoom it (also a width change for the same pane, also exempt),
+    // then focus and zoom the BATCH pane.
+    session.write_bytes(b"z");
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"batch-1"],
+        Duration::from_secs(5),
+    );
+    session.write_bytes(b"\tz");
+    // ONE capture through the honest-width respawn: the zoom repaints
+    // the retained batch-1 body first, and the debounced re-run paints
+    // batch-2 — the screen needle keeps the master drained (the
+    // backpressure rule) while it lands.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"batch-1", b"batch-2"],
+        Duration::from_secs(5),
+    );
+
+    // EXACTLY once, and only for the pane that was zoomed.
+    assert_counter_settled_at(&batch, 2);
+    assert_counter_settled_at(&follower, 1);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// `zzz` inside one debounce window is one respawn, not three: the
+/// pane's own gate is ANCHORED (fire opens a window only when none is
+/// open), so repeated toggles of one pane collapse into its one window.
+#[test]
+fn rapid_zoom_toggles_cost_one_child_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    session.write_bytes(b"\tzzz"); // focus, zoom, unzoom, zoom
+    let wide = "─".repeat(60);
+    // ONE capture through the zoomed pane's honest-width repaint — the
+    // screen needle keeps the master drained (the backpressure rule),
+    // and `left-2` arriving at all is the respawn's own evidence.
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"left-2"],
+        Duration::from_secs(5),
+    );
+    // The ceiling is the assertion: three gestures, one run.
+    assert_counter_settled_at(&left, 2);
+    assert_counter_settled_at(&right, 1);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}
+
+/// zoom A, unzoom A (A now owes one declared-width run), then within
+/// the same debounce window Tab to B and zoom B. Per-pane gates (D3):
+/// BOTH obligations discharge — A respawns once at declared width, B
+/// once at full width. A single pending slot would drop A's.
+#[test]
+fn a_second_panes_zoom_never_discards_the_firsts_respawn() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (left, right) = (dir.path().join("left"), dir.path().join("right"));
+    let decl = write_dashboard(dir.path(), &two_pane_row(&left, &right));
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"right-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+    let wide = "─".repeat(60);
+    // Focus A, zoom, unzoom, move to B, zoom — all inside one window.
+    session.write_bytes(b"\tzz\tz");
+    // ONE capture through the zoomed pane's honest-width repaint: the
+    // screen needle keeps the master DRAINED (the backpressure rule —
+    // a file-only wait here lets the pty fill and blocks the loop's
+    // writer before the spawn step can discharge either request).
+    wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[wide.as_bytes(), b"right-2"],
+        Duration::from_secs(5),
+    );
+    // The hidden pane's respawn is file-side evidence only: its block
+    // is not composed while its neighbour is zoomed.
+    wait_for_counter(&left, 2);
+    assert_counter_settled_at(&left, 2);
+    assert_counter_settled_at(&right, 2);
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "the dashboard should have exited on q"
+    );
+}

@@ -564,6 +564,14 @@ pub(crate) fn run_registry(
         panes.scroll[id.0] = initial_pane_scroll(overflow, 0, geom[id.0].inner_rows as usize);
     }
     let mut resize_gate = DebounceGate::new(RESIZE_DEBOUNCE);
+    // Zoom's honesty channel. A child is told its width only at spawn, so a
+    // zoomed (or restored) pane needs one run to become honest — debounced
+    // PER PANE (D3): pane A's outstanding obligation survives pane B's
+    // gesture, and a burst of toggles on one pane still costs one run.
+    let mut zoom_gates: Vec<DebounceGate> = registry
+        .ids()
+        .map(|_| DebounceGate::new(RESIZE_DEBOUNCE))
+        .collect();
     // The once-notice clock starts when the loop does — the panes'
     // first spawns are due immediately, so loop age IS wait age.
     let once_started = Instant::now();
@@ -1411,6 +1419,20 @@ pub(crate) fn run_registry(
                 request_respawn_all(&mut runtime);
             }
         }
+        // 3c'. Zoom's debounced respawns: per pane (D3), and only panes
+        // that will run again. A live child is not killed by a view
+        // gesture — the gutter toggle and the resize arm both already
+        // declined that, and a zoom is a more emphatic view toggle, not
+        // less (INV-5). `due` is called BEFORE the live test so a live
+        // pane's fired window still clears instead of going stale.
+        {
+            let now = Instant::now();
+            for id in registry.ids() {
+                if zoom_gates[id.0].due(now) && !registry.spec(id).live {
+                    runtime[id.0].schedule.request_respawn();
+                }
+            }
+        }
         // 3d. A quiet `--once` says what it is waiting on: one batched
         // stderr line, once, and nothing else moves — no exit change,
         // no stdout byte, no timing (the nap below is computed the
@@ -2028,6 +2050,9 @@ pub(crate) fn run_registry(
                                 view.gutter,
                                 &panes,
                             );
+                            // Both directions moved this pane's width;
+                            // the due check below owes it one honest run.
+                            zoom_gates[id.0].fire(Instant::now());
                             recompose_live(
                                 &mut live,
                                 &registry,
@@ -2081,7 +2106,9 @@ pub(crate) fn run_registry(
                             // The ladder (INV-12): zoomed → unzoom and
                             // KEEP the focus, so a second Esc clears it;
                             // only then does the focus rung run.
-                            if action == WatchAction::ClearFocus && panes.zoomed.take().is_some() {
+                            if action == WatchAction::ClearFocus
+                                && let Some(id) = panes.zoomed.take()
+                            {
                                 geom = derive_geometry(
                                     &registry,
                                     size,
@@ -2089,6 +2116,8 @@ pub(crate) fn run_registry(
                                     view.gutter,
                                     &panes,
                                 );
+                                // The restore moved this pane's width too.
+                                zoom_gates[id.0].fire(Instant::now());
                                 recompose_live(
                                     &mut live,
                                     &registry,
