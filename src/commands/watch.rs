@@ -4,10 +4,11 @@
 //! spawn-if-due → drain-then-compose-once → triggers → nap → age
 //! refresh → theme verify → events. The drain terminates because each
 //! source has at most one tick in flight; nothing ever paints inside
-//! it, and nothing outside this file writes to the terminal. Every
-//! gesture is whole-dashboard: there is no focus concept, `action_for`
-//! takes no pane, and a future per-pane gesture is a deliberate
-//! re-opening of that decision, not a small edit.
+//! it, and nothing outside this file writes to the terminal. Pane
+//! gestures — focus, zoom, collapse, per-pane scroll — exist for
+//! `Composition::Panes` registries in a live frame only, and thread
+//! through one `PaneView` and one `derive_geometry`; `action_for`
+//! still takes no pane — dispatch resolves the target from the focus.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -2819,9 +2820,10 @@ fn append_help_lines(extra: &[String]) -> Vec<String> {
 /// The whole binding table, for both input paths and every mode — unix and
 /// Windows read their keys differently but mean the same things by them.
 /// What a Scroll action does while live is the loop's business, not the
-/// table's. View keys never freeze. A pane gesture names a direction,
+/// table's. View keys never freeze. A pane gesture names an action,
 /// never a pane — which is why this table still has no pane parameter:
-/// the loop resolves which pane a direction reaches.
+/// dispatch resolves the target from the focused pane after the table
+/// answers.
 fn action_for(key: Key, mode: FrameMode) -> WatchAction {
     match key {
         Key::CtrlC => WatchAction::Abort,
@@ -5038,9 +5040,9 @@ fn fold_changed_at(
     }
 }
 
-/// Every gesture is whole-dashboard: a resume means the whole surface
-/// is stale, so every source is asked for a tick — the request an
-/// in-flight child CAN discharge, because its environment is unchanged.
+/// A resume means the whole surface is stale, so every source is asked
+/// for a tick — the request an in-flight child CAN discharge, because
+/// its environment is unchanged.
 fn request_now_all(runtime: &mut [SourceRuntime]) {
     for r in runtime {
         r.schedule.request_now();
@@ -5533,6 +5535,10 @@ mod tests {
         for needle in ["q  ", "Ctrl-C", "S  ", "?  "] {
             assert!(lines.contains(needle), "missing {needle:?} in {lines}");
         }
+        // The closed four-key surface never describes pane gestures —
+        // the permanent tripwire against a merged help path (INV-3).
+        assert!(!lines.contains("pane gestures"));
+        assert!(!lines.contains("BackTab"));
     }
 
     #[test]

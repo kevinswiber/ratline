@@ -115,8 +115,11 @@ pub struct SourceSpec {
 }
 
 /// The declared box a source paints into. Height is PINNED: the
-/// composed frame's row count is run-constant, which is what keeps the
-/// retained-row differ on its cheap path.
+/// composed frame's row count is run-constant between view gestures
+/// (a zoom or collapse moves it exactly once, costing that one paint
+/// the differ's cheap path — `inline.rs` requires equal counts only
+/// between consecutive frames), which is what keeps the retained-row
+/// differ cheap the rest of the run.
 #[derive(Clone, PartialEq, Debug)]
 pub struct PaneBox {
     /// The finished box, borders and chrome included.

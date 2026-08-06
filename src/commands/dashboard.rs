@@ -88,6 +88,9 @@ fn pane_help(registry: &Registry) -> Vec<String> {
             lines.push(format!("      {trigger}"));
         }
     }
+    // Unconditional, unlike the sections below: every dashboard registry
+    // is Composition::Panes, so the gestures always apply.
+    lines.extend(PANE_GESTURE_HELP.iter().map(|l| (*l).to_string()));
     if registry.ids().any(|id| registry.spec(id).live) {
         lines.extend(LIVE_HELP.iter().map(|l| (*l).to_string()));
     }
@@ -115,6 +118,25 @@ fn pane_help(registry: &Registry) -> Vec<String> {
     }
     lines
 }
+
+/// The per-pane gestures, gated to a live frame. "live" here is the
+/// FRAME state (not paused, not scrolled) — a different word from the
+/// `live` pane label the next section defines, and the heading says so
+/// because the two share a spelling and nothing else.
+///
+/// Wrapped by hand, like every section here: `?` pages plain grouped
+/// text through the pager, and nothing may exceed the key table's width.
+const PANE_GESTURE_HELP: &[&str] = &[
+    "",
+    "  pane gestures (while the frame is live — not the `live` label):",
+    "    Tab, BackTab     cycle focus between panes",
+    "    Alt-h/j/k/l      move focus directionally",
+    "    Esc              clear focus (unzoom first, if zoomed)",
+    "    z                zoom the focused pane to the full frame",
+    "    Space            collapse the focused pane to its title row",
+    "    With a pane focused, the scroll keys and the wheel drive that",
+    "    pane's own window instead of the whole frame.",
+];
 
 /// What the `live` label means, and what `interval` means under it.
 ///
@@ -406,7 +428,38 @@ mod tests {
                 "  panes:".to_string(),
                 "    a  every 5s".to_string(),
                 "    b  every 5s".to_string(),
+                String::new(),
+                "  pane gestures (while the frame is live — not the `live` label):".to_string(),
+                "    Tab, BackTab     cycle focus between panes".to_string(),
+                "    Alt-h/j/k/l      move focus directionally".to_string(),
+                "    Esc              clear focus (unzoom first, if zoomed)".to_string(),
+                "    z                zoom the focused pane to the full frame".to_string(),
+                "    Space            collapse the focused pane to its title row".to_string(),
+                "    With a pane focused, the scroll keys and the wheel drive that".to_string(),
+                "    pane's own window instead of the whole frame.".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_help_names_the_pane_gestures() {
+        // Unconditional, unlike LIVE_HELP: every dashboard registry is
+        // Composition::Panes, so the gestures always apply — proven by
+        // asking a registry with no live pane and no trigger.
+        let text = pane_help(&registry(false)).join("\n");
+        for needle in [
+            "Tab",
+            "BackTab",
+            "Alt-h/j/k/l",
+            "Esc",
+            "z ",
+            "Space",
+            "focus",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in {text}");
+        }
+        // The retargeting sentence is a behavior change to keys the
+        // shared reference already documents, so it must be stated here.
+        assert!(text.contains("scroll keys"), "the retarget is unstated");
     }
 }

@@ -10,6 +10,9 @@
 //    its child; the inner one-shot sizes itself to the pane through
 //    the handed-down RAT_WIDTH/RAT_HEIGHT. (A live inner dashboard
 //    needs streaming children — a later chapter.)
+// 3. Pane navigation: Tab/Alt-hjkl focus a pane across this grid, z
+//    zooms it, Space collapses it — see the README's Pane navigation
+//    section.
 
 gap 1
 

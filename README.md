@@ -377,16 +377,51 @@ text, a nonzero exit shows the command's output and stderr with
 ` · exit N` on the chrome row, and the rest of the dashboard is
 untouched.
 
-There is no pane focus: every key acts on the whole dashboard, exactly
-as in `rat watch` — freeze, scrub, snapshot, pager, scroll, and the
-view toggles all work on the composed frame, and `?` pages the key
-reference with each pane's cadence listed. `--once` runs every pane
+Freeze, scrub, snapshot, the pager, and the view toggles all act on
+the whole composed frame, exactly as in `rat watch`, and `?` pages the
+key reference with each pane's cadence listed. Scroll is the one key
+group with two targets: whole-frame by default, and a focused pane's
+own window once a pane holds the focus — see Pane navigation below,
+which also adds three pane-scoped gestures (focus itself, zoom, and
+collapse). `--once` runs every pane
 once in parallel, prints one frame, and exits; piped output degrades to
 plain text with each pane's stderr folded into its own box. If a pane
 follows instead of exiting, `--once` says so on stderr after five quiet
 seconds — naming the pane and the `live=#true` declaration to write —
 and `--once-timeout 30s` bounds the wait: on expiry the run exits 124
 with an empty stdout rather than printing a partial frame.
+
+#### Pane navigation
+
+`Tab` and `BackTab` cycle the focus through the panes in layout
+reading order, wrapping; `Alt-h/j/k/l` moves it directionally, and a
+direction with no candidate pane is a no-op rather than a wrap. The
+focused pane wears the accent border and the footer names it. `Esc`
+clears the focus — or leaves a zoom first, if one is active. All of it
+is live-frame only: while the frame is paused or scrubbed these keys do
+nothing, and freeze/scrub/pager stay whole-frame, unchanged.
+
+With a pane focused, the scroll keys (`j/k`, `d/u`, `f/b`, `g/G`) and
+the wheel drive that pane's own window over its retained lines instead
+of the whole frame; the chrome row gains a `lines a-b of N` badge while
+the window is off its declared rest, and `v` pages the focused pane's
+whole retained body. The window holds its place when the pane's next
+run replaces the body — clamped into the new shape, never reset.
+
+`z` zooms the focused pane to the full frame and back. A live pane
+just re-clips to the new width — a view gesture never restarts a
+long-lived child, the same rule the gutter toggle and a resize already
+follow. A batch pane's content was rendered at its old declared width,
+so it re-runs once, debounced, to arrive at the zoomed width honestly —
+on zoom-in and zoom-out alike. The hidden panes keep running
+underneath, and per-pane scroll stays active over the zoomed body.
+
+`Space` collapses the focused pane to a one-row title line; the child
+keeps running and being captured underneath — only what is rendered
+changes, so expanding returns the retained body without a re-run. A
+collapsed pane in a column shortens the composed frame by its height;
+one in a row frees nothing, since its row keeps its tallest pane's
+height. `?` carries the full key table.
 
 **Panes are for watching, not for doing.** A pane's command runs again
 and again, and its declared interval is a floor rather than the whole
