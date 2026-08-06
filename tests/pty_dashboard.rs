@@ -2638,3 +2638,64 @@ row {{
         "dashboard should have exited on q"
     );
 }
+
+/// The position badge appears when the reader takes over the pane's
+/// window and is gone the moment the window is back where the
+/// declaration puts it — a dashboard nobody has touched says nothing.
+#[test]
+fn the_scroll_badge_appears_on_a_scrolled_pane_and_leaves_at_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let decl = write_dashboard(
+        dir.path(),
+        r#"
+row-gap 0
+
+defaults {
+    height 5
+    border "none"
+    chrome #true
+    shell #true
+}
+
+pane "a" {
+    interval "1h"
+    command "printf 'L%s\\n' 1 2 3 4 5 6"
+}
+"#,
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    // 5 rows minus the chrome row is a 4-line window over 6 lines.
+    let first = wait_for_bytes(&session, &mut terminal, b"L4", Duration::from_secs(5))
+        .expect("the first composition never painted");
+    assert!(
+        !contains(&first, b"lines "),
+        "a pane at rest must carry no position badge"
+    );
+
+    session.write_bytes(b"\t");
+    session.write_bytes(b"j");
+    session.write_bytes(b"g");
+    // ONE capture: the badge, then the repaint `g` produced (its first
+    // body row is L1 again), then that frame's chrome row.
+    let seen = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"lines 2-5 of 6", b"L1", b"every 1h"],
+        Duration::from_secs(5),
+    );
+    let at_rest = row_containing(&seen, b"every 1h").expect("the chrome row after g");
+    assert!(
+        !contains(at_rest, b"lines "),
+        "back at rest, the badge must be gone: {:?}",
+        String::from_utf8_lossy(at_rest)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}

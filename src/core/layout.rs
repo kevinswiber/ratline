@@ -44,6 +44,12 @@ pub struct PaneChrome<'a> {
     /// second one exists: a pane can fail, loop and overflow at once,
     /// and each says something the others do not.
     pub truncated: Option<&'a str>,
+    /// "lines 12-33 of 300" when the reader has taken this pane's window
+    /// off its declared rest. A FOURTH independent slot: a pane can fail,
+    /// loop, overflow and be scrolled at once. Appended last and so
+    /// dropped first on a narrow pane — the recorded v1 order; the
+    /// footer carries the range for a chrome-less pane (D5).
+    pub scrolled: Option<&'a str>,
     /// Whether this pane holds the focus. The only visual channel a
     /// focused pane gets: the border recolors and costs no display
     /// cell, which is why a borderless pane needs the footer too.
@@ -63,6 +69,16 @@ pub fn overflow_clip(overflow: Overflow, total: usize, rows: usize) -> usize {
         Overflow::KeepTop => 0,
         Overflow::KeepBottom => max_offset(total, rows),
     }
+}
+
+/// A pane's window as a badge: `lines 12-33 of 300`, 1-based and worded
+/// exactly like `scrolled_notice` so the pane row and the footer are one
+/// family. `window` is the pane's `inner_rows`; how many lines it
+/// actually holds is derived HERE so the badge and the footer range can
+/// never be two different numbers.
+pub fn scroll_badge(offset: usize, window: usize, total: usize) -> String {
+    let shown = total.saturating_sub(offset).min(window);
+    format!("lines {}-{} of {total}", offset + 1, offset + shown)
 }
 
 /// Pin one pane's output into its declared box: drop the viewport's
@@ -391,6 +407,7 @@ fn chrome_row(chrome: &PaneChrome<'_>, cols: usize, profile: ColorProfile) -> St
     push_badge(&mut text, chrome.failure);
     push_badge(&mut text, chrome.looping.then_some("looping"));
     push_badge(&mut text, chrome.truncated);
+    push_badge(&mut text, chrome.scrolled);
     let faint = StyleSpec {
         faint: true,
         ..StyleSpec::default()
@@ -457,6 +474,7 @@ mod tests {
             failure,
             looping: false,
             truncated: None,
+            scrolled: None,
             focused: false,
         }
     }
@@ -1376,5 +1394,76 @@ mod tests {
             ColorProfile::Ascii,
         );
         assert_eq!(block.lines, lines(&["L6   ", "     ", "     "]));
+    }
+
+    #[test]
+    fn the_scroll_badge_is_the_scrolled_rows_phrase() {
+        // The footer already says `lines 30-58 of 59` while the whole
+        // frame is scrolled. A pane saying the same thing differently
+        // would read as a different fact, so the badge is asserted
+        // against the shipped row rather than against a literal alone.
+        assert_eq!(scroll_badge(11, 22, 300), "lines 12-33 of 300");
+        assert!(
+            crate::term::scroll::scrolled_notice("since 12:07:45", "", 11, 22, 300)
+                .contains(&scroll_badge(11, 22, 300)),
+            "the pane badge and the footer row must be the same phrase"
+        );
+        // A window past the body's tail reports what it actually holds.
+        assert_eq!(scroll_badge(8, 22, 10), "lines 9-10 of 10");
+    }
+
+    #[test]
+    fn a_scrolled_pane_shows_its_position_after_the_other_badges() {
+        // A fourth independent slot: a pane can fail, loop, truncate and
+        // be scrolled at once. 76 cells of text, so 80 shows it whole.
+        let row = chrome_row(
+            &PaneChrome {
+                looping: true,
+                truncated: Some("1.2k lines dropped"),
+                scrolled: Some("lines 2-5 of 6"),
+                ..chrome(Some("exit 3"))
+            },
+            80,
+            ColorProfile::Ascii,
+        );
+        assert!(
+            row.contains(
+                "every 5s · 12:04:31 · exit 3 · looping · 1.2k lines dropped · lines 2-5 of 6"
+            ),
+            "got {row:?}"
+        );
+    }
+
+    #[test]
+    fn a_pane_at_rest_shows_no_position_at_all() {
+        // The byte-inertness pin for the chrome row: `scrolled` is None
+        // for every pane nobody has scrolled, so an untouched dashboard
+        // composes exactly the bytes it composes on main.
+        let row = chrome_row(&chrome(None), 40, ColorProfile::Ascii);
+        assert!(row.ends_with("every 5s · 12:04:31"), "got {row:?}");
+        assert!(!row.contains("lines"), "got {row:?}");
+        assert_eq!(display_width(&row), 40);
+    }
+
+    #[test]
+    fn a_narrow_pane_loses_the_position_before_the_dropped_marker() {
+        // The recorded v1 order: appended last, dropped first — the same
+        // truncate-from-the-right rule every other badge obeys.
+        // `on trigger · 12:04:31 · lines 2-5 of 6` is 38 cells.
+        let scrolled = PaneChrome {
+            cadence: "on trigger",
+            scrolled: Some("lines 2-5 of 6"),
+            ..chrome(None)
+        };
+        assert_eq!(
+            chrome_row(&scrolled, 38, ColorProfile::Ascii),
+            "on trigger · 12:04:31 · lines 2-5 of 6"
+        );
+        let narrow = chrome_row(&scrolled, 37, ColorProfile::Ascii);
+        assert!(
+            narrow.starts_with("on trigger · 12:04:31"),
+            "the cadence and the stamp survive: {narrow:?}"
+        );
+        assert_eq!(display_width(&narrow), 37, "and the row still fits");
     }
 }

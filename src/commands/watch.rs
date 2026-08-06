@@ -25,6 +25,7 @@ use crate::core::child::{
 use crate::core::duration::parse_interval;
 use crate::core::layout::{
     PaneBlock, PaneChrome, PaneRect, compose_panes, pane_order, pane_rects, render_pane,
+    scroll_badge,
 };
 use crate::core::live::Emissions;
 use crate::core::measure::{seal_rows, shift_chop};
@@ -3277,13 +3278,25 @@ fn initial_pane_scroll(overflow: Overflow, total: usize, window: usize) -> LiveS
 /// NEVER `LiveScroll::at_top()`: that is the whole-frame collapse rule
 /// (offset 0 means the live view), and a KeepBottom pane at rest sits at
 /// its tail with a nonzero offset.
-// Staged: the scroll badge consumes this; the allow leaves with it.
-#[allow(dead_code)]
 fn pane_at_rest(scroll: LiveScroll, overflow: Overflow) -> bool {
     match overflow {
         Overflow::KeepTop => scroll.offset() == 0 && !scroll.pinned(),
         Overflow::KeepBottom => scroll.pinned(),
     }
+}
+
+/// A pane's position, or `None` when there is nothing to say: at rest
+/// (its declaration's own window) or with no body at all. THE one
+/// predicate both surfaces consult — the chrome badge and the footer's
+/// D5 range — so a pane can never contradict itself across them.
+fn pane_scroll_badge(
+    scroll: LiveScroll,
+    overflow: Overflow,
+    total: usize,
+    window: usize,
+) -> Option<String> {
+    (!pane_at_rest(scroll, overflow) && total > 0)
+        .then(|| scroll_badge(scroll.offset(), window, total))
 }
 
 /// Which pane a scroll step addresses, or `None` for the whole frame.
@@ -4476,11 +4489,25 @@ fn focus_segment(
     geom: &[PaneGeometry],
     view: &PaneView,
 ) -> Option<String> {
-    // The pane's position rides this segment too once a pane can be
-    // scrolled; today the name is the whole of it.
-    let _ = (runtime, geom);
     let id = view.focus?;
-    Some(format!("focus {}", pane_display_name(registry, id)))
+    let mut seg = format!("focus {}", pane_display_name(registry, id));
+    // D5: a `chrome = #false` pane is scrollable and has nowhere on
+    // itself to say where its window is, so the footer says it. A
+    // chromed pane already carries the badge, and saying it twice would
+    // move the footer for something the reader can already see.
+    if let Some(pane) = registry.pane(id)
+        && !pane.chrome
+        && let Some(badge) = pane_scroll_badge(
+            view.scroll[id.0],
+            pane.overflow,
+            runtime[id.0].output.as_ref().map_or(0, Vec::len),
+            geom[id.0].inner_rows as usize,
+        )
+    {
+        seg.push_str(" · ");
+        seg.push_str(&badge);
+    }
+    Some(seg)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4552,6 +4579,13 @@ fn compose_sources(
             } else {
                 local_hms(source.changed_at)
             };
+            let body = source.output.as_deref().unwrap_or(&[]);
+            let scrolled = pane_scroll_badge(
+                view.scroll[id.0],
+                pane.overflow,
+                body.len(),
+                geom[id.0].inner_rows as usize,
+            );
             let chrome = PaneChrome {
                 title: pane_display_name(registry, id),
                 cadence: &cadence,
@@ -4559,9 +4593,9 @@ fn compose_sources(
                 failure: source.failure.as_deref(),
                 looping: source.looping,
                 truncated: source.truncated.as_deref(),
+                scrolled: scrolled.as_deref(),
                 focused: view.focus == Some(id),
             };
-            let body = source.output.as_deref().unwrap_or(&[]);
             render_pane(
                 body,
                 &source.marks,
@@ -7531,6 +7565,37 @@ mod tests {
         // replacement: that is today's behavior, unchanged.
         let tail = initial_pane_scroll(Overflow::KeepBottom, 40, 5);
         assert_eq!(tail.reanchor(400, 5).offset(), max_offset(400, 5));
+    }
+
+    #[test]
+    fn a_pane_names_its_position_only_when_it_is_off_its_rest() {
+        // Both surfaces consult this, so a pane can never carry a badge
+        // on its chrome row and nothing on the footer (or "lines 1-0 of 0").
+        let top = initial_pane_scroll(Overflow::KeepTop, 6, 4);
+        assert_eq!(pane_scroll_badge(top, Overflow::KeepTop, 6, 4), None);
+        assert_eq!(
+            pane_scroll_badge(
+                top.step(ScrollStep::LineDown, 6, 4),
+                Overflow::KeepTop,
+                6,
+                4
+            )
+            .as_deref(),
+            Some("lines 2-5 of 6")
+        );
+        // KeepBottom at rest is PINNED, not offset zero — the badge must
+        // not appear for a log pane doing exactly what it was declared to.
+        let tail = initial_pane_scroll(Overflow::KeepBottom, 6, 4);
+        assert_eq!(tail.offset(), 2);
+        assert_eq!(pane_scroll_badge(tail, Overflow::KeepBottom, 6, 4), None);
+        assert_eq!(
+            pane_scroll_badge(tail.step(ScrollStep::Top, 6, 4), Overflow::KeepBottom, 6, 4)
+                .as_deref(),
+            Some("lines 1-4 of 6")
+        );
+        // An empty body has no position to report, whatever its pin bit.
+        let empty = initial_pane_scroll(Overflow::KeepBottom, 0, 4).step(ScrollStep::Top, 0, 4);
+        assert_eq!(pane_scroll_badge(empty, Overflow::KeepBottom, 0, 4), None);
     }
 
     #[test]
