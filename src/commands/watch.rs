@@ -988,6 +988,7 @@ pub(crate) fn run_registry(
                         &registry,
                         &runtime,
                         &geom,
+                        &panes,
                         view.alt_time,
                         &palette,
                         profile,
@@ -1094,6 +1095,7 @@ pub(crate) fn run_registry(
                         &palette,
                         view,
                         panes.key(),
+                        focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                         None,
                         size,
                         session.max_height,
@@ -1225,7 +1227,7 @@ pub(crate) fn run_registry(
             // Then one evaluation, for the whole dashboard: the graph it tests
             // is a whole-dashboard object, not a per-source one.
             if observing {
-                let panes: Vec<crate::core::trigger::PaneWindow<'_>> = registry
+                let pane_windows: Vec<crate::core::trigger::PaneWindow<'_>> = registry
                     .ids()
                     .map(|id| crate::core::trigger::PaneWindow {
                         source: id,
@@ -1237,7 +1239,7 @@ pub(crate) fn run_registry(
                         readers: &per_source_readers[id.0],
                     })
                     .collect();
-                let verdict = suspicion.evaluate(now, &ledger, &log, &panes);
+                let verdict = suspicion.evaluate(now, &ledger, &log, &pane_windows);
                 if let Some(t) = trace.as_mut() {
                     t.record(now, &verdict);
                 }
@@ -1253,6 +1255,7 @@ pub(crate) fn run_registry(
                         &registry,
                         &runtime,
                         &geom,
+                        &panes,
                         view.alt_time,
                         &palette,
                         profile,
@@ -1299,6 +1302,7 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
+                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                     (!notices.is_empty()).then(|| notices.join(" · ")),
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1342,6 +1346,7 @@ pub(crate) fn run_registry(
                         &registry,
                         &runtime,
                         &geom,
+                        &panes,
                         view.alt_time,
                         &palette,
                         profile,
@@ -1377,6 +1382,7 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
+                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                     None,
                     size,
                     session.max_height,
@@ -1479,6 +1485,7 @@ pub(crate) fn run_registry(
                     &registry,
                     &runtime,
                     &geom,
+                    &panes,
                     view.alt_time,
                     &palette,
                     profile,
@@ -1493,6 +1500,7 @@ pub(crate) fn run_registry(
                     &palette,
                     view,
                     panes.key(),
+                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                     None,
                     crossterm::terminal::size().unwrap_or((80, 24)),
                     session.max_height,
@@ -1699,6 +1707,7 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
+                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                     pager_notice,
                                     size,
                                     session.max_height,
@@ -1758,6 +1767,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1789,6 +1799,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1824,6 +1835,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1879,6 +1891,7 @@ pub(crate) fn run_registry(
                                     &palette,
                                     view,
                                     panes.key(),
+                                    focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                     None,
                                     size,
                                     session.max_height,
@@ -1916,6 +1929,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -1980,6 +1994,7 @@ pub(crate) fn run_registry(
                                 &registry,
                                 &runtime,
                                 &geom,
+                                &panes,
                                 view.alt_time,
                                 &palette,
                                 profile,
@@ -1994,6 +2009,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2059,6 +2075,7 @@ pub(crate) fn run_registry(
                                     &registry,
                                     &runtime,
                                     &geom,
+                                    &panes,
                                     view.alt_time,
                                     &palette,
                                     profile,
@@ -2075,6 +2092,7 @@ pub(crate) fn run_registry(
                                     &registry,
                                     &runtime,
                                     &geom,
+                                    &panes,
                                     view.alt_time,
                                     &palette,
                                     profile,
@@ -2091,6 +2109,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 None,
                                 size,
                                 session.max_height,
@@ -2127,6 +2146,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 Some(text.to_string()),
                                 size,
                                 session.max_height,
@@ -2156,6 +2176,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 Some(text),
                                 size,
                                 session.max_height,
@@ -2202,6 +2223,7 @@ pub(crate) fn run_registry(
                                 &palette,
                                 view,
                                 panes.key(),
+                                focus_segment(&registry, &runtime, &geom, &panes).as_deref(),
                                 debug_notice,
                                 size,
                                 session.max_height,
@@ -3029,7 +3051,12 @@ fn live_suffix(once: bool, interval: Option<&str>, triggered: bool) -> String {
 /// lines` is about this VIEWPORT — the rows exist and scrolling reaches
 /// them. `N lines dropped` is about the CONTENT — those lines are gone
 /// and no key will bring them back.
-fn live_notice(hidden: usize, time_seg: &str, dropped: Option<&str>) -> String {
+fn live_notice(
+    hidden: usize,
+    time_seg: &str,
+    dropped: Option<&str>,
+    focus_seg: Option<&str>,
+) -> String {
     let mut row = if hidden > 0 {
         format!("… {hidden} more lines · {time_seg}")
     } else {
@@ -3038,6 +3065,10 @@ fn live_notice(hidden: usize, time_seg: &str, dropped: Option<&str>) -> String {
     if let Some(dropped) = dropped {
         row.push_str(" · ");
         row.push_str(dropped);
+    }
+    if let Some(focus) = focus_seg {
+        row.push_str(" · ");
+        row.push_str(focus);
     }
     row
 }
@@ -3055,6 +3086,7 @@ fn repaint(
     palette: &Palette,
     view: ViewState,
     view_key: PaneViewKey,
+    focus_seg: Option<&str>,
     notice: Option<String>,
     size: (u16, u16),
     max_height: Option<u16>,
@@ -3159,6 +3191,7 @@ fn repaint(
         &mark_cell,
         &solid_mark,
         live.dropped.as_deref(),
+        focus_seg,
     )?;
     Ok(key)
 }
@@ -3274,6 +3307,7 @@ fn paint_frame(
     mark_cell: &str,
     solid_mark: &str,
     dropped: Option<&str>,
+    focus_seg: Option<&str>,
 ) -> anyhow::Result<()> {
     let kept = frame_rows(
         lines,
@@ -3293,6 +3327,7 @@ fn paint_frame(
         mark_cell,
         solid_mark,
         dropped,
+        focus_seg,
     );
     renderer.draw(&kept, size.0).context("writing frame")?;
     Ok(())
@@ -3320,6 +3355,7 @@ fn frame_rows(
     mark_cell: &str,
     solid_mark: &str,
     dropped: Option<&str>,
+    focus_seg: Option<&str>,
 ) -> Vec<String> {
     let (cols, rows) = size;
     // Fullscreen pins the status row to the bottom screen row and
@@ -3406,7 +3442,12 @@ fn frame_rows(
         FrameMode::LiveScrolled => {
             scrolled_notice(time_seg_live, live_tail, offset, kept.len(), lines.len())
         }
-        FrameMode::Live => live_notice(hidden, &format!("{time_seg_live}{live_tail}"), dropped),
+        FrameMode::Live => live_notice(
+            hidden,
+            &format!("{time_seg_live}{live_tail}"),
+            dropped,
+            focus_seg,
+        ),
     };
     kept.push(faint.render(&status, profile));
     if let Some(text) = notice {
@@ -4304,11 +4345,43 @@ fn chrome_ages(registry: &Registry, runtime: &[SourceRuntime]) -> Vec<jiff::Time
 /// re-enter the compose through here. Nothing is re-dated and nothing
 /// is recorded: history takes only collect-step compositions.
 #[allow(clippy::too_many_arguments)]
+/// A pane's display name: its declared title where it has one, else
+/// the source's id. ONE resolution, so the border label and the
+/// footer's focus segment can never name the same pane differently.
+fn pane_display_name(registry: &Registry, id: SourceId) -> &str {
+    registry
+        .pane(id)
+        .and_then(|pane| pane.title.as_deref())
+        .unwrap_or(&registry.spec(id).id)
+}
+
+/// The footer's focus segment: the focused pane's display name, or
+/// None when nothing is focused.
+///
+/// A footer segment may change only when a `PaintKey` field changes —
+/// the run-constant tail rule — and this one is admissible exactly
+/// because `PaneViewKey.focus` is IN the key. A counter here would not
+/// be, and would go silently stale.
+fn focus_segment(
+    registry: &Registry,
+    runtime: &[SourceRuntime],
+    geom: &[PaneGeometry],
+    view: &PaneView,
+) -> Option<String> {
+    // The pane's position rides this segment too once a pane can be
+    // scrolled; today the name is the whole of it.
+    let _ = (runtime, geom);
+    let id = view.focus?;
+    Some(format!("focus {}", pane_display_name(registry, id)))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn recompose_live(
     live: &mut Option<Live>,
     registry: &Registry,
     runtime: &[SourceRuntime],
     geom: &[PaneGeometry],
+    view: &PaneView,
     alt_time: bool,
     palette: &Palette,
     profile: ColorProfile,
@@ -4319,7 +4392,7 @@ fn recompose_live(
     if matches!(registry.composition(), Composition::Plain { .. }) {
         return;
     }
-    let block = compose_sources(registry, runtime, geom, alt_time, palette, profile);
+    let block = compose_sources(registry, runtime, geom, view, alt_time, palette, profile);
     l.lines = block.lines;
     l.panes = Some(PaneLive {
         marks: block.marks,
@@ -4331,10 +4404,12 @@ fn recompose_live(
 /// it has exactly three re-entrants: the collect step, the resize
 /// arm's reflow, and the counting-refresh path. Renders every source
 /// into its declared box and joins them by the layout tree.
+#[allow(clippy::too_many_arguments)]
 fn compose_sources(
     registry: &Registry,
     runtime: &[SourceRuntime],
     geom: &[PaneGeometry],
+    view: &PaneView,
     alt_time: bool,
     palette: &Palette,
     profile: ColorProfile,
@@ -4370,12 +4445,13 @@ fn compose_sources(
                 local_hms(source.changed_at)
             };
             let chrome = PaneChrome {
-                title: pane.title.as_deref().unwrap_or(&spec.id),
+                title: pane_display_name(registry, id),
                 cadence: &cadence,
                 stamp: &stamp,
                 failure: source.failure.as_deref(),
                 looping: source.looping,
                 truncated: source.truncated.as_deref(),
+                focused: view.focus == Some(id),
             };
             render_pane(
                 source.output.as_deref().unwrap_or(&[]),
@@ -5519,10 +5595,29 @@ mod tests {
 
     #[test]
     fn the_live_rows_carry_the_time_segment() {
-        assert_eq!(live_notice(0, "since 18:47:53", None), "since 18:47:53");
         assert_eq!(
-            live_notice(8, "changed 14s ago", None),
+            live_notice(0, "since 18:47:53", None, None),
+            "since 18:47:53"
+        );
+        assert_eq!(
+            live_notice(8, "changed 14s ago", None, None),
             "… 8 more lines · changed 14s ago"
+        );
+        // The focus segment rides LAST — the pane's scroll range extends
+        // it later, and a range before the drop marker would read as the
+        // frame's.
+        assert_eq!(
+            live_notice(0, "since 18:47:53", None, Some("focus plan")),
+            "since 18:47:53 · focus plan"
+        );
+        assert_eq!(
+            live_notice(
+                8,
+                "changed 14s ago",
+                Some("2.0k lines dropped"),
+                Some("focus plan")
+            ),
+            "… 8 more lines · changed 14s ago · 2.0k lines dropped · focus plan"
         );
     }
 
@@ -5533,13 +5628,36 @@ mod tests {
         // the hidden rows are still there and scrolling reaches them,
         // the dropped ones are gone for good.
         assert_eq!(
-            live_notice(0, "since 18:47:53", Some("2.0k lines dropped")),
+            live_notice(0, "since 18:47:53", Some("2.0k lines dropped"), None),
             "since 18:47:53 · 2.0k lines dropped"
         );
         assert_eq!(
-            live_notice(8, "since 18:47:53", Some("2.0k lines dropped")),
+            live_notice(8, "since 18:47:53", Some("2.0k lines dropped"), None),
             "… 8 more lines · since 18:47:53 · 2.0k lines dropped"
         );
+    }
+
+    #[test]
+    fn the_focus_segment_names_the_focused_pane() {
+        let registry = two_weighted_panes();
+        let runtime = vec![SourceRuntime::for_test(), SourceRuntime::for_test()];
+        let geom = registry.geometry((80, 24));
+        let mut panes = PaneView::new(registry.len());
+        assert_eq!(focus_segment(&registry, &runtime, &geom, &panes), None);
+        panes.focus = Some(SourceId(1));
+        assert_eq!(
+            focus_segment(&registry, &runtime, &geom, &panes),
+            Some("focus right".to_string())
+        );
+    }
+
+    #[test]
+    fn one_resolution_names_a_pane_for_the_border_and_the_footer() {
+        // The chrome row's title and the footer's focus segment must
+        // never disagree about what a pane is called.
+        let registry = two_weighted_panes();
+        assert_eq!(pane_display_name(&registry, SourceId(0)), "left");
+        assert_eq!(pane_display_name(&registry, SourceId(1)), "right");
     }
 
     #[test]
@@ -5622,6 +5740,7 @@ mod tests {
             "▌ ",
             "",
             None,
+            None,
         );
         assert_eq!(rows[0], "\x1b[31mred\x1b[0m");
         assert_eq!(rows[1], "\x1b[31mstill\x1b[0m");
@@ -5664,6 +5783,7 @@ mod tests {
             "▌ ",
             "",
             None,
+            None,
         );
         assert_eq!(rows[0], "plain");
         assert_eq!(rows[1], "\x1b[31mclosed\x1b[0m");
@@ -5701,6 +5821,7 @@ mod tests {
                 None,
                 "▌ ",
                 "",
+                None,
                 None,
             )
         };
@@ -6356,6 +6477,7 @@ mod tests {
             &registry,
             &runtime,
             &geom,
+            &PaneView::new(registry.len()),
             false,
             &palette,
             ColorProfile::TrueColor,
@@ -6385,6 +6507,7 @@ mod tests {
             &bare,
             &runtime,
             &geom,
+            &PaneView::new(registry.len()),
             false,
             &palette,
             ColorProfile::TrueColor,
@@ -6410,6 +6533,7 @@ mod tests {
             &referred,
             &runtime,
             &geom,
+            &PaneView::new(registry.len()),
             false,
             &palette,
             ColorProfile::TrueColor,
@@ -6494,6 +6618,7 @@ mod tests {
             &registry,
             &runtime,
             &geom,
+            &PaneView::new(registry.len()),
             false,
             &palette,
             ColorProfile::Ascii,
@@ -6550,6 +6675,7 @@ mod tests {
             &registry,
             &runtime,
             &geom,
+            &PaneView::new(registry.len()),
             false,
             &palette,
             ColorProfile::Ascii,

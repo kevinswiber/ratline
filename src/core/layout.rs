@@ -40,6 +40,10 @@ pub struct PaneChrome<'a> {
     /// second one exists: a pane can fail, loop and overflow at once,
     /// and each says something the others do not.
     pub truncated: Option<&'a str>,
+    /// Whether this pane holds the focus. The only visual channel a
+    /// focused pane gets: the border recolors and costs no display
+    /// cell, which is why a borderless pane needs the footer too.
+    pub focused: bool,
 }
 
 /// Pin one pane's output into its declared box: apply the overflow
@@ -87,7 +91,12 @@ pub fn render_pane(
         padding: pane.padding,
         border: pane.border,
         border_style: StyleSpec {
-            foreground: Some(palette.border),
+            foreground: Some(if chrome.focused {
+                palette.accent
+            } else {
+                palette.border
+            }),
+            bold: chrome.focused,
             ..StyleSpec::default()
         },
         title: Some(chrome.title),
@@ -426,6 +435,7 @@ mod tests {
             failure,
             looping: false,
             truncated: None,
+            focused: false,
         }
     }
 
@@ -1199,6 +1209,58 @@ mod tests {
             vec![SourceId(2), SourceId(0), SourceId(1)]
         );
         assert!(pane_order(&LayoutNode::Row(Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn a_focused_pane_wears_the_accent_border_and_no_extra_cell() {
+        let boxed = pane(4, BorderPreset::Normal, Sides::default(), false);
+        let draw = |focused: bool| {
+            render_pane(
+                &lines(&["x"]),
+                &[LineMark::default()],
+                &boxed,
+                geom(&boxed, 20),
+                &PaneChrome {
+                    focused,
+                    ..chrome(None)
+                },
+                &palette(),
+                ColorProfile::Ansi256,
+            )
+        };
+        let plain = draw(false);
+        let focused = draw(true);
+        // The dark accent, bolded: the border's own style, nothing else.
+        assert!(
+            focused.lines[0].contains("\x1b[1;38;5;212m"),
+            "got {:?}",
+            focused.lines[0]
+        );
+        assert!(!plain.lines[0].contains("\x1b[1;38;5;212m"));
+        // Indication costs no display cell and no row: the pane is
+        // exactly its declared size either way.
+        assert_eq!(focused.lines.len(), plain.lines.len());
+        for (a, b) in focused.lines.iter().zip(&plain.lines) {
+            assert_eq!(display_width(a), display_width(b), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn an_unfocused_pane_renders_exactly_what_it_always_did() {
+        // Phase 1's byte-inertness pin at pane scope: with the flag
+        // off, not one byte of the box moves.
+        let boxed = pane(4, BorderPreset::Normal, Sides::default(), true);
+        let block = render_pane(
+            &lines(&["x"]),
+            &[LineMark::default()],
+            &boxed,
+            geom(&boxed, 20),
+            &chrome(None),
+            &palette(),
+            ColorProfile::Ansi256,
+        );
+        assert!(block.lines[0].contains("\x1b[38;5;240m"));
+        assert!(!block.lines[0].contains("\x1b[1;"));
     }
 
     #[test]

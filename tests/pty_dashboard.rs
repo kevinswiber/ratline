@@ -2309,3 +2309,140 @@ fn the_script_directory_is_gone_when_the_dashboard_exits() {
         "the private script directory survived exit: {script_dir:?}"
     );
 }
+
+/// The whole focus indication, end to end: the border restyle and the
+/// footer segment arrive in ONE repaint, borders first (the frame
+/// paints top to bottom), so they are one ordered needle chain rather
+/// than two waits that would race each other.
+#[test]
+fn tab_focuses_the_first_pane_and_esc_clears_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+row-gap 0
+
+defaults {{
+    height 3
+    border "rounded"
+    chrome #false
+    shell #true
+    interval "10s"
+}}
+
+row {{
+    pane "a" {{
+        command "{counter}"
+    }}
+    pane "b" {{
+        command "printf 'zzz'"
+    }}
+}}
+"#,
+            counter = labeled_counter_cmd(&count, "a"),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"a-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    session.write_bytes(b"\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\x1b[1;38;5;212m", b"focus a"],
+        Duration::from_secs(5),
+    );
+
+    // A bare escape resolves to Esc only after 50ms of silence, and any
+    // byte inside that window cancels it — so nothing else is sent here.
+    session.write_bytes(b"\x1b");
+    let cleared = drain_for(&session, Duration::from_millis(700));
+    let footer = row_containing(&cleared, b"? help").expect("the status row after Esc");
+    assert!(
+        !contains(footer, b"focus"),
+        "Esc must clear the focus segment: {:?}",
+        String::from_utf8_lossy(footer)
+    );
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
+
+/// The negative respawn pin, the gutter toggle's shape: focus moves
+/// what is composed, never what is allocated, so detect_resize derives
+/// the same geometry and the 250ms gate stays unarmed. A gesture that
+/// restarted every child — live ones included — would be a real cost
+/// paid for a border color.
+#[test]
+fn a_focus_gesture_never_restarts_a_child() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count = dir.path().join("count");
+    let decl = write_dashboard(
+        dir.path(),
+        &format!(
+            r#"
+gap 1
+row-gap 0
+
+defaults {{
+    height 3
+    border "rounded"
+    chrome #false
+    shell #true
+    interval "10s"
+}}
+
+row {{
+    pane "a" {{
+        command "{counter}"
+    }}
+    pane "b" {{
+        command "printf 'zzz'"
+    }}
+}}
+"#,
+            counter = labeled_counter_cmd(&count, "a"),
+        ),
+    );
+
+    let session = PtySession::spawn(&rat_bin(), &["dashboard", &decl.display().to_string()], &[])
+        .expect("spawn rat dashboard under a pty");
+    let mut terminal = FakeTerminal::dark();
+    assert!(
+        wait_for(&session, &mut terminal, b"a-1", Duration::from_secs(5)),
+        "the first composition never painted"
+    );
+
+    session.write_bytes(b"\t");
+    let _ = wait_for_in_order(
+        &session,
+        &mut terminal,
+        &[b"\x1b[1;38;5;212m", b"focus a"],
+        Duration::from_secs(5),
+    );
+    // Past the resize debounce: a geometry drift would have respawned
+    // every child and the counter would read 2.
+    let _ = drain_for(&session, Duration::from_millis(700));
+    let runs = std::fs::read_to_string(&count)
+        .map(|s| s.lines().count())
+        .unwrap_or(0);
+    assert_eq!(runs, 1, "a focus gesture must never restart children");
+
+    session.write_bytes(b"q");
+    assert!(
+        !session.kill_if_alive(Duration::from_secs(2)),
+        "dashboard should have exited on q"
+    );
+}
